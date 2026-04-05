@@ -19,10 +19,6 @@ Execution Engine (Go)
 Agents (in-memory)
 ```
 
-**Removed** (from earlier iterations to keep the core focused):
-- AI Engine (Python / LangGraph)
-- Kubernetes pods (for V1)
-
 ---
 
 ## 🧩 2. Core Building Blocks
