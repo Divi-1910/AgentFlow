@@ -20,7 +20,7 @@ func ConnectMongoDB() *mongo.Client {
 	once.Do(func() {
 		mongo_url := os.Getenv("MONGO_URL")
 		if mongo_url == "" {
-			log.Fatalf("MONGO_URL environment variable is not set")
+			log.Printf("MONGO_URL environment variable is not set")
 			log.Println("Using default mongo URL")
 			mongo_url = "mongodb://localhost:27017"
 		}

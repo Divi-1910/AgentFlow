@@ -1,12 +1,28 @@
 package main
 
 import (
+	"backend/db"
+	"backend/handlers"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
 	"time"
 )
+
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		next(w, r)
+	}
+}
 
 func main() {
 	mux := http.NewServeMux()
@@ -37,6 +53,13 @@ func main() {
 			"status": "ok",
 		})
 	})
+
+	authHandler := &handlers.AuthHandler{
+		Users: db.GetCollection("AgentFlow", "users"),
+	}
+
+	mux.HandleFunc("/api/auth/signup", corsMiddleware(authHandler.SignUp))
+	mux.HandleFunc("/api/auth/login", corsMiddleware(authHandler.Login))
 
 	port := os.Getenv("PORT")
 	if port == "" {
