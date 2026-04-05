@@ -9,16 +9,16 @@ function AuthInput({
   required = true,
 }) {
   return (
-    <div className="flex flex-col gap-1.5">
+    <div className="flex flex-col gap-2.5">
       <label
         htmlFor={id}
-        className="text-[13px] font-medium text-white/80 ml-1"
+        className="ml-1 font-headline text-[11px] font-bold uppercase tracking-[0.15em] text-white/50"
       >
         {label}
       </label>
 
-      <div className="relative group">
-        <span className="material-symbols-outlined pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-[18px] text-outline transition-colors group-focus-within:text-primary">
+      <div className="group relative">
+        <span className="material-symbols-outlined pointer-events-none absolute left-5 top-1/2 -translate-y-1/2 text-[20px] text-white/30 transition-colors group-focus-within:text-white">
           {icon}
         </span>
 
@@ -29,11 +29,11 @@ function AuthInput({
           autoComplete={autoComplete}
           placeholder={placeholder}
           required={required}
-          className="w-full rounded-xl border border-outline-variant/30 bg-surface-container-high/30 px-11 py-3 text-sm text-white outline-none transition-all duration-300 placeholder:text-outline focus:border-primary/50 focus:bg-surface-container-high/60 focus:ring-4 focus:ring-primary/10 shadow-[inset_0_2px_4px_rgba(0,0,0,0.1)]"
+          className="w-full rounded-2xl border border-white/10 bg-white/[0.02] px-12 py-4 text-[15px] font-light text-white outline-none transition-all duration-300 placeholder:text-white/20 focus:border-white/40 focus:bg-white/[0.05] focus:ring-4 focus:ring-white/10 shadow-[inset_0_2px_8px_rgba(0,0,0,0.5)]"
         />
       </div>
     </div>
   )
 }
 
-export default AuthInput
+export default AuthInput;

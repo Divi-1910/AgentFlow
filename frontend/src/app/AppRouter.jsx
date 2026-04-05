@@ -1,4 +1,5 @@
-import { Route, Routes } from 'react-router-dom'
+import { Route, Routes } from 'react-router-dom';
+import WelcomePage from '../pages/WelcomePage';
 import AppShell from '../components/layout/AppShell'
 import AgentLibraryPage from '../pages/AgentLibraryPage'
 import DashboardPage from '../pages/DashboardPage'
@@ -11,11 +12,12 @@ import TeamLibraryPage from '../pages/TeamLibraryPage'
 function AppRouter() {
   return (
     <Routes>
+      <Route path="/" element={<WelcomePage />} />
       <Route path="login" element={<LoginPage />} />
       <Route path="signup" element={<SignUpPage />} />
 
       <Route element={<AppShell />}>
-        <Route index element={<DashboardPage />} />
+        <Route path="dashboard" element={<DashboardPage />} />
         <Route path="agents" element={<AgentLibraryPage />} />
         <Route path="teams" element={<TeamLibraryPage />} />
         <Route path="chat" element={<OrchestrationChatPage />} />
