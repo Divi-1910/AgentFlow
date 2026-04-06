@@ -32,7 +32,6 @@ func (lh *LLMHandler) GetModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If MongoDB returns nothing, initialize an empty list so JSON is `[]` instead of `null`
 	if models == nil {
 		models = []bson.M{}
 	}
