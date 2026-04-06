@@ -5,6 +5,7 @@ import {
   sidebarCollapsedAtom,
   sidebarOpenAtom,
 } from '../../store/atoms/appAtoms'
+import { useAuth } from '../../hooks/useAuth'
 
 function navLinkClassName({ isActive }, sidebarCollapsed) {
   const base =
@@ -20,6 +21,7 @@ function navLinkClassName({ isActive }, sidebarCollapsed) {
 function SideNav() {
   const [sidebarOpen, setSidebarOpen] = useAtom(sidebarOpenAtom)
   const [sidebarCollapsed, setSidebarCollapsed] = useAtom(sidebarCollapsedAtom)
+  const { logout } = useAuth()
 
   const closeSidebar = () => setSidebarOpen(false)
   const toggleCollapse = () => setSidebarCollapsed((c) => !c)
@@ -117,6 +119,7 @@ function SideNav() {
           <div className="group rounded-2xl border border-white/5 bg-white/[0.02] transition-colors hover:bg-white/[0.04]">
             <button
               type="button"
+              onClick={logout}
               className={`flex w-full items-center gap-4 rounded-2xl p-4 font-headline text-[11px] font-bold uppercase tracking-[0.15em] text-white/50 transition-all duration-300 hover:text-white ${
                 sidebarCollapsed ? 'lg:justify-center px-0' : ''
               }`}

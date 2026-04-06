@@ -3,11 +3,14 @@ package main
 import (
 	"backend/db"
 	"backend/handlers"
+	"backend/middleware"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -24,7 +27,24 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "OPTIONS" {
+			log.Printf("[%s] %s - Request initiated", r.Method, r.URL.Path)
+		}
+		start := time.Now()
+		next(w, r)
+		if r.Method != "OPTIONS" {
+			log.Printf("[%s] %s - Completed in %v\n--", r.Method, r.URL.Path, time.Since(start))
+		}
+	}
+}
+
 func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found or error loading it. Proceeding with system environment variables.")
+	}
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -58,8 +78,9 @@ func main() {
 		Users: db.GetCollection("AgentFlow", "users"),
 	}
 
-	mux.HandleFunc("/api/auth/signup", corsMiddleware(authHandler.SignUp))
-	mux.HandleFunc("/api/auth/login", corsMiddleware(authHandler.Login))
+	mux.HandleFunc("/api/auth/signup", loggingMiddleware(corsMiddleware(authHandler.SignUp)))
+	mux.HandleFunc("/api/auth/login", loggingMiddleware(corsMiddleware(authHandler.Login)))
+	mux.HandleFunc("/api/auth/me", loggingMiddleware(corsMiddleware(middleware.RequireAuth(authHandler.Me))))
 
 	port := os.Getenv("PORT")
 	if port == "" {

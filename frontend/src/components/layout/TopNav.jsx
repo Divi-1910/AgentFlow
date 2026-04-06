@@ -4,11 +4,18 @@ import {
   sidebarCollapsedAtom,
   sidebarOpenAtom,
 } from '../../store/atoms/appAtoms'
+import { useAuth } from '../../hooks/useAuth'
 
 function TopNav() {
   const [searchQuery, setSearchQuery] = useAtom(globalSearchAtom)
   const [, setSidebarOpen] = useAtom(sidebarOpenAtom)
   const sidebarCollapsed = useAtomValue(sidebarCollapsedAtom)
+  const { user } = useAuth()
+
+  const getInitials = () => {
+    if (!user) return ''
+    return `${user.first_name?.[0] || ''}${user.last_name?.[0] || ''}`.toUpperCase()
+  }
 
   return (
     <header
@@ -28,43 +35,34 @@ function TopNav() {
             <span className="material-symbols-outlined text-[20px]">menu</span>
           </button>
 
-          {/* Search */}
-
         </div>
 
         {/* Right: actions + avatar */}
         <div className="flex items-center gap-3 sm:gap-4">
-          <div className="hidden items-center gap-2 sm:flex">
-            <button
-              type="button"
-              className="h-10 w-10 inline-flex items-center justify-center rounded-full text-white/40 transition-colors hover:bg-white/5 hover:text-white"
-              aria-label="Alerts"
-            >
-              <span className="material-symbols-outlined text-[20px]">notifications</span>
-            </button>
-            <button
-              type="button"
-              className="h-10 w-10 inline-flex items-center justify-center rounded-full text-white/40 transition-colors hover:bg-white/5 hover:text-white"
-              aria-label="Network Activity"
-            >
-              <span className="material-symbols-outlined text-[20px]">swap_calls</span>
-            </button>
-          </div>
-
-          <button
-            type="button"
-            className="hidden rounded-full border border-white/20 bg-white/10 px-5 py-2.5 font-headline text-[11px] font-bold uppercase tracking-[0.1em] text-white transition-all hover:bg-white hover:text-black md:inline-flex hover:shadow-[0_0_24px_rgba(255,255,255,0.2)]"
-          >
-            New Team
-          </button>
-
-          {/* Avatar / Status Indicator */}
-          <div className="flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-white/5 text-white/70 shadow-[0_0_12px_rgba(255,255,255,0.05)] cursor-pointer hover:bg-white/10 transition-colors">
-            <div className="relative">
-              <span className="material-symbols-outlined text-[18px]">person</span>
-              <div className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-white shadow-[0_0_8px_rgba(255,255,255,1)]" />
+          {user ? (
+            <div className="flex items-center gap-4 pl-2 sm:pl-4 border-white/10 ml-2">
+              <div className="hidden flex-col items-end text-right sm:flex">
+                <span className="font-headline text-[11px] font-bold uppercase tracking-[0.15em] text-white">
+                  {user.first_name} {user.last_name}
+                </span>
+                <span className="text-[10px] font-medium tracking-wide text-white/30">
+                  {user.email}
+                </span>
+              </div>
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-white/20 bg-white/5 text-white/90 shadow-[0_0_16px_rgba(255,255,255,0.05)] transition-all hover:bg-white/10 cursor-pointer hover:shadow-[0_0_24px_rgba(255,255,255,0.1)]">
+                <span className="font-headline text-[13px] font-bold tracking-widest ml-[2px]">
+                  {getInitials()}
+                </span>
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-white/5 text-white/70 shadow-[0_0_12px_rgba(255,255,255,0.05)] cursor-pointer hover:bg-white/10 transition-colors">
+              <div className="relative">
+                <span className="material-symbols-outlined text-[18px]">person</span>
+                <div className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-white shadow-[0_0_8px_rgba(255,255,255,1)]" />
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </header>

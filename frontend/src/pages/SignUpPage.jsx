@@ -1,18 +1,61 @@
+import { useState } from "react";
 import { motion } from "framer-motion";
 import AuthInput from '../components/auth/AuthInput'
 import AuthShell from '../components/auth/AuthShell'
+import { useAuth } from "../hooks/useAuth";
 
 function SignUpPage() {
+  const { signup } = useAuth();
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError("");
+    
+    const formData = new FormData(e.target);
+    const pwd = formData.get("password");
+    const confirm = formData.get("confirmPassword");
+    
+    if (pwd !== confirm) {
+        setError("Passwords do not match");
+        return;
+    }
+
+    setLoading(true);
+    try {
+      await signup(
+        formData.get("firstName"), 
+        formData.get("lastName"), 
+        formData.get("email"), 
+        pwd
+      );
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <AuthShell
       mode="signup"
-      title="Create an account"
-      subtitle="Set up your workspace and start building your intelligent agents."
+      title="Create Account"
+      subtitle="Initialize your access key and join the AgentFlow network."
       submitLabel="Sign Up"
       switchLabel="Already have an account?"
       switchCta="Sign in"
       switchTo="/login"
+      onSubmit={handleSubmit}
     >
+      {error && (
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="rounded-xl border border-red-500/20 bg-red-950/30 p-4 relative overflow-hidden backdrop-blur-md">
+          <div className="absolute left-0 top-0 bottom-0 w-1 bg-red-500/80"></div>
+          <p className="pl-2 font-headline text-[11px] font-bold uppercase tracking-[0.1em] text-red-400">Failed to create account</p>
+          <p className="pl-2 text-sm font-light text-white/60 mt-1">{error}</p>
+        </motion.div>
+      )}
+
       <motion.div initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.1, duration: 0.5 }} className="grid gap-4 sm:grid-cols-2">
         <AuthInput
           id="signUpFirstName"

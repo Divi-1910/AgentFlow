@@ -57,10 +57,9 @@ export default {
         'secondary-container': '#262626',
       },
       fontFamily: {
-        headline: ['Syne', 'sans-serif'],
+        headline: ['Clash Display', 'sans-serif'],
         body: ['Inter', 'sans-serif'],
         label: ['Inter', 'sans-serif'],
-        manrope: ['Syne', 'sans-serif'],
       },
       borderRadius: {
         // Use Tailwind defaults — do NOT override lg/xl/full here

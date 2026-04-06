@@ -1,18 +1,48 @@
+import { useState } from "react";
 import { motion } from "framer-motion";
 import AuthInput from "../components/auth/AuthInput";
 import AuthShell from "../components/auth/AuthShell";
+import { useAuth } from "../hooks/useAuth";
 
 function LoginPage() {
+  const { login } = useAuth();
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+    
+    const formData = new FormData(e.target);
+    try {
+      await login(formData.get("email"), formData.get("password"));
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <AuthShell
       mode="login"
-      title="Welcome back"
-      subtitle="Authenticate to access your workspace and manage your AI agents with ease."
+      title="Welcome Back"
+      subtitle="Enter your credentials to access your orchestration workspace."
       submitLabel="Sign In"
       switchLabel="Need a new account?"
       switchCta="Create one"
       switchTo="/signup"
+      onSubmit={handleSubmit}
     >
+      {error && (
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="rounded-xl border border-red-500/20 bg-red-950/30 p-4 relative overflow-hidden backdrop-blur-md">
+          <div className="absolute left-0 top-0 bottom-0 w-1 bg-red-500/80"></div>
+          <p className="pl-2 font-headline text-[11px] font-bold uppercase tracking-[0.1em] text-red-400">Authentication Failed</p>
+          <p className="pl-2 text-sm font-light text-white/60 mt-1">{error}</p>
+        </motion.div>
+      )}
+
       <motion.div initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: 0.1, duration: 0.5 }}>
         <AuthInput
           id="loginEmail"

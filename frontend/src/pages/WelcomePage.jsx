@@ -6,7 +6,7 @@ export default function WelcomePage() {
   const navigate = useNavigate();
 
   return (
-    <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-black font-body text-white">
+    <div className="relative flex min-h-[100dvh] items-center justify-center overflow-x-hidden overflow-y-auto bg-black font-body text-white">
       {/* Absolute Backdrop */}
       <div className="absolute inset-0 z-0">
         <PixelSnow
@@ -25,7 +25,7 @@ export default function WelcomePage() {
       </div>
 
       {/* Main Container */}
-      <div className="relative z-10 grid w-full max-w-[85rem] grid-cols-1 gap-16 px-8 py-24 sm:px-12 lg:grid-cols-5 lg:gap-12 xl:px-8">
+      <div className="relative z-10 grid w-full max-w-[85rem] grid-cols-1 gap-12 px-6 py-20 sm:px-12 lg:grid-cols-5 lg:gap-12 xl:px-8">
 
         {/* Left Typography Section */}
         <motion.div
@@ -34,8 +34,8 @@ export default function WelcomePage() {
           transition={{ duration: 1.2, ease: [0.16, 1, 0.3, 1] }}
           className="flex flex-col justify-center lg:col-span-3"
         >
-          <h1 className="font-headline text-6xl font-extrabold leading-[1.02] tracking-tight sm:text-[5.5rem] lg:text-[6.5rem] xl:text-[7.5rem]">
-            Agent<span className="font-light italic text-white/30">Flow</span>
+          <h1 className="font-headline text-[4rem] font-semibold leading-[0.95] tracking-wide uppercase sm:text-[5rem] lg:text-[5.5rem] xl:text-[6.5rem]">
+            Agent<span className="font-medium text-white/30">Flow</span>
           </h1>
 
           <motion.p
@@ -64,7 +64,7 @@ export default function WelcomePage() {
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: 0.7, duration: 0.8 }}
-              className="font-headline text-4xl font-bold tracking-tight text-white mb-2"
+              className="font-headline text-3xl font-semibold uppercase tracking-wider text-white mb-3"
             >
               Get Started
             </motion.h2>

@@ -24,6 +24,7 @@ function AuthShell({
   switchLabel,
   switchCta,
   switchTo,
+  onSubmit,
   children,
 }) {
   return (
@@ -48,10 +49,13 @@ function AuthShell({
         </div>
 
         {/* Top bar with Brand Logo */}
-        <div className="relative z-10 p-10 xl:p-14">
+        <div className="relative z-10 p-10 xl:p-14 shrink-0">
           <Link to="/" className="inline-flex items-center gap-4 transition-opacity hover:opacity-80">
-            <div>
-              <p className="font-headline text-2xl font-extrabold tracking-tight text-white leading-none mb-1">
+            <div className="shrink-0 flex items-center justify-center h-10 w-10 rounded-xl bg-white shadow-[0_0_24px_rgba(255,255,255,0.2)]">
+              <span className="material-symbols-outlined text-[20px] text-black">hive</span>
+            </div>
+            <div className="flex flex-col justify-center">
+              <p className="font-headline text-3xl font-extrabold tracking-tight text-white leading-none whitespace-nowrap">
                 Agent<span className="italic font-light text-white/50">Flow</span>
               </p>
             </div>
@@ -65,9 +69,9 @@ function AuthShell({
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.8, ease: "easeOut" }}
           >
-            <h1 className="font-headline text-5xl font-bold tracking-tight text-white xl:text-[4rem] leading-[1.05]">
+            <h1 className="font-headline text-[3.5rem] font-semibold uppercase tracking-wider text-white xl:text-[4.5rem] leading-[1]">
               Create with <br />
-              <span className="text-white/40 font-light italic">
+              <span className="text-white/30 font-medium">
                 AgentFlow
               </span>
             </h1>
@@ -86,12 +90,12 @@ function AuthShell({
 
         <div className="relative z-10 w-full max-w-[420px] mx-auto">
           {/* Mobile Header */}
-          <div className="mb-12 flex items-center gap-3 lg:hidden">
+          <div className="mb-12 flex items-center gap-3 lg:hidden shrink-0">
             <Link to="/" className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-white text-black shadow-[0_0_24px_rgba(255,255,255,0.2)]">
-                <span className="material-symbols-outlined text-xl">all_inclusive</span>
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-white text-black shadow-[0_0_24px_rgba(255,255,255,0.2)]">
+                <span className="material-symbols-outlined text-[20px]">hive</span>
               </div>
-              <p className="font-headline text-xl font-extrabold tracking-tight text-white">
+              <p className="font-headline text-2xl font-extrabold tracking-tight text-white whitespace-nowrap">
                 Agent<span className="italic font-light text-white/50">Flow</span>
               </p>
             </Link>
@@ -117,18 +121,19 @@ function AuthShell({
               </div>
             </div>
 
-            <div className="mb-10">
-              <h2 className="font-headline text-3xl font-extrabold tracking-tight text-white mb-3">
+            <div className="mb-12 relative flex flex-col justify-end">
+              <h2 className="font-headline text-5xl leading-[0.95] font-semibold uppercase tracking-wide text-white mb-4 sm:text-6xl">
                 {title}
               </h2>
-              <p className="text-[15px] font-light leading-relaxed text-white/50 max-w-sm">
+              <div className="h-px w-24 bg-white/20 mb-4" />
+              <p className="text-[14px] font-body font-light leading-relaxed text-white/40 max-w-sm">
                 {subtitle}
               </p>
             </div>
 
             <form
               className="space-y-6"
-              onSubmit={(event) => event.preventDefault()}
+              onSubmit={onSubmit || ((event) => event.preventDefault())}
             >
               {children}
 
