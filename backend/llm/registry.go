@@ -1,0 +1,95 @@
+package llm
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"time"
+)
+
+type Registry struct {
+	clients map[string]LLMClient
+}
+
+func NewRegistry() *Registry {
+	r := &Registry{
+		clients: make(map[string]LLMClient),
+	}
+
+	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
+
+		r.clients["openai"] = NewOpenAIAdapter(AdapterConfig{
+			APIKey:     key,
+			BaseURL:    "https://api.openai.com/v1",
+			MaxRetries: 3,
+			Timeout:    30 * time.Second,
+		})
+
+		log.Println("[registry] openai registered")
+
+	} else {
+
+		log.Println("[registry] openai skipped (OPENAI_API_KEY not set)")
+
+	}
+
+	// NVIDIA is OpenAI Compatible
+	if key := os.Getenv("NVIDIA_API_KEY"); key != "" {
+
+		r.clients["nvidia"] = NewOpenAIAdapter(AdapterConfig{
+			APIKey:     key,
+			BaseURL:    "https://integrate.api.nvidia.com/v1",
+			MaxRetries: 3,
+			Timeout:    30 * time.Second,
+		})
+
+		log.Println("[registry] nvidia registered")
+
+	} else {
+
+		log.Println("[registry] nvidia skipped (NVIDIA_API_KEY not set)")
+
+	}
+
+	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
+
+		r.clients["anthropic"] = NewAnthropicAdapter(AdapterConfig{
+			APIKey:     key,
+			MaxRetries: 3,
+			Timeout:    60 * time.Second,
+		})
+
+		log.Println("[registry] anthropic registered")
+
+	} else {
+
+		log.Println("[registry] anthropic skipped (ANTHROPIC_API_KEY not set)")
+
+	}
+
+	log.Printf("[registry] %d provider(s) available", len(r.clients))
+
+	return r
+}
+
+func (r *Registry) Get(provider string) (LLMClient, error) {
+
+	client, ok := r.clients[provider]
+
+	if !ok {
+		return nil, fmt.Errorf("provider %q not registered or missing API key", provider)
+	}
+
+	return client, nil
+}
+
+func (r *Registry) Available() []string {
+
+	providers := make([]string, 0, len(r.clients))
+
+	for k := range r.clients {
+		providers = append(providers, k)
+	}
+
+	return providers
+}

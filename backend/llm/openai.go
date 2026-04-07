@@ -1,0 +1,272 @@
+package llm
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"net/http"
+	"time"
+)
+
+type OpenAIAdapter struct {
+	baseURL    string
+	apiKey     string
+	client     *http.Client
+	maxRetries int
+}
+
+func NewOpenAIAdapter(config AdapterConfig) *OpenAIAdapter {
+	return &OpenAIAdapter{
+		baseURL: config.BaseURL,
+		apiKey:  config.APIKey,
+		client: &http.Client{
+			Timeout: config.Timeout,
+		},
+		maxRetries: config.MaxRetries,
+	}
+}
+
+type openaiRequest struct {
+	Model       string          `json:"model"`
+	Messages    []openaiMessage `json:"messages"`
+	Tools       []openaiTool    `json:"tools"`
+	Temperature float64         `json:"temperature"`
+	MaxTokens   int             `json:"max_tokens"`
+	Params      map[string]any  `json:"params"`
+}
+
+type openaiMessage struct {
+	Role       string           `json:"role"`
+	Content    string           `json:"content,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	ToolCalls  []openaiToolCall `json:"tool_calls,omitempty"`
+}
+
+type openaiTool struct {
+	Type     string             `json:"type"`
+	Function openaiToolFunction `json:"function"`
+}
+
+type openaiToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+type openaiToolCall struct {
+	ID       string                 `json:"id"`
+	Type     string                 `json:"type"`
+	Function openaiToolCallFunction `json:"function"`
+}
+
+type openaiToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type openaiResponse struct {
+	ID      string         `json:"id"`
+	Model   string         `json:"model"`
+	Choices []openaiChoice `json:"choices"`
+	Usage   openaiUsage    `json:"usage"`
+}
+
+type openaiChoice struct {
+	Message openaiMessage `json:"message"`
+}
+
+type openaiUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+type openaiErrorResponse struct {
+	Error struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error"`
+}
+
+func (ad *OpenAIAdapter) ChatCompletion(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
+
+	payload := ad.buildPayload(req)
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal openai request : %w", err)
+	}
+
+	var lastErr error
+
+	for attempt := 0; attempt <= ad.maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(math.Pow(2, float64(attempt-1))) * time.Second
+
+			log.Printf("OpenAI retry %d/%d after %v", attempt, ad.maxRetries, backoff)
+
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ad.baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, fmt.Errorf("Failed to Create Request : %w", err)
+		}
+
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+ad.apiKey)
+
+		httpResp, err := ad.client.Do(httpReq)
+		if err != nil {
+			lastErr = fmt.Errorf("OpenAI Request Failed : %w", err)
+			continue
+		}
+
+		respBody, err := io.ReadAll(httpResp.Body)
+		httpResp.Body.Close()
+
+		if err != nil {
+			lastErr = fmt.Errorf("Failed to read OpenAI Response : %w", err)
+			continue
+		}
+
+		if httpResp.StatusCode != http.StatusOK {
+			lastErr = ad.handleErrorStatus(httpResp.StatusCode, respBody)
+
+			if httpResp.StatusCode == 429 || httpResp.StatusCode >= 500 {
+				continue
+			}
+			return nil, lastErr
+		}
+
+		return ad.parseResponse(respBody)
+
+	}
+
+	return nil, fmt.Errorf("OpenAI Request Failed after %d retries : %w", ad.maxRetries, lastErr)
+}
+
+func (a *OpenAIAdapter) parseResponse(body []byte) (*ChatResponse, error) {
+	var raw openaiResponse
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+	if len(raw.Choices) == 0 {
+		return nil, fmt.Errorf("empty choices in response")
+	}
+	choice := raw.Choices[0]
+	resp := &ChatResponse{
+		Content: choice.Message.Content,
+		Model:   raw.Model,
+		Usage: TokenUsage{
+			PromptTokens:     raw.Usage.PromptTokens,
+			CompletionTokens: raw.Usage.CompletionTokens,
+			TotalTokens:      raw.Usage.TotalTokens,
+		},
+	}
+
+	if len(choice.Message.ToolCalls) > 0 {
+		resp.ToolCalls = make([]ToolCall, len(choice.Message.ToolCalls))
+		for i, tc := range choice.Message.ToolCalls {
+			resp.ToolCalls[i] = ToolCall{
+				ID:        tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: json.RawMessage(tc.Function.Arguments),
+			}
+		}
+	}
+	return resp, nil
+}
+
+func (a *OpenAIAdapter) handleErrorStatus(status int, body []byte) error {
+	var errResp openaiErrorResponse
+	if err := json.Unmarshal(body, &errResp); err != nil {
+		return fmt.Errorf("Failed to parse openai error response : %w", err)
+	}
+
+	msg := errResp.Error.Message
+
+	switch status {
+	case 401:
+		return fmt.Errorf("%w: %s", ErrInvalidAPIKey, msg)
+	case 429:
+		return fmt.Errorf("%w: %s", ErrRateLimited, msg)
+	case 400:
+		return fmt.Errorf("%w: %s", ErrBadRequest, msg)
+	default:
+		return fmt.Errorf("provider error (status %d): %s", status, msg)
+	}
+
+}
+
+func (ad *OpenAIAdapter) buildPayload(req *ChatRequest) map[string]any {
+
+	messages := make([]openaiMessage, len(req.Messages))
+
+	for i, m := range req.Messages {
+		msg := openaiMessage{
+			Role:       m.Role,
+			Content:    m.Content,
+			ToolCallID: m.ToolCallID,
+		}
+
+		if len(m.ToolCalls) > 0 {
+			msg.ToolCalls = make([]openaiToolCall, len(m.ToolCalls))
+
+			for j, tc := range m.ToolCalls {
+				msg.ToolCalls[j] = openaiToolCall{
+					ID:   tc.ID,
+					Type: "function",
+					Function: openaiToolCallFunction{
+						Name:      tc.Name,
+						Arguments: string(tc.Arguments),
+					},
+				}
+			}
+
+		}
+		messages[i] = msg
+	}
+
+	payload := map[string]interface{}{
+		"model":    req.Model,
+		"messages": messages,
+	}
+
+	if req.Temperature != 0 {
+		payload["temperature"] = req.Temperature
+	}
+
+	if req.MaxTokens > 0 {
+		payload["max_tokens"] = req.MaxTokens
+	}
+
+	if len(req.Tools) > 0 {
+		tools := make([]openaiTool, len(req.Tools))
+		for i, t := range req.Tools {
+			tools[i] = openaiTool{
+				Type: "function",
+				Function: openaiToolFunction{
+					Name:        t.Name,
+					Description: t.Description,
+					Parameters:  t.Parameters,
+				},
+			}
+		}
+		payload["tools"] = tools
+	}
+
+	for k, v := range req.Params {
+		payload[k] = v
+	}
+
+	return payload
+}
