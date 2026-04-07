@@ -25,11 +25,11 @@ func NewRegistry() *Registry {
 			Timeout:    30 * time.Second,
 		})
 
-		log.Println("[registry] openai registered")
+		log.Println("openai api registered")
 
 	} else {
 
-		log.Println("[registry] openai skipped (OPENAI_API_KEY not set)")
+		log.Println(" openai api skipped (OPENAI_API_KEY not set)")
 
 	}
 
@@ -43,11 +43,11 @@ func NewRegistry() *Registry {
 			Timeout:    30 * time.Second,
 		})
 
-		log.Println("[registry] nvidia registered")
+		log.Println("nvidia api registered")
 
 	} else {
 
-		log.Println("[registry] nvidia skipped (NVIDIA_API_KEY not set)")
+		log.Println(" nvidia api skipped (NVIDIA_API_KEY not set)")
 
 	}
 
@@ -59,15 +59,15 @@ func NewRegistry() *Registry {
 			Timeout:    60 * time.Second,
 		})
 
-		log.Println("[registry] anthropic registered")
+		log.Println("anthropic api registered")
 
 	} else {
 
-		log.Println("[registry] anthropic skipped (ANTHROPIC_API_KEY not set)")
+		log.Println(" anthropic api skipped (ANTHROPIC_API_KEY not set)")
 
 	}
 
-	log.Printf("[registry] %d provider(s) available", len(r.clients))
+	log.Printf("%d provider(s) available", len(r.clients))
 
 	return r
 }

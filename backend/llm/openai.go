@@ -93,6 +93,8 @@ type openaiErrorResponse struct {
 }
 
 func (ad *OpenAIAdapter) ChatCompletion(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
+	endpoint := ad.baseURL + "/chat/completions"
+	log.Printf("[openai] → POST %s model=%s messages=%d tools=%d", endpoint, req.Model, len(req.Messages), len(req.Tools))
 
 	payload := ad.buildPayload(req)
 
@@ -100,25 +102,28 @@ func (ad *OpenAIAdapter) ChatCompletion(ctx context.Context, req *ChatRequest) (
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal openai request : %w", err)
 	}
+	log.Printf("[openai] request payload size=%d bytes", len(bodyBytes))
 
 	var lastErr error
+	start := time.Now()
 
 	for attempt := 0; attempt <= ad.maxRetries; attempt++ {
 		if attempt > 0 {
 			backoff := time.Duration(math.Pow(2, float64(attempt-1))) * time.Second
-
-			log.Printf("OpenAI retry %d/%d after %v", attempt, ad.maxRetries, backoff)
+			log.Printf("[openai] retry %d/%d after %v (last error: %v)", attempt, ad.maxRetries, backoff, lastErr)
 
 			select {
 			case <-ctx.Done():
+				log.Printf("[openai] context cancelled during retry backoff")
 				return nil, ctx.Err()
 			case <-time.After(backoff):
 			}
 		}
 
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ad.baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
+		attemptStart := time.Now()
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 		if err != nil {
-			return nil, fmt.Errorf("Failed to Create Request : %w", err)
+			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
 
 		httpReq.Header.Set("Content-Type", "application/json")
@@ -126,7 +131,8 @@ func (ad *OpenAIAdapter) ChatCompletion(ctx context.Context, req *ChatRequest) (
 
 		httpResp, err := ad.client.Do(httpReq)
 		if err != nil {
-			lastErr = fmt.Errorf("OpenAI Request Failed : %w", err)
+			lastErr = fmt.Errorf("request failed: %w", err)
+			log.Printf("[openai] ✗ network error attempt=%d elapsed=%v err=%v", attempt, time.Since(attemptStart), err)
 			continue
 		}
 
@@ -134,9 +140,12 @@ func (ad *OpenAIAdapter) ChatCompletion(ctx context.Context, req *ChatRequest) (
 		httpResp.Body.Close()
 
 		if err != nil {
-			lastErr = fmt.Errorf("Failed to read OpenAI Response : %w", err)
+			lastErr = fmt.Errorf("failed to read response: %w", err)
+			log.Printf("[openai] ✗ read error attempt=%d err=%v", attempt, err)
 			continue
 		}
+
+		log.Printf("[openai] ← status=%d response_size=%d bytes elapsed=%v", httpResp.StatusCode, len(respBody), time.Since(attemptStart))
 
 		if httpResp.StatusCode != http.StatusOK {
 			lastErr = ad.handleErrorStatus(httpResp.StatusCode, respBody)
@@ -147,11 +156,25 @@ func (ad *OpenAIAdapter) ChatCompletion(ctx context.Context, req *ChatRequest) (
 			return nil, lastErr
 		}
 
-		return ad.parseResponse(respBody)
+		resp, err := ad.parseResponse(respBody)
+		if err != nil {
+			return nil, err
+		}
 
+		log.Printf("[openai] ✓ completed model=%s prompt=%d completion=%d total_elapsed=%v",
+			resp.Model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens, time.Since(start))
+
+		if len(resp.ToolCalls) > 0 {
+			for _, tc := range resp.ToolCalls {
+				log.Printf("[openai] ⚡ tool_call id=%s name=%s", tc.ID, tc.Name)
+			}
+		}
+
+		return resp, nil
 	}
 
-	return nil, fmt.Errorf("OpenAI Request Failed after %d retries : %w", ad.maxRetries, lastErr)
+	log.Printf("[openai] ✗ exhausted all %d retries total_elapsed=%v", ad.maxRetries, time.Since(start))
+	return nil, fmt.Errorf("request failed after %d retries: %w", ad.maxRetries, lastErr)
 }
 
 func (a *OpenAIAdapter) parseResponse(body []byte) (*ChatResponse, error) {
@@ -188,11 +211,14 @@ func (a *OpenAIAdapter) parseResponse(body []byte) (*ChatResponse, error) {
 
 func (a *OpenAIAdapter) handleErrorStatus(status int, body []byte) error {
 	var errResp openaiErrorResponse
-	if err := json.Unmarshal(body, &errResp); err != nil {
-		return fmt.Errorf("Failed to parse openai error response : %w", err)
-	}
+	json.Unmarshal(body, &errResp) // best-effort, ignore parse errors
 
 	msg := errResp.Error.Message
+	if msg == "" {
+		msg = string(body)
+	}
+
+	log.Printf("[openai] error status=%d body=%s", status, msg)
 
 	switch status {
 	case 401:
@@ -204,7 +230,6 @@ func (a *OpenAIAdapter) handleErrorStatus(status int, body []byte) error {
 	default:
 		return fmt.Errorf("provider error (status %d): %s", status, msg)
 	}
-
 }
 
 func (ad *OpenAIAdapter) buildPayload(req *ChatRequest) map[string]any {

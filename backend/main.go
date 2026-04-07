@@ -3,6 +3,7 @@ package main
 import (
 	"backend/db"
 	"backend/handlers"
+	"backend/llm"
 	"backend/middleware"
 	"encoding/json"
 	"log"
@@ -78,8 +79,11 @@ func main() {
 		Users: db.GetCollection("AgentFlow", "users"),
 	}
 
+	llmRegistry := llm.NewRegistry()
+
 	llmHandler := &handlers.LLMHandler{
 		LLMRegistry: db.GetCollection("AgentFlow", "llm_registry"),
+		Registry:    llmRegistry,
 	}
 
 	mux.HandleFunc("/api/auth/signup", loggingMiddleware(corsMiddleware(authHandler.SignUp)))

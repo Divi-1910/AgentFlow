@@ -81,57 +81,59 @@ type anthropicErrorResponse struct {
 }
 
 func (a *AnthropicAdapter) ChatCompletion(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
+	log.Printf("[anthropic] → POST https://api.anthropic.com/v1/messages model=%s messages=%d tools=%d", req.Model, len(req.Messages), len(req.Tools))
+
 	payload := a.buildPayload(req)
 
 	bodyBytes, err := json.Marshal(payload)
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
+	log.Printf("[anthropic] request payload size=%d bytes", len(bodyBytes))
 
 	var lastErr error
+	start := time.Now()
 
 	for attempt := 0; attempt <= a.maxRetries; attempt++ {
-
 		if attempt > 0 {
-
 			backoff := time.Duration(math.Pow(2, float64(attempt-1))) * time.Second
+			log.Printf("[anthropic] retry %d/%d after %v (last error: %v)", attempt, a.maxRetries, backoff, lastErr)
 
-			log.Printf("Anthropic retry %d/%d after %v", attempt, a.maxRetries, backoff)
 			select {
 			case <-ctx.Done():
+				log.Printf("[anthropic] context cancelled during retry backoff")
 				return nil, ctx.Err()
 			case <-time.After(backoff):
 			}
 		}
 
+		attemptStart := time.Now()
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(bodyBytes))
-
 		if err != nil {
 			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
 
 		httpReq.Header.Set("Content-Type", "application/json")
-
 		httpReq.Header.Set("x-api-key", a.apiKey)
-
 		httpReq.Header.Set("anthropic-version", anthropicAPIVersion)
 
 		resp, err := a.client.Do(httpReq)
-
 		if err != nil {
 			lastErr = fmt.Errorf("request failed: %w", err)
+			log.Printf("[anthropic] ✗ network error attempt=%d elapsed=%v err=%v", attempt, time.Since(attemptStart), err)
 			continue
 		}
 
 		respBody, err := io.ReadAll(resp.Body)
-
 		resp.Body.Close()
 
 		if err != nil {
 			lastErr = fmt.Errorf("failed to read response: %w", err)
+			log.Printf("[anthropic] ✗ read error attempt=%d err=%v", attempt, err)
 			continue
 		}
+
+		log.Printf("[anthropic] ← status=%d response_size=%d bytes elapsed=%v", resp.StatusCode, len(respBody), time.Since(attemptStart))
 
 		if resp.StatusCode != http.StatusOK {
 			lastErr = a.handleErrorStatus(resp.StatusCode, respBody)
@@ -141,10 +143,25 @@ func (a *AnthropicAdapter) ChatCompletion(ctx context.Context, req *ChatRequest)
 			return nil, lastErr
 		}
 
-		return a.parseResponse(respBody)
+		result, err := a.parseResponse(respBody)
+		if err != nil {
+			return nil, err
+		}
+
+		log.Printf("[anthropic] ✓ completed model=%s prompt=%d completion=%d total_elapsed=%v",
+			result.Model, result.Usage.PromptTokens, result.Usage.CompletionTokens, time.Since(start))
+
+		if len(result.ToolCalls) > 0 {
+			for _, tc := range result.ToolCalls {
+				log.Printf("[anthropic] ⚡ tool_call id=%s name=%s", tc.ID, tc.Name)
+			}
+		}
+
+		return result, nil
 	}
 
-	return nil, fmt.Errorf("exhausted retries: %w", lastErr)
+	log.Printf("[anthropic] ✗ exhausted all %d retries total_elapsed=%v", a.maxRetries, time.Since(start))
+	return nil, fmt.Errorf("request failed after %d retries: %w", a.maxRetries, lastErr)
 }
 
 func (a *AnthropicAdapter) buildPayload(req *ChatRequest) map[string]interface{} {
@@ -157,6 +174,11 @@ func (a *AnthropicAdapter) buildPayload(req *ChatRequest) map[string]interface{}
 			messages = append(messages, m)
 		}
 	}
+
+	if system != "" {
+		log.Printf("[anthropic] extracted system message (%d chars) → top-level field", len(system))
+	}
+	log.Printf("[anthropic] building payload: %d user/assistant messages, max_tokens=%d", len(messages), req.MaxTokens)
 
 	anthMessages := make([]anthropicMessage, 0, len(messages))
 	for _, m := range messages {
@@ -274,14 +296,14 @@ func (a *AnthropicAdapter) parseResponse(body []byte) (*ChatResponse, error) {
 
 func (a *AnthropicAdapter) handleErrorStatus(status int, body []byte) error {
 	var errResp anthropicErrorResponse
-
 	json.Unmarshal(body, &errResp)
 
 	msg := errResp.Error.Message
-
 	if msg == "" {
 		msg = string(body)
 	}
+
+	log.Printf("[anthropic] error status=%d type=%s body=%s", status, errResp.Error.Type, msg)
 
 	switch status {
 	case 401:
@@ -293,5 +315,4 @@ func (a *AnthropicAdapter) handleErrorStatus(status int, body []byte) error {
 	default:
 		return fmt.Errorf("provider error (status %d): %s", status, msg)
 	}
-
 }
