@@ -78,9 +78,15 @@ func main() {
 		Users: db.GetCollection("AgentFlow", "users"),
 	}
 
+	llmHandler := &handlers.LLMHandler{
+		LLMRegistry: db.GetCollection("AgentFlow", "llm_registry"),
+	}
+
 	mux.HandleFunc("/api/auth/signup", loggingMiddleware(corsMiddleware(authHandler.SignUp)))
 	mux.HandleFunc("/api/auth/login", loggingMiddleware(corsMiddleware(authHandler.Login)))
 	mux.HandleFunc("/api/auth/me", loggingMiddleware(corsMiddleware(middleware.RequireAuth(authHandler.Me))))
+
+	mux.HandleFunc("/api/llms", loggingMiddleware(corsMiddleware(middleware.RequireAuth(llmHandler.GetLLMs))))
 
 	port := os.Getenv("PORT")
 	if port == "" {

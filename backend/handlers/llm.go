@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"backend/model"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -13,7 +14,7 @@ type LLMHandler struct {
 	LLMRegistry *mongo.Collection
 }
 
-func (lh *LLMHandler) GetModels(w http.ResponseWriter, r *http.Request) {
+func (lh *LLMHandler) GetLLMs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
@@ -26,14 +27,15 @@ func (lh *LLMHandler) GetModels(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cursor.Close(context.TODO())
 
-	var models []bson.M
+	var models []model.LLMModel
+
 	if err := cursor.All(context.TODO(), &models); err != nil {
 		http.Error(w, "Error processing model data", http.StatusInternalServerError)
 		return
 	}
 
 	if models == nil {
-		models = []bson.M{}
+		models = []model.LLMModel{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
