@@ -45,8 +45,6 @@ func (lh *LLMHandler) GetLLMs(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(models)
 }
 
-// ── Chat Test Endpoint ────────────────────────────────────
-
 type chatRequest struct {
 	Provider    string                 `json:"provider"`
 	Model       string                 `json:"model"`
@@ -58,11 +56,14 @@ type chatRequest struct {
 }
 
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string         `json:"role"`
+	Content    string         `json:"content,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+	ToolCalls  []llm.ToolCall `json:"tool_calls,omitempty"`
 }
 
 type chatResponse struct {
+	Provider  string         `json:"provider"`
 	Content   string         `json:"content"`
 	ToolCalls []llm.ToolCall `json:"tool_calls,omitempty"`
 	Model     string         `json:"model"`
@@ -87,10 +88,24 @@ func (lh *LLMHandler) Chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Provider == "" || req.Model == "" || len(req.Messages) == 0 {
+	if req.Provider == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(chatErrorResponse{Error: "provider, model, and messages are required"})
+		json.NewEncoder(w).Encode(chatErrorResponse{Error: "provider is required"})
+		return
+	}
+
+	if req.Model == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(chatErrorResponse{Error: "model is required"})
+		return
+	}
+
+	if len(req.Messages) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(chatErrorResponse{Error: "messages cannot be empty"})
 		return
 	}
 
@@ -105,8 +120,10 @@ func (lh *LLMHandler) Chat(w http.ResponseWriter, r *http.Request) {
 	messages := make([]llm.ChatMessage, len(req.Messages))
 	for i, m := range req.Messages {
 		messages[i] = llm.ChatMessage{
-			Role:    m.Role,
-			Content: m.Content,
+			Role:       m.Role,
+			Content:    m.Content,
+			ToolCallID: m.ToolCallID,
+			ToolCalls:  m.ToolCalls,
 		}
 	}
 
@@ -134,6 +151,7 @@ func (lh *LLMHandler) Chat(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(chatResponse{
+		Provider:  req.Provider,
 		Content:   resp.Content,
 		ToolCalls: resp.ToolCalls,
 		Model:     resp.Model,
