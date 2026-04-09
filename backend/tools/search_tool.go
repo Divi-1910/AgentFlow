@@ -1,0 +1,160 @@
+package tools
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"backend/llm"
+)
+
+type SearchTool struct {
+	apiKey string
+	client *http.Client
+}
+
+func NewSearchTool(apiKey string, timeout time.Duration) *SearchTool {
+	return &SearchTool{
+		apiKey: apiKey,
+		client: &http.Client{Timeout: timeout},
+	}
+}
+
+func (t *SearchTool) Name() string { return "web_search" }
+
+func (t *SearchTool) Definition() llm.ToolDefinition {
+	return llm.ToolDefinition{
+		Name:        "web_search",
+		Description: "Searches the web for current information and returns a summary with top results. Use this to answer questions about recent events or find up-to-date information.",
+		Parameters: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"query": {
+					"type": "string",
+					"description": "The search query"
+				},
+				"max_results": {
+					"type": "integer",
+					"description": "Maximum number of results to return (1-10). Defaults to 5.",
+					"minimum": 1,
+					"maximum": 10
+				}
+			},
+			"required": ["query"]
+		}`),
+	}
+}
+
+type searchArgs struct {
+	Query      string `json:"query"`
+	MaxResults int    `json:"max_results,omitempty"`
+}
+
+type tavilyRequest struct {
+	APIKey      string `json:"api_key"`
+	Query       string `json:"query"`
+	MaxResults  int    `json:"max_results"`
+	SearchDepth string `json:"search_depth"`
+}
+
+type tavilyResponse struct {
+	Answer  string         `json:"answer"`
+	Results []tavilyResult `json:"results"`
+}
+
+type tavilyResult struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Content string `json:"content"`
+}
+
+func (t *SearchTool) Execute(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
+	var input searchArgs
+	if err := json.Unmarshal(args, &input); err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidArgs, err.Error())
+	}
+	if strings.TrimSpace(input.Query) == "" {
+		return nil, fmt.Errorf("%w: query is required", ErrInvalidArgs)
+	}
+	if input.MaxResults <= 0 || input.MaxResults > 10 {
+		input.MaxResults = 5
+	}
+
+	payload, err := json.Marshal(tavilyRequest{
+		APIKey:      t.apiKey,
+		Query:       input.Query,
+		MaxResults:  input.MaxResults,
+		SearchDepth: "basic",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to build request", ErrToolExecutionFailed)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://api.tavily.com/search", bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to create request", ErrToolExecutionFailed)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return &ToolResult{
+			Content: fmt.Sprintf("[tool: web_search]\nError: search request failed: %s", err.Error()),
+			IsError: true,
+		}, nil
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("%w: failed to read response", ErrToolExecutionFailed)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return &ToolResult{
+			Content: fmt.Sprintf("[tool: web_search]\nError: Tavily returned status %d: %s",
+				resp.StatusCode, string(respBytes)),
+			IsError: true,
+		}, nil
+	}
+
+	var tavilyResp tavilyResponse
+	if err := json.Unmarshal(respBytes, &tavilyResp); err != nil {
+		return nil, fmt.Errorf("%w: failed to parse Tavily response", ErrToolExecutionFailed)
+	}
+
+	return &ToolResult{
+		Content: t.format(tavilyResp),
+		Metadata: map[string]interface{}{
+			"query":        input.Query,
+			"result_count": len(tavilyResp.Results),
+		},
+	}, nil
+}
+
+func (t *SearchTool) format(r tavilyResponse) string {
+	var sb strings.Builder
+	sb.WriteString("[tool: web_search]")
+
+	if r.Answer != "" {
+		sb.WriteString("\n\nSummary:\n")
+		sb.WriteString(r.Answer)
+	}
+
+	for i, res := range r.Results {
+		domain := res.URL
+		if parsed, err := url.Parse(res.URL); err == nil {
+			domain = parsed.Hostname()
+		}
+		sb.WriteString(fmt.Sprintf("\n\n[%d] %s (%s)\n%s", i+1, res.Title, domain, res.Content))
+	}
+
+	return sb.String()
+}
