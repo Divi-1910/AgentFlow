@@ -30,14 +30,6 @@ func NewOpenAIAdapter(config AdapterConfig) *OpenAIAdapter {
 	}
 }
 
-type openaiRequest struct {
-	Model       string          `json:"model"`
-	Messages    []openaiMessage `json:"messages"`
-	Tools       []openaiTool    `json:"tools"`
-	Temperature float64         `json:"temperature"`
-	MaxTokens   int             `json:"max_tokens"`
-	Params      map[string]any  `json:"params"`
-}
 
 type openaiMessage struct {
 	Role       string           `json:"role"`
