@@ -7,12 +7,12 @@ import (
 	"time"
 )
 
-type Registry struct {
+type LLMRegistry struct {
 	clients map[string]LLMClient
 }
 
-func NewRegistry() *Registry {
-	r := &Registry{
+func NewLLMRegistry() *LLMRegistry {
+	r := &LLMRegistry{
 		clients: make(map[string]LLMClient),
 	}
 
@@ -72,7 +72,7 @@ func NewRegistry() *Registry {
 	return r
 }
 
-func (r *Registry) Get(provider string) (LLMClient, error) {
+func (r *LLMRegistry) Get(provider string) (LLMClient, error) {
 
 	client, ok := r.clients[provider]
 
@@ -83,7 +83,7 @@ func (r *Registry) Get(provider string) (LLMClient, error) {
 	return client, nil
 }
 
-func (r *Registry) Available() []string {
+func (r *LLMRegistry) Available() []string {
 
 	providers := make([]string, 0, len(r.clients))
 

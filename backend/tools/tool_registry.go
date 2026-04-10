@@ -2,6 +2,7 @@ package tools
 
 import (
 	"backend/llm"
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -44,10 +45,19 @@ func (r *ToolRegistry) Definitions() []llm.ToolDefinition {
 	}
 	return defs
 }
+
 func (r *ToolRegistry) Names() []string {
 	names := make([]string, 0, len(r.tools))
 	for name := range r.tools {
 		names = append(names, name)
 	}
 	return names
+}
+
+func (r *ToolRegistry) Get(name string) (Tool, error) {
+	t, ok := r.tools[name]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrToolNotFound, name)
+	}
+	return t, nil
 }

@@ -14,7 +14,7 @@ import (
 
 type LLMHandler struct {
 	LLMRegistry *mongo.Collection
-	Registry    *llm.Registry
+	Registry    *llm.LLMRegistry
 }
 
 func (lh *LLMHandler) GetLLMs(w http.ResponseWriter, r *http.Request) {
