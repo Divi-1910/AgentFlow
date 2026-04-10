@@ -151,8 +151,8 @@ func (t *HTTPTool) Execute(ctx context.Context, args json.RawMessage) (*ToolResu
 	}
 
 	return &ToolResult{
-		Content: fmt.Sprintf("[tool: http_request]\nStatus: %d\nBody: %s%s",
-			resp.StatusCode, string(bodyBytes), truncationNote),
+		Content: fmt.Sprintf("[tool: http_request]\nStatus: %d\nContent-Type: %s\nBody: %s%s",
+			resp.StatusCode, contentType, string(bodyBytes), truncationNote),
 		Metadata: map[string]interface{}{
 			"status_code":  resp.StatusCode,
 			"url":          input.URL,

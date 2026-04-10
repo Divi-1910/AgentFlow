@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"time"
 )
 
@@ -39,9 +40,11 @@ func (r *ToolRegistry) Register(t Tool) {
 }
 
 func (r *ToolRegistry) Definitions() []llm.ToolDefinition {
-	defs := make([]llm.ToolDefinition, 0, len(r.tools))
-	for _, t := range r.tools {
-		defs = append(defs, t.Definition())
+	names := r.Names()
+	sort.Strings(names)
+	defs := make([]llm.ToolDefinition, 0, len(names))
+	for _, name := range names {
+		defs = append(defs, r.tools[name].Definition())
 	}
 	return defs
 }

@@ -9,7 +9,7 @@ import (
 
 var (
 	ErrToolNotFound        = errors.New("tool not found")
-	ErrInvalidArgs         = errors.New("Invalide Tool Arguments")
+	ErrInvalidArgs         = errors.New("invalid tool arguments")
 	ErrToolExecutionFailed = errors.New("Tool Execution Failed")
 	ErrToolTimeout         = errors.New("Tool Timeout")
 )
