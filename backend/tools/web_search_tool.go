@@ -14,21 +14,21 @@ import (
 	"backend/llm"
 )
 
-type SearchTool struct {
+type WebSearchTool struct {
 	apiKey string
 	client *http.Client
 }
 
-func NewSearchTool(apiKey string, timeout time.Duration) *SearchTool {
-	return &SearchTool{
+func NewWebSearchTool(apiKey string, timeout time.Duration) *WebSearchTool {
+	return &WebSearchTool{
 		apiKey: apiKey,
 		client: &http.Client{Timeout: timeout},
 	}
 }
 
-func (t *SearchTool) Name() string { return "web_search" }
+func (t *WebSearchTool) Name() string { return "web_search" }
 
-func (t *SearchTool) Definition() llm.ToolDefinition {
+func (t *WebSearchTool) Definition() llm.ToolDefinition {
 	return llm.ToolDefinition{
 		Name:        "web_search",
 		Description: "Searches the web for current information and returns a summary with top results. Use this to answer questions about recent events or find up-to-date information.",
@@ -74,7 +74,7 @@ type tavilyResult struct {
 	Content string `json:"content"`
 }
 
-func (t *SearchTool) Execute(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
+func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
 	var input searchArgs
 	if err := json.Unmarshal(args, &input); err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidArgs, err.Error())
@@ -139,12 +139,12 @@ func (t *SearchTool) Execute(ctx context.Context, args json.RawMessage) (*ToolRe
 	}, nil
 }
 
-func (t *SearchTool) format(r tavilyResponse) string {
+func (t *WebSearchTool) format(r tavilyResponse) string {
 	var sb strings.Builder
 	sb.WriteString("[tool: web_search]")
 
 	if r.Answer != "" {
-		sb.WriteString("\n\nSummary:\n")
+		sb.WriteString("\nSummary:\n")
 		sb.WriteString(r.Answer)
 	}
 

@@ -23,7 +23,7 @@ func NewToolRegistry() *ToolRegistry {
 	log.Println("http_request tool registered")
 
 	if key := os.Getenv("TAVILY_API_KEY"); key != "" {
-		r.Register(NewSearchTool(key, 30*time.Second))
+		r.Register(NewWebSearchTool(key, 30*time.Second))
 		log.Println("web_search tool registered")
 	} else {
 		log.Println("web_search tool skipped (TAVILY_API_KEY not set)")

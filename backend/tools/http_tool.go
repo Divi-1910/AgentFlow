@@ -145,13 +145,19 @@ func (t *HTTPTool) Execute(ctx context.Context, args json.RawMessage) (*ToolResu
 		truncationNote = "\n[response truncated at 32KB]"
 	}
 
+	contentType := resp.Header.Get("Content-Type")
+	if idx := strings.Index(contentType, ";"); idx != -1 {
+		contentType = strings.TrimSpace(contentType[:idx])
+	}
+
 	return &ToolResult{
 		Content: fmt.Sprintf("[tool: http_request]\nStatus: %d\nBody: %s%s",
 			resp.StatusCode, string(bodyBytes), truncationNote),
 		Metadata: map[string]interface{}{
-			"status_code": resp.StatusCode,
-			"url":         input.URL,
-			"method":      input.Method,
+			"status_code":  resp.StatusCode,
+			"url":          input.URL,
+			"method":       input.Method,
+			"content_type": contentType,
 		},
 	}, nil
 }
@@ -160,6 +166,10 @@ func (t *HTTPTool) checkSSRF(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %s", err.Error())
+	}
+
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("only http and https URLs are allowed, got %q", parsed.Scheme)
 	}
 
 	hostname := parsed.Hostname()

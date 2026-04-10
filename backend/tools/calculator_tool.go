@@ -151,7 +151,7 @@ func (p *parser) parsePower() (float64, error) {
 	ch, ok := p.peek()
 	if ok && ch == '^' {
 		p.pos++
-		exp, err := p.parseUnary()
+		exp, err := p.parsePower()
 		if err != nil {
 			return 0, err
 		}
