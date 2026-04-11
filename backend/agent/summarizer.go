@@ -50,7 +50,7 @@ Be concise. Max 300 words.
 Return only the updated summary.`, input),
 			},
 		},
-		Temperature: 0, // deterministic summaries — same input must produce same output
+		Temperature: 0,
 		MaxTokens:   1024,
 	})
 	if err != nil {
