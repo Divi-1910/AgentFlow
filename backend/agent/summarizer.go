@@ -22,7 +22,7 @@ func (s *Summarizer) Summarize(
 	agent *Agent,
 	previousSummary string,
 	droppedTurns []Turn,
-) (string, error) {
+) (string, llm.TokenUsage, error) {
 	model := agent.SummarizationModel
 	if model == "" {
 		model = agent.Model
@@ -30,7 +30,7 @@ func (s *Summarizer) Summarize(
 
 	client, err := s.llmRegistry.Get(agent.Provider)
 	if err != nil {
-		return "", fmt.Errorf("summarizer: provider %q unavailable: %w", agent.Provider, err)
+		return "", llm.TokenUsage{}, fmt.Errorf("summarizer: provider %q unavailable: %w", agent.Provider, err)
 	}
 
 	input := s.buildSummarizationInput(previousSummary, droppedTurns)
@@ -50,16 +50,17 @@ Be concise. Max 300 words.
 Return only the updated summary.`, input),
 			},
 		},
-		MaxTokens: 512,
+		Temperature: 0, // deterministic summaries — same input must produce same output
+		MaxTokens:   1024,
 	})
 	if err != nil {
 		log.Printf("[summarizer] ✗ failed: %v", err)
-		return "", err
+		return "", llm.TokenUsage{}, err
 	}
 
 	summary := strings.TrimSpace(resp.Content)
-	log.Printf("[summarizer] ✓ produced summary len=%d", len(summary))
-	return summary, nil
+	log.Printf("[summarizer] ✓ produced summary len=%d tokens=%d", len(summary), resp.Usage.TotalTokens)
+	return summary, resp.Usage, nil
 }
 
 func (s *Summarizer) buildSummarizationInput(previousSummary string, turns []Turn) string {

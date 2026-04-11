@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"backend/llm"
 	"backend/tools"
@@ -109,7 +110,7 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 
 		assistantMsg := llm.ChatMessage{
 			Role:      "assistant",
-			Content:   resp.Content,
+			Content:   strings.TrimSpace(resp.Content),
 			ToolCalls: resp.ToolCalls,
 		}
 		messages = append(messages, assistantMsg)
@@ -124,6 +125,10 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 					Role:       "tool",
 					ToolCallID: call.ID,
 					Content:    fmt.Sprintf("[error] tool %q not available", call.Name),
+					Metadata: map[string]any{
+						"tool_name": call.Name,
+						"is_error":  true,
+					},
 				}
 				messages = append(messages, errMsg)
 				newMessages = append(newMessages, errMsg)
@@ -131,12 +136,21 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 				continue
 			}
 
+			start := time.Now()
 			result, err := tool.Execute(ctx, call.Arguments)
+			latencyMs := time.Since(start).Milliseconds()
+
 			if err != nil {
 				errMsg := llm.ChatMessage{
 					Role:       "tool",
 					ToolCallID: call.ID,
 					Content:    fmt.Sprintf("[error] tool %q failed: %s", call.Name, err.Error()),
+					Metadata: map[string]any{
+						"tool_name":  call.Name,
+						"arguments":  call.Arguments,
+						"is_error":   true,
+						"latency_ms": latencyMs,
+					},
 				}
 				messages = append(messages, errMsg)
 				newMessages = append(newMessages, errMsg)
@@ -144,13 +158,19 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 				continue
 			}
 
-			log.Printf("[runtime] ✓ tool=%s is_error=%v content_len=%d",
-				call.Name, result.IsError, len(result.Content))
+			log.Printf("[runtime] ✓ tool=%s is_error=%v content_len=%d latency_ms=%d",
+				call.Name, result.IsError, len(result.Content), latencyMs)
 
 			toolMsg := llm.ChatMessage{
 				Role:       "tool",
 				ToolCallID: call.ID,
 				Content:    result.Content,
+				Metadata: map[string]any{
+					"tool_name":  call.Name,
+					"arguments":  call.Arguments,
+					"is_error":   result.IsError,
+					"latency_ms": latencyMs,
+				},
 			}
 			messages = append(messages, toolMsg)
 			newMessages = append(newMessages, toolMsg)

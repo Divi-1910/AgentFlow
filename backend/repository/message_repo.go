@@ -57,6 +57,14 @@ func (r *MessageRepo) InsertMany(
 			doc.ToolCallID = m.ToolCallID
 		}
 
+		if m.Metadata != nil {
+			doc.Metadata = m.Metadata
+			// Promote tool_name to its own field for easier querying and indexing
+			if name, ok := m.Metadata["tool_name"].(string); ok {
+				doc.ToolName = name
+			}
+		}
+
 		docs = append(docs, doc)
 	}
 
