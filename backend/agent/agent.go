@@ -2,6 +2,7 @@ package agent
 
 import (
 	"errors"
+	"time"
 
 	"backend/llm"
 )
@@ -13,15 +14,19 @@ var (
 )
 
 const (
-	defaultMaxSteps         = 25
-	defaultContextWindow    = 6
-	defaultContextKeepRatio = 0.5
-	contextTriggerRatio     = 0.95
+	DefaultMaxSteps         = 25
+	DefaultContextWindow    = 6
+	DefaultContextKeepRatio = 0.5
+	DefaultTemperature      = 0.7
+	DefaultMaxTokens        = 4096
+
+	contextTriggerRatio = 0.95
 )
 
 type Agent struct {
-	ID   string
-	Name string
+	ID          string
+	Name        string
+	Description string
 
 	Provider string
 	Model    string
@@ -37,6 +42,8 @@ type Agent struct {
 	MaxSteps    int
 	Temperature float64
 	MaxTokens   int
+
+	CreatedAt time.Time
 }
 
 type RunContext struct {

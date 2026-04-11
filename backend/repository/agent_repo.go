@@ -10,6 +10,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 type AgentRepo struct {
@@ -32,6 +33,7 @@ func (r *AgentRepo) Create(ctx context.Context, userID string, input *agent.Agen
 		ID:                 bson.NewObjectID(),
 		UserID:             uid,
 		Name:               input.Name,
+		Description:        input.Description,
 		Provider:           input.Provider,
 		Model:              input.Model,
 		SystemPrompt:       input.SystemPrompt,
@@ -103,6 +105,83 @@ func (r *AgentRepo) ListByUser(ctx context.Context, userID string) ([]*agent.Age
 	return agents, nil
 }
 
+type UpdateAgentInput struct {
+	Name               *string
+	Description        *string
+	SystemPrompt       *string
+	Tools              *[]string
+	Provider           *string
+	Model              *string
+	Temperature        *float64
+	MaxSteps           *int
+	MaxTokens          *int
+	ContextKeepRatio   *float64
+	SummarizationModel *string
+}
+
+func (r *AgentRepo) Update(ctx context.Context, agentID, userID string, input UpdateAgentInput) (*agent.Agent, error) {
+	aid, err := bson.ObjectIDFromHex(agentID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid agent_id: %w", err)
+	}
+	uid, err := bson.ObjectIDFromHex(userID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid user_id: %w", err)
+	}
+
+	set := bson.M{"updated_at": time.Now()}
+	if input.Name != nil {
+		set["name"] = *input.Name
+	}
+	if input.Description != nil {
+		set["description"] = *input.Description
+	}
+	if input.SystemPrompt != nil {
+		set["system_prompt"] = *input.SystemPrompt
+	}
+	if input.Tools != nil {
+		set["tools"] = *input.Tools
+	}
+	if input.Provider != nil {
+		set["provider"] = *input.Provider
+	}
+	if input.Model != nil {
+		set["model"] = *input.Model
+	}
+	if input.Temperature != nil {
+		set["temperature"] = *input.Temperature
+	}
+	if input.MaxSteps != nil {
+		set["max_steps"] = *input.MaxSteps
+	}
+	if input.MaxTokens != nil {
+		set["max_tokens"] = *input.MaxTokens
+	}
+	if input.ContextKeepRatio != nil {
+		set["context_keep_ratio"] = *input.ContextKeepRatio
+	}
+	if input.SummarizationModel != nil {
+		set["summarization_model"] = *input.SummarizationModel
+	}
+
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+	var doc model.AgentDocument
+	err = r.col.FindOneAndUpdate(
+		ctx,
+		bson.M{"_id": aid, "user_id": uid},
+		bson.M{"$set": set},
+		opts,
+	).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return nil, fmt.Errorf("agent not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("agent_repo: update failed: %w", err)
+	}
+
+	return r.toRuntimeAgent(ctx, doc), nil
+}
+
 func (r *AgentRepo) Delete(ctx context.Context, agentID, userID string) error {
 	aid, err := bson.ObjectIDFromHex(agentID)
 	if err != nil {
@@ -127,6 +206,7 @@ func (r *AgentRepo) toRuntimeAgent(ctx context.Context, doc model.AgentDocument)
 	return &agent.Agent{
 		ID:                 doc.ID.Hex(),
 		Name:               doc.Name,
+		Description:        doc.Description,
 		Provider:           doc.Provider,
 		Model:              doc.Model,
 		SystemPrompt:       doc.SystemPrompt,
@@ -138,6 +218,7 @@ func (r *AgentRepo) toRuntimeAgent(ctx context.Context, doc model.AgentDocument)
 		MaxSteps:           doc.MaxSteps,
 		Temperature:        doc.Temperature,
 		MaxTokens:          doc.MaxTokens,
+		CreatedAt:          doc.CreatedAt,
 	}
 }
 

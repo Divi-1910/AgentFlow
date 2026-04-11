@@ -26,7 +26,7 @@ func NewAgentRuntime(llmRegistry *llm.LLMRegistry, toolRegistry *tools.ToolRegis
 func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext) (*RunResult, error) {
 	maxSteps := agent.MaxSteps
 	if maxSteps == 0 {
-		maxSteps = defaultMaxSteps
+		maxSteps = DefaultMaxSteps
 	}
 
 	client, err := r.llmRegistry.Get(agent.Provider)

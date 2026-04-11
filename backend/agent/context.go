@@ -133,7 +133,7 @@ func SplitTurnsForCompaction(a *Agent, summary string, turns []Turn) (drop, keep
 
 	keepRatio := a.ContextKeepRatio
 	if keepRatio == 0 {
-		keepRatio = defaultContextKeepRatio
+		keepRatio = DefaultContextKeepRatio
 	}
 	keepBudget := int(float64(modelLimit) * keepRatio)
 
@@ -145,7 +145,7 @@ func SplitTurnsForCompaction(a *Agent, summary string, turns []Turn) (drop, keep
 
 	minTurns := a.ContextWindow
 	if minTurns == 0 {
-		minTurns = defaultContextWindow
+		minTurns = DefaultContextWindow
 	}
 
 	keepCount := 0

@@ -33,7 +33,7 @@ type ChatMessage struct {
 	Content    string
 	ToolCallID string
 	ToolCalls  []ToolCall
-	Metadata   map[string]any // optional — used by persistence layer, ignored by LLM adapters
+	Metadata   map[string]any
 }
 
 type ChatResponse struct {

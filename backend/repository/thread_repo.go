@@ -20,7 +20,6 @@ func NewThreadRepo(col *mongo.Collection) *ThreadRepo {
 	return &ThreadRepo{col: col}
 }
 
-// Create inserts a new thread and returns the stored document.
 func (r *ThreadRepo) Create(ctx context.Context, userID, agentID, title string) (*model.ThreadDocument, error) {
 	uid, err := bson.ObjectIDFromHex(userID)
 	if err != nil {
@@ -52,7 +51,6 @@ func (r *ThreadRepo) Create(ctx context.Context, userID, agentID, title string) 
 	return &doc, nil
 }
 
-// GetByID returns a thread by ID, scoped to the requesting user.
 func (r *ThreadRepo) GetByID(ctx context.Context, threadID, userID string) (*model.ThreadDocument, error) {
 	tid, err := bson.ObjectIDFromHex(threadID)
 	if err != nil {
@@ -75,7 +73,6 @@ func (r *ThreadRepo) GetByID(ctx context.Context, threadID, userID string) (*mod
 	return &doc, nil
 }
 
-// ListByAgent returns all threads for a given agent, scoped to the user, newest first.
 func (r *ThreadRepo) ListByAgent(ctx context.Context, agentID, userID string) ([]*model.ThreadDocument, error) {
 	aid, err := bson.ObjectIDFromHex(agentID)
 	if err != nil {
@@ -101,7 +98,6 @@ func (r *ThreadRepo) ListByAgent(ctx context.Context, agentID, userID string) ([
 	return docs, nil
 }
 
-// UpdateSummary replaces the rolling summary for a thread, scoped to the requesting user.
 func (r *ThreadRepo) UpdateSummary(ctx context.Context, threadID, userID, summary string) error {
 	tid, err := bson.ObjectIDFromHex(threadID)
 	if err != nil {
