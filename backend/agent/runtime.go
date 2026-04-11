@@ -22,7 +22,7 @@ func NewAgentRuntime(llmRegistry *llm.LLMRegistry, toolRegistry *tools.ToolRegis
 	}
 }
 
-func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, input string) (*RunResult, error) {
+func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext) (*RunResult, error) {
 	maxSteps := agent.MaxSteps
 	if maxSteps == 0 {
 		maxSteps = defaultMaxSteps
@@ -38,18 +38,20 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, input string) (*Ru
 		return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, err.Error())
 	}
 
-	messages := make([]llm.ChatMessage, 0, 8)
+	systemMsg := BuildSystemMessage(agent.SystemPrompt, runCtx.Summary)
 
-	if agent.SystemPrompt != "" {
-		messages = append(messages, llm.ChatMessage{
-			Role:    "system",
-			Content: agent.SystemPrompt,
-		})
-	}
-
+	messages := make([]llm.ChatMessage, 0, 1+len(runCtx.History)+1+8)
+	messages = append(messages, systemMsg)
+	messages = append(messages, runCtx.History...)
 	messages = append(messages, llm.ChatMessage{
 		Role:    "user",
-		Content: input,
+		Content: runCtx.Input,
+	})
+
+	newMessages := make([]llm.ChatMessage, 0, 8)
+	newMessages = append(newMessages, llm.ChatMessage{
+		Role:    "user",
+		Content: runCtx.Input,
 	})
 
 	var totalUsage llm.TokenUsage
@@ -84,56 +86,60 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, input string) (*Ru
 
 		if len(resp.ToolCalls) == 0 {
 			output := strings.TrimSpace(resp.Content)
-
 			if output == "" {
 				return nil, ErrNoFinalOutput
 			}
 
-			messages = append(messages, llm.ChatMessage{
-				Role:    "assistant",
-				Content: resp.Content,
-			})
+			finalMsg := llm.ChatMessage{Role: "assistant", Content: resp.Content}
+			messages = append(messages, finalMsg)
+			newMessages = append(newMessages, finalMsg)
 
 			log.Printf("[runtime] done steps=%d prompt_tokens=%d completion_tokens=%d",
 				steps, totalUsage.PromptTokens, totalUsage.CompletionTokens)
 
 			return &RunResult{
-				Output:   output,
-				Messages: messages,
-				Steps:    steps,
-				Usage:    totalUsage,
+				Output:      output,
+				NewMessages: newMessages,
+				Steps:       steps,
+				Usage:       totalUsage,
 			}, nil
 		}
 
 		log.Printf("[runtime] step=%d tool_calls=%d", steps, len(resp.ToolCalls))
 
-		messages = append(messages, llm.ChatMessage{
+		assistantMsg := llm.ChatMessage{
 			Role:      "assistant",
 			Content:   resp.Content,
 			ToolCalls: resp.ToolCalls,
-		})
+		}
+		messages = append(messages, assistantMsg)
+		newMessages = append(newMessages, assistantMsg)
 
 		for _, call := range resp.ToolCalls {
 			log.Printf("[runtime] executing tool=%s id=%s", call.Name, call.ID)
 
 			tool, err := r.toolRegistry.Get(call.Name)
 			if err != nil {
-				messages = append(messages, llm.ChatMessage{
+				errMsg := llm.ChatMessage{
 					Role:       "tool",
 					ToolCallID: call.ID,
 					Content:    fmt.Sprintf("[error] tool %q not available", call.Name),
-				})
+				}
+				messages = append(messages, errMsg)
+				newMessages = append(newMessages, errMsg)
 				log.Printf("[runtime] ✗ tool not found: %s", call.Name)
 				continue
 			}
 
 			result, err := tool.Execute(ctx, call.Arguments)
 			if err != nil {
-				messages = append(messages, llm.ChatMessage{
+				errMsg := llm.ChatMessage{
 					Role:       "tool",
 					ToolCallID: call.ID,
 					Content:    fmt.Sprintf("[error] tool %q failed: %s", call.Name, err.Error()),
-				})
+				}
+				messages = append(messages, errMsg)
+				newMessages = append(newMessages, errMsg)
 				log.Printf("[runtime] ✗ tool execution failed: %s err=%v", call.Name, err)
 				continue
 			}
@@ -141,11 +147,13 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, input string) (*Ru
 			log.Printf("[runtime] ✓ tool=%s is_error=%v content_len=%d",
 				call.Name, result.IsError, len(result.Content))
 
-			messages = append(messages, llm.ChatMessage{
+			toolMsg := llm.ChatMessage{
 				Role:       "tool",
 				ToolCallID: call.ID,
 				Content:    result.Content,
-			})
+			}
+			messages = append(messages, toolMsg)
+			newMessages = append(newMessages, toolMsg)
 		}
 	}
 
@@ -166,6 +174,5 @@ func (r *AgentRuntime) loadTools(agent *Agent) ([]llm.ToolDefinition, error) {
 		}
 		defs = append(defs, tool.Definition())
 	}
-
 	return defs, nil
 }
