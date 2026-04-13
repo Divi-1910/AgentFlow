@@ -91,6 +91,10 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	ag, err := h.agentRepo.GetByID(ctx, thread.AgentID.Hex(), userID)
 	if err != nil {
+		if err.Error() == "agent not found" {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to load agent")
 		return
 	}
@@ -208,7 +212,7 @@ func (h *MessageHandler) List(w http.ResponseWriter, r *http.Request) {
 	}
 
 	limit := parseLimit(r, 50, 500)
-	messages, err := h.messageRepo.ListRecentByThread(r.Context(), threadID, limit)
+	messages, err := h.messageRepo.ListDocsByThread(r.Context(), threadID, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load messages")
 		return
@@ -216,10 +220,7 @@ func (h *MessageHandler) List(w http.ResponseWriter, r *http.Request) {
 
 	resp := make([]MessageResponse, len(messages))
 	for i, m := range messages {
-		resp[i] = MessageResponse{
-			Role:    m.Role,
-			Content: m.Content,
-		}
+		resp[i] = toMessageResponse(m)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

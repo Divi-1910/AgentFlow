@@ -106,7 +106,7 @@ func main() {
 	summarizer := agent.NewSummarizer(llmRegistry)
 
 	agentHandler := handlers.NewAgentHandler(agentRepo)
-	threadHandler := handlers.NewThreadHandler(threadRepo)
+	threadHandler := handlers.NewThreadHandler(threadRepo, agentRepo)
 	messageHandler := handlers.NewMessageHandler(
 		agentRepo,
 		threadRepo,

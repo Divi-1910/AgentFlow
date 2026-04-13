@@ -11,10 +11,14 @@ import (
 
 type ThreadHandler struct {
 	threadRepo *repository.ThreadRepo
+	agentRepo  *repository.AgentRepo
 }
 
-func NewThreadHandler(threadRepo *repository.ThreadRepo) *ThreadHandler {
-	return &ThreadHandler{threadRepo: threadRepo}
+func NewThreadHandler(threadRepo *repository.ThreadRepo, agentRepo *repository.AgentRepo) *ThreadHandler {
+	return &ThreadHandler{
+		threadRepo: threadRepo,
+		agentRepo:  agentRepo,
+	}
 }
 
 type CreateThreadRequest struct {
@@ -52,7 +56,18 @@ func (h *ThreadHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	thread, err := h.threadRepo.Create(r.Context(), userID, r.PathValue("id"), req.Title)
+	agentID := r.PathValue("id")
+
+	if _, err := h.agentRepo.GetByID(r.Context(), agentID, userID); err != nil {
+		if err.Error() == "agent not found" {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify agent access")
+		return
+	}
+
+	thread, err := h.threadRepo.Create(r.Context(), userID, agentID, req.Title)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create thread")
 		return
@@ -67,7 +82,18 @@ func (h *ThreadHandler) ListByAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	threads, err := h.threadRepo.ListByAgent(r.Context(), r.PathValue("id"), userID)
+	agentID := r.PathValue("id")
+
+	if _, err := h.agentRepo.GetByID(r.Context(), agentID, userID); err != nil {
+		if err.Error() == "agent not found" {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify agent access")
+		return
+	}
+
+	threads, err := h.threadRepo.ListByAgent(r.Context(), agentID, userID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list threads")
 		return

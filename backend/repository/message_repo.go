@@ -77,7 +77,7 @@ func (r *MessageRepo) InsertMany(
 	return typed, nil
 }
 
-func (r *MessageRepo) ListRecentByThread(ctx context.Context, threadID string, limit int) ([]llm.ChatMessage, error) {
+func (r *MessageRepo) ListDocsByThread(ctx context.Context, threadID string, limit int) ([]model.MessageDocument, error) {
 	tid, err := bson.ObjectIDFromHex(threadID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid thread_id: %w", err)
@@ -100,6 +100,15 @@ func (r *MessageRepo) ListRecentByThread(ctx context.Context, threadID string, l
 
 	for i, j := 0, len(docs)-1; i < j; i, j = i+1, j-1 {
 		docs[i], docs[j] = docs[j], docs[i]
+	}
+
+	return docs, nil
+}
+
+func (r *MessageRepo) ListRecentByThread(ctx context.Context, threadID string, limit int) ([]llm.ChatMessage, error) {
+	docs, err := r.ListDocsByThread(ctx, threadID, limit)
+	if err != nil {
+		return nil, err
 	}
 
 	messages := make([]llm.ChatMessage, len(docs))

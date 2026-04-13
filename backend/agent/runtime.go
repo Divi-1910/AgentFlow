@@ -108,7 +108,7 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 
 		assistantMsg := llm.ChatMessage{
 			Role:      "assistant",
-			Content:   strings.TrimSpace(resp.Content),
+			Content:   resp.Content,
 			ToolCalls: resp.ToolCalls,
 		}
 		messages = append(messages, assistantMsg)
