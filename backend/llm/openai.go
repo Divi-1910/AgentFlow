@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -29,7 +30,6 @@ func NewOpenAIAdapter(config AdapterConfig) *OpenAIAdapter {
 		maxRetries: config.MaxRetries,
 	}
 }
-
 
 type openaiMessage struct {
 	Role       string           `json:"role"`
@@ -258,12 +258,16 @@ func (ad *OpenAIAdapter) buildPayload(req *ChatRequest) map[string]any {
 		"messages": messages,
 	}
 
-	if req.Temperature != 0 {
+	if req.Temperature != 0 && !ad.usesDefaultOnlyTemperature(req.Model) {
 		payload["temperature"] = req.Temperature
 	}
 
 	if req.MaxTokens > 0 {
-		payload["max_tokens"] = req.MaxTokens
+		if ad.usesMaxCompletionTokens(req.Model) {
+			payload["max_completion_tokens"] = req.MaxTokens
+		} else {
+			payload["max_tokens"] = req.MaxTokens
+		}
 	}
 
 	if len(req.Tools) > 0 {
@@ -286,4 +290,21 @@ func (ad *OpenAIAdapter) buildPayload(req *ChatRequest) map[string]any {
 	}
 
 	return payload
+}
+
+func (ad *OpenAIAdapter) usesMaxCompletionTokens(model string) bool {
+	return strings.Contains(ad.baseURL, "api.openai.com") && ad.isReasoningModel(model)
+}
+
+func (ad *OpenAIAdapter) usesDefaultOnlyTemperature(model string) bool {
+	return strings.Contains(ad.baseURL, "api.openai.com") && ad.isReasoningModel(model)
+}
+
+func (ad *OpenAIAdapter) isReasoningModel(model string) bool {
+	model = strings.ToLower(model)
+
+	return strings.HasPrefix(model, "o1") ||
+		strings.HasPrefix(model, "o3") ||
+		strings.HasPrefix(model, "o4") ||
+		strings.HasPrefix(model, "gpt-5")
 }
