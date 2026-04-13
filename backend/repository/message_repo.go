@@ -25,21 +25,22 @@ func (r *MessageRepo) InsertMany(
 	ctx context.Context,
 	threadID, agentID, userID string,
 	messages []llm.ChatMessage,
-) error {
+) ([]model.MessageDocument, error) {
 	tid, err := bson.ObjectIDFromHex(threadID)
 	if err != nil {
-		return fmt.Errorf("invalid thread_id: %w", err)
+		return nil, fmt.Errorf("invalid thread_id: %w", err)
 	}
 	aid, err := bson.ObjectIDFromHex(agentID)
 	if err != nil {
-		return fmt.Errorf("invalid agent_id: %w", err)
+		return nil, fmt.Errorf("invalid agent_id: %w", err)
 	}
 	uid, err := bson.ObjectIDFromHex(userID)
 	if err != nil {
-		return fmt.Errorf("invalid user_id: %w", err)
+		return nil, fmt.Errorf("invalid user_id: %w", err)
 	}
 
 	now := time.Now()
+	typed := make([]model.MessageDocument, 0, len(messages))
 	docs := make([]interface{}, 0, len(messages))
 
 	for i, m := range messages {
@@ -64,15 +65,16 @@ func (r *MessageRepo) InsertMany(
 			}
 		}
 
+		typed = append(typed, doc)
 		docs = append(docs, doc)
 	}
 
 	opts := options.InsertMany().SetOrdered(true)
 	if _, err := r.col.InsertMany(ctx, docs, opts); err != nil {
-		return fmt.Errorf("message_repo: insert failed: %w", err)
+		return nil, fmt.Errorf("message_repo: insert failed: %w", err)
 	}
 
-	return nil
+	return typed, nil
 }
 
 func (r *MessageRepo) ListRecentByThread(ctx context.Context, threadID string, limit int) ([]llm.ChatMessage, error) {

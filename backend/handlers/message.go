@@ -2,12 +2,15 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"backend/agent"
 	"backend/llm"
+	"backend/model"
 	"backend/repository"
 )
 
@@ -130,12 +133,12 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 		Input:   req.Content,
 	})
 	if err != nil {
-		switch err {
-		case agent.ErrMaxStepsReached:
+		switch {
+		case errors.Is(err, agent.ErrMaxStepsReached):
 			writeError(w, http.StatusUnprocessableEntity, "agent exceeded maximum steps")
-		case agent.ErrNoFinalOutput:
+		case errors.Is(err, agent.ErrNoFinalOutput):
 			writeError(w, http.StatusUnprocessableEntity, "agent did not produce a response")
-		case agent.ErrToolNotAvailable:
+		case errors.Is(err, agent.ErrToolNotAvailable):
 			writeError(w, http.StatusUnprocessableEntity, "agent requested an unavailable tool")
 		default:
 			log.Printf("[message] runtime error thread=%s err=%v", threadID, err)
@@ -144,7 +147,13 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.messageRepo.InsertMany(ctx, threadID, thread.AgentID.Hex(), userID, result.NewMessages); err != nil {
+	allMessages := append(
+		[]llm.ChatMessage{{Role: "user", Content: req.Content}},
+		result.NewMessages...,
+	)
+
+	docs, err := h.messageRepo.InsertMany(ctx, threadID, thread.AgentID.Hex(), userID, allMessages)
+	if err != nil {
 		log.Printf("[message] persist failed thread=%s err=%v", threadID, err)
 		writeError(w, http.StatusInternalServerError, "failed to save messages")
 		return
@@ -156,13 +165,9 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 		TotalTokens:      summarizeUsage.TotalTokens + result.Usage.TotalTokens,
 	}
 
-	msgs := make([]MessageResponse, len(result.NewMessages))
-	for i, m := range result.NewMessages {
-		msgs[i] = MessageResponse{
-			Role:       m.Role,
-			Content:    m.Content,
-			ToolCallID: m.ToolCallID,
-		}
+	msgs := make([]MessageResponse, len(docs))
+	for i, doc := range docs {
+		msgs[i] = toMessageResponse(doc)
 	}
 
 	writeJSON(w, http.StatusOK, SendMessageResponse{
@@ -170,6 +175,18 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 		Steps:    result.Steps,
 		Usage:    totalUsage,
 	})
+}
+
+func toMessageResponse(doc model.MessageDocument) MessageResponse {
+	return MessageResponse{
+		ID:         doc.ID.Hex(),
+		Role:       doc.Role,
+		Content:    doc.Content,
+		ToolCallID: doc.ToolCallID,
+		ToolName:   doc.ToolName,
+		Metadata:   doc.Metadata,
+		CreatedAt:  doc.CreatedAt.UTC().Format(time.RFC3339Nano),
+	}
 }
 
 func (h *MessageHandler) List(w http.ResponseWriter, r *http.Request) {

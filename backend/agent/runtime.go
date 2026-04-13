@@ -36,7 +36,7 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 
 	toolDefs, err := r.loadTools(agent)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, err.Error())
+		return nil, err
 	}
 
 	systemMsg := BuildSystemMessage(agent.SystemPrompt, runCtx.Summary)
@@ -49,11 +49,9 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 		Content: runCtx.Input,
 	})
 
+	// newMessages tracks only what the runtime produced (assistant + tool messages).
+	// The handler owns the user message and prepends it before persistence.
 	newMessages := make([]llm.ChatMessage, 0, 8)
-	newMessages = append(newMessages, llm.ChatMessage{
-		Role:    "user",
-		Content: runCtx.Input,
-	})
 
 	var totalUsage llm.TokenUsage
 	steps := 0
@@ -121,19 +119,8 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 
 			tool, err := r.toolRegistry.Get(call.Name)
 			if err != nil {
-				errMsg := llm.ChatMessage{
-					Role:       "tool",
-					ToolCallID: call.ID,
-					Content:    fmt.Sprintf("[error] tool %q not available", call.Name),
-					Metadata: map[string]any{
-						"tool_name": call.Name,
-						"is_error":  true,
-					},
-				}
-				messages = append(messages, errMsg)
-				newMessages = append(newMessages, errMsg)
-				log.Printf("[runtime] ✗ tool not found: %s", call.Name)
-				continue
+				log.Printf("[runtime] ✗ tool not found: %s — aborting", call.Name)
+				return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, call.Name)
 			}
 
 			start := time.Now()
@@ -190,7 +177,7 @@ func (r *AgentRuntime) loadTools(agent *Agent) ([]llm.ToolDefinition, error) {
 	for _, name := range agent.Tools {
 		tool, err := r.toolRegistry.Get(name)
 		if err != nil {
-			return nil, fmt.Errorf("tool %q not registered", name)
+			return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, name)
 		}
 		defs = append(defs, tool.Definition())
 	}
