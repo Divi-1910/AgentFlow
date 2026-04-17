@@ -125,6 +125,7 @@ func main() {
 	mux.HandleFunc("POST /api/agents", middleware.RequireAuth(agentHandler.Create))
 	mux.HandleFunc("GET /api/agents", middleware.RequireAuth(agentHandler.List))
 	mux.HandleFunc("GET /api/agents/{id}", middleware.RequireAuth(agentHandler.Get))
+	mux.HandleFunc("PUT /api/agents/{id}", middleware.RequireAuth(agentHandler.Update))
 	mux.HandleFunc("DELETE /api/agents/{id}", middleware.RequireAuth(agentHandler.Delete))
 
 	mux.HandleFunc("POST /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.Create))
