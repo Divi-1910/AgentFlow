@@ -20,7 +20,7 @@ const (
 	DefaultTemperature      = 0.7
 	DefaultMaxTokens        = 4096
 
-	contextTriggerRatio = 0.95
+	contextTriggerRatio = 0.85
 )
 
 type Agent struct {

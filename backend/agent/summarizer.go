@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"backend/llm"
 )
@@ -35,7 +36,7 @@ func (s *Summarizer) Summarize(
 
 	input := s.buildSummarizationInput(previousSummary, droppedTurns)
 
-	resp, err := client.ChatCompletion(ctx, &llm.ChatRequest{
+	req := &llm.ChatRequest{
 		Model: model,
 		Messages: []llm.ChatMessage{
 			{
@@ -51,11 +52,32 @@ Return only the updated summary.`, input),
 			},
 		},
 		Temperature: 0,
-		MaxTokens:   1024,
-	})
-	if err != nil {
-		log.Printf("[summarizer] ✗ failed: %v", err)
-		return "", llm.TokenUsage{}, err
+		MaxTokens:   2048,
+	}
+
+	const maxAttempts = 3
+	var (
+		resp    *llm.ChatResponse
+		callErr error
+	)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, callErr = client.ChatCompletion(ctx, req)
+		if callErr == nil {
+			break
+		}
+		if attempt < maxAttempts {
+			backoff := time.Duration(attempt*attempt) * time.Second
+			log.Printf("[summarizer] attempt %d/%d failed, retrying in %s: %v", attempt, maxAttempts, backoff, callErr)
+			select {
+			case <-ctx.Done():
+				return "", llm.TokenUsage{}, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+	}
+	if callErr != nil {
+		log.Printf("[summarizer] ✗ all %d attempts failed: %v", maxAttempts, callErr)
+		return "", llm.TokenUsage{}, callErr
 	}
 
 	summary := strings.TrimSpace(resp.Content)
@@ -104,8 +126,8 @@ func (s *Summarizer) preprocessMessage(m llm.ChatMessage) string {
 
 	case "tool":
 		snippet := m.Content
-		if len(snippet) > maxToolContentLen {
-			snippet = snippet[:maxToolContentLen] + "... [truncated]"
+		if len([]rune(snippet)) > maxToolContentLen {
+			snippet = string([]rune(m.Content)[:maxToolContentLen]) + "... [truncated]"
 		}
 		return fmt.Sprintf("tool result: %s\n", snippet)
 

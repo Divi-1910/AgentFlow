@@ -85,23 +85,13 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			sink.Emit(StreamEvent{Type: EventRunCancelled, DurationMs: duration})
 		case stateFailed:
 			errMsg := "unknown error"
-			errCode := "engine.runtime_error"
 			if err != nil {
 				errMsg = err.Error()
-				if strings.Contains(errMsg, "max steps") {
-					errCode = "engine.max_steps"
-				} else if strings.Contains(errMsg, "panic") {
-					errCode = "engine.panic"
-				} else if strings.Contains(errMsg, "not found in registry") {
-					errCode = "tool.not_found"
-				} else if strings.Contains(errMsg, "llm registry") {
-					errCode = "provider.unavailable"
-				}
 			}
 			sink.Emit(StreamEvent{
 				Type:       EventRunFailed,
 				DurationMs: duration,
-				Error:      &ErrMeta{Code: errCode, Message: errMsg},
+				Error:      &ErrMeta{Code: classifyError(err), Message: errMsg},
 			})
 		}
 		sink.Close()
@@ -151,12 +141,21 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		log.Printf("[runtime] step=%d agent=%s provider=%s model=%s messages=%d",
 			steps+1, agent.Name, agent.Provider, agent.Model, len(messages))
 
+		temperature := agent.Temperature
+		if temperature == 0 {
+			temperature = DefaultTemperature
+		}
+		maxTokens := agent.MaxTokens
+		if maxTokens == 0 {
+			maxTokens = DefaultMaxTokens
+		}
+
 		resp, err := client.ChatCompletion(ctx, &llm.ChatRequest{
 			Model:       agent.Model,
 			Messages:    messages,
 			Tools:       toolDefs,
-			Temperature: agent.Temperature,
-			MaxTokens:   agent.MaxTokens,
+			Temperature: temperature,
+			MaxTokens:   maxTokens,
 		})
 
 		if err != nil {
@@ -240,6 +239,12 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 
 			start := time.Now()
 
+			// Fix #15: guard against already-cancelled context tripping the tool failure counter
+			if ctx.Err() != nil {
+				state = stateCancelled
+				return nil, ctx.Err()
+			}
+
 			toolCtx, toolCancel := context.WithTimeout(ctx, 30*time.Second)
 			toolResult, err := tool.Execute(toolCtx, call.Arguments)
 			toolCancel()
@@ -322,6 +327,36 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 
 	log.Printf("[runtime] max steps reached agent=%s steps=%d", agent.Name, steps)
 	return nil, ErrMaxStepsReached
+}
+
+// classifyError maps a runtime error to a stable error code for SSE consumers.
+// Uses errors.Is for sentinel errors — never string matching.
+func classifyError(err error) string {
+	if err == nil {
+		return "engine.runtime_error"
+	}
+	switch {
+	case errors.Is(err, ErrMaxStepsReached):
+		return "engine.max_steps"
+	case errors.Is(err, ErrNoFinalOutput):
+		return "engine.no_output"
+	case errors.Is(err, ErrToolNotAvailable):
+		return "tool.not_found"
+	case errors.Is(err, context.Canceled):
+		return "engine.cancelled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "engine.timeout"
+	default:
+		// Only remaining string check: panic recovery wraps the value as a string.
+		// We cannot use errors.Is here because recovered panics are not typed errors.
+		if strings.Contains(err.Error(), "panic in runtime") {
+			return "engine.panic"
+		}
+		if strings.Contains(err.Error(), "llm registry") {
+			return "provider.unavailable"
+		}
+		return "engine.runtime_error"
+	}
 }
 
 func (r *AgentRuntime) loadTools(agent *Agent) ([]llm.ToolDefinition, error) {

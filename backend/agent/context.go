@@ -42,11 +42,13 @@ func resolveContextLimit(a *Agent) int {
 
 func estimateTokens(messages []llm.ChatMessage) int {
 	total := 0
+	const tokensPerMessage = 4
 	for _, m := range messages {
-		total += len(m.Content) / 4
+		total += tokensPerMessage
+		total += len([]rune(m.Content)) / tokensPerMessage
 		for _, tc := range m.ToolCalls {
-			total += len(tc.Name) / 4
-			total += len(tc.Arguments) / 4
+			total += len([]rune(tc.Name)) / tokensPerMessage
+			total += len((tc.Arguments)) / tokensPerMessage
 		}
 	}
 	return total
