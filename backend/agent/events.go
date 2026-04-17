@@ -1,0 +1,115 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sync"
+	"time"
+
+	"backend/llm"
+)
+
+type EventType string
+
+const (
+	EventRunStarted     EventType = "run.started"
+	EventRunCompleted   EventType = "run.completed"
+	EventRunFailed      EventType = "run.failed"
+	EventRunCancelled   EventType = "run.cancelled"
+	EventStepStarted    EventType = "step.started"
+	EventStepCompleted  EventType = "step.completed"
+	EventModelDelta     EventType = "model.delta"
+	EventModelCompleted EventType = "model.completed"
+	EventToolStarted    EventType = "tool.started"
+	EventToolCompleted  EventType = "tool.completed"
+	EventToolFailed     EventType = "tool.failed"
+	EventStatusUpdated  EventType = "status.updated"
+)
+
+type ToolMeta struct {
+	ID      string          `json:"id,omitempty"`
+	Name    string          `json:"name,omitempty"`
+	Args    json.RawMessage `json:"args,omitempty"`
+	Display string          `json:"display,omitempty"`
+}
+
+type ErrMeta struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type StreamEvent struct {
+	ID    string    `json:"id"`
+	RunID string    `json:"run_id"`
+	Seq   int64     `json:"seq"`
+	Type  EventType `json:"type"`
+	Time  time.Time `json:"time"`
+
+	Attempt int `json:"attempt,omitempty"`
+
+	Step     int `json:"step,omitempty"`
+	MaxSteps int `json:"max_steps,omitempty"`
+
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+
+	Status  string `json:"status,omitempty"`
+	Delta   string `json:"delta,omitempty"`
+	Content string `json:"content,omitempty"`
+
+	DurationMs int64 `json:"duration_ms,omitempty"`
+
+	Tool  *ToolMeta       `json:"tool,omitempty"`
+	Usage *llm.TokenUsage `json:"usage,omitempty"`
+	Error *ErrMeta        `json:"error,omitempty"`
+}
+
+type EventSink interface {
+	Emit(e StreamEvent)
+	Close()
+}
+
+type ChannelSink struct {
+	ctx   context.Context
+	mu    sync.Mutex
+	seq   int64
+	runID string
+	ch    chan<- StreamEvent
+}
+
+func NewChannelSink(ctx context.Context, runID string, ch chan<- StreamEvent) *ChannelSink {
+	return &ChannelSink{
+		ctx:   ctx,
+		seq   : 1,
+		runID: runID,
+		ch:    ch,
+	}
+}
+
+func (s *ChannelSink) Emit(e StreamEvent) {
+	s.mu.Lock()
+	seq := s.seq
+	s.seq++
+	s.mu.Unlock()
+
+	e.ID = fmt.Sprintf("%s-%d", s.runID, seq)
+	e.RunID = s.runID
+	e.Seq = seq
+	e.Time = time.Now()
+
+	select {
+	case <-s.ctx.Done():
+		return // Do not block if client disconnects
+	case s.ch <- e:
+	}
+}
+
+func (s *ChannelSink) Close() {
+	close(s.ch) // runtime owns the producer lifecycle
+}
+
+type NoopSink struct{}
+
+func (s *NoopSink) Emit(e StreamEvent) {}
+func (s *NoopSink) Close()             {}

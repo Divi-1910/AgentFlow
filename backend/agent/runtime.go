@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -24,6 +26,72 @@ func NewAgentRuntime(llmRegistry *llm.LLMRegistry, toolRegistry *tools.ToolRegis
 }
 
 func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext) (*RunResult, error) {
+	return r.runInternal(ctx, agent, runCtx, &NoopSink{})
+}
+
+func (r *AgentRuntime) RunStream(ctx context.Context, agent *Agent, runCtx RunContext, events chan<- StreamEvent) (*RunResult, error) {
+	runID := fmt.Sprintf("run-%d", time.Now().UnixNano())
+	sink := NewChannelSink(ctx, runID, events)
+	return r.runInternal(ctx, agent, runCtx, sink)
+}
+
+// terminalState ensures explicit lifecycle closure
+type terminalState int
+
+const (
+	stateFailed terminalState = iota
+	stateSuccess
+	stateCancelled
+)
+
+func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx RunContext, sink EventSink) (result *RunResult, err error) {
+	state := stateFailed // pessimism default
+	runStart := time.Now()
+
+	sink.Emit(StreamEvent{
+		Type:     EventRunStarted,
+		Provider: agent.Provider,
+		Model:    agent.Model,
+	})
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("panic in runtime: %v", rec)
+			state = stateFailed
+		}
+
+		if err == nil && result == nil {
+			err = fmt.Errorf("internal logic error: result is nil on success")
+			state = stateFailed
+		}
+
+		duration := time.Since(runStart).Milliseconds()
+
+		switch state {
+		case stateSuccess:
+			sink.Emit(StreamEvent{
+				Type:       EventRunCompleted,
+				DurationMs: duration,
+				Content:    result.Output,
+				Usage:      &result.Usage,
+				Step:       result.Steps,
+			})
+		case stateCancelled:
+			sink.Emit(StreamEvent{Type: EventRunCancelled, DurationMs: duration})
+		case stateFailed:
+			errMsg := "unknown error"
+			if err != nil {
+				errMsg = err.Error()
+			}
+			sink.Emit(StreamEvent{
+				Type:       EventRunFailed,
+				DurationMs: duration,
+				Error:      &ErrMeta{Code: "runtime.error", Message: errMsg},
+			})
+		}
+		sink.Close()
+	}()
+
 	maxSteps := agent.MaxSteps
 	if maxSteps == 0 {
 		maxSteps = DefaultMaxSteps
@@ -49,19 +117,19 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 		Content: runCtx.Input,
 	})
 
-	// newMessages tracks only what the runtime produced (assistant + tool messages).
-	// The handler owns the user message and prepends it before persistence.
 	newMessages := make([]llm.ChatMessage, 0, 8)
 
 	var totalUsage llm.TokenUsage
 	steps := 0
 
 	for steps < maxSteps {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
+			state = stateCancelled
 			return nil, ctx.Err()
-		default:
 		}
+
+		sink.Emit(StreamEvent{Type: EventStepStarted, Step: steps + 1, MaxSteps: maxSteps})
+		sink.Emit(StreamEvent{Type: EventStatusUpdated, Status: "Calling model", Step: steps + 1})
 
 		log.Printf("[runtime] step=%d agent=%s provider=%s model=%s messages=%d",
 			steps+1, agent.Name, agent.Provider, agent.Model, len(messages))
@@ -73,11 +141,17 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 			Temperature: agent.Temperature,
 			MaxTokens:   agent.MaxTokens,
 		})
+
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+				state = stateCancelled
+				return nil, err
+			}
 			return nil, fmt.Errorf("runtime: llm call failed at step %d: %w", steps+1, err)
 		}
 
 		steps++
+		sink.Emit(StreamEvent{Type: EventModelCompleted, Step: steps})
 
 		totalUsage.PromptTokens += resp.Usage.PromptTokens
 		totalUsage.CompletionTokens += resp.Usage.CompletionTokens
@@ -96,6 +170,9 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 			log.Printf("[runtime] done steps=%d prompt_tokens=%d completion_tokens=%d",
 				steps, totalUsage.PromptTokens, totalUsage.CompletionTokens)
 
+			sink.Emit(StreamEvent{Type: EventStepCompleted, Step: steps})
+
+			state = stateSuccess
 			return &RunResult{
 				Output:      output,
 				NewMessages: newMessages,
@@ -117,9 +194,29 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 		for _, call := range resp.ToolCalls {
 			log.Printf("[runtime] executing tool=%s id=%s", call.Name, call.ID)
 
+			var rawArgs json.RawMessage
+			if json.Valid(call.Arguments) {
+				rawArgs = call.Arguments
+			} else {
+				rawArgs = json.RawMessage(`"` + strings.ReplaceAll(string(call.Arguments), `"`, `\"`) + `"`)
+			}
+
+			sink.Emit(StreamEvent{
+				Type: EventToolStarted,
+				Tool: &ToolMeta{ID: call.ID, Name: call.Name, Args: rawArgs},
+				Step: steps,
+			})
+			sink.Emit(StreamEvent{Type: EventStatusUpdated, Status: fmt.Sprintf("Using %s", call.Name), Step: steps})
+
 			tool, err := r.toolRegistry.Get(call.Name)
 			if err != nil {
 				log.Printf("[runtime] ✗ tool not found: %s — aborting", call.Name)
+				sink.Emit(StreamEvent{
+					Type:  EventToolFailed,
+					Tool:  &ToolMeta{ID: call.ID, Name: call.Name, Args: rawArgs},
+					Error: &ErrMeta{Code: "tool.not_found", Message: err.Error()},
+					Step:  steps,
+				})
 				return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, call.Name)
 			}
 
@@ -134,7 +231,7 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 					Content:    fmt.Sprintf("[error] tool %q failed: %s", call.Name, err.Error()),
 					Metadata: map[string]any{
 						"tool_name":  call.Name,
-						"arguments":  call.Arguments,
+						"arguments":  string(call.Arguments),
 						"is_error":   true,
 						"latency_ms": latencyMs,
 					},
@@ -142,6 +239,14 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 				messages = append(messages, errMsg)
 				newMessages = append(newMessages, errMsg)
 				log.Printf("[runtime] ✗ tool execution failed: %s err=%v", call.Name, err)
+
+				sink.Emit(StreamEvent{
+					Type:       EventToolFailed,
+					Step:       steps,
+					Tool:       &ToolMeta{ID: call.ID, Name: call.Name, Args: rawArgs},
+					Error:      &ErrMeta{Code: "tool.execution_failed", Message: err.Error()},
+					DurationMs: latencyMs,
+				})
 				continue
 			}
 
@@ -154,14 +259,30 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 				Content:    result.Content,
 				Metadata: map[string]any{
 					"tool_name":  call.Name,
-					"arguments":  call.Arguments,
+					"arguments":  string(call.Arguments),
 					"is_error":   result.IsError,
 					"latency_ms": latencyMs,
 				},
 			}
 			messages = append(messages, toolMsg)
 			newMessages = append(newMessages, toolMsg)
+
+			displayStr := fmt.Sprintf("Finished %s", call.Name)
+			if result.Content != "" && len(result.Content) < 50 {
+				displayStr = fmt.Sprintf("Result: %s", result.Content)
+			}
+			if result.IsError {
+				displayStr = fmt.Sprintf("Error in %s", call.Name)
+			}
+
+			sink.Emit(StreamEvent{
+				Type:       EventToolCompleted,
+				Step:       steps,
+				Tool:       &ToolMeta{ID: call.ID, Name: call.Name, Args: rawArgs, Display: displayStr},
+				DurationMs: latencyMs,
+			})
 		}
+		sink.Emit(StreamEvent{Type: EventStepCompleted, Step: steps})
 	}
 
 	log.Printf("[runtime] max steps reached agent=%s steps=%d", agent.Name, steps)

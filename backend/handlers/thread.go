@@ -38,8 +38,8 @@ func toThreadResponse(t *model.ThreadDocument) ThreadResponse {
 		ID:        t.ID.Hex(),
 		AgentID:   t.AgentID.Hex(),
 		Title:     t.Title,
-		CreatedAt: t.CreatedAt.UTC().Format(time.RFC3339),
-		UpdatedAt: t.UpdatedAt.UTC().Format(time.RFC3339),
+		CreatedAt: t.CreatedAt.UTC().Format(time.RFC3339Nano),
+		UpdatedAt: t.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	}
 }
 

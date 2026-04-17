@@ -78,7 +78,7 @@ func toAgentResponse(a *agent.Agent) AgentResponse {
 		MaxSteps:           a.MaxSteps,
 		Temperature:        a.Temperature,
 		MaxTokens:          a.MaxTokens,
-		CreatedAt:          a.CreatedAt.UTC().Format(time.RFC3339),
+		CreatedAt:          a.CreatedAt.UTC().Format(time.RFC3339Nano),
 	}
 }
 

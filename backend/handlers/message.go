@@ -2,7 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
-	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -47,6 +47,7 @@ type MessageResponse struct {
 	Role       string         `json:"role"`
 	Content    string         `json:"content"`
 	ToolCallID string         `json:"tool_call_id,omitempty"`
+	ToolCalls  []llm.ToolCall `json:"tool_calls,omitempty"`
 	ToolName   string         `json:"tool_name,omitempty"`
 	Metadata   map[string]any `json:"metadata,omitempty"`
 	CreatedAt  string         `json:"created_at"`
@@ -131,54 +132,94 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	history := agent.FlattenTurns(turns)
 
-	result, err := h.runtime.Run(ctx, ag, agent.RunContext{
+	runCtx := agent.RunContext{
 		Summary: currentSummary,
 		History: history,
 		Input:   req.Content,
-	})
-	if err != nil {
-		switch {
-		case errors.Is(err, agent.ErrMaxStepsReached):
-			writeError(w, http.StatusUnprocessableEntity, "agent exceeded maximum steps")
-		case errors.Is(err, agent.ErrNoFinalOutput):
-			writeError(w, http.StatusUnprocessableEntity, "agent did not produce a response")
-		case errors.Is(err, agent.ErrToolNotAvailable):
-			writeError(w, http.StatusUnprocessableEntity, "agent requested an unavailable tool")
-		default:
-			log.Printf("[message] runtime error thread=%s err=%v", threadID, err)
-			writeError(w, http.StatusInternalServerError, "agent execution failed")
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "Streaming unsupported")
+		return
+	}
+
+	events := make(chan agent.StreamEvent, 128)
+	var runResult *agent.RunResult
+
+	go func() {
+		res, _ := h.runtime.RunStream(ctx, ag, runCtx, events)
+		runResult = res
+	}()
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	var terminalEvent *agent.StreamEvent
+
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			break loop
+		case <-ticker.C:
+			fmt.Fprintf(w, ": ping\n\n")
+			flusher.Flush()
+		case e, ok := <-events:
+			if !ok {
+				break loop
+			}
+			
+			if e.Type == agent.EventRunCompleted || e.Type == agent.EventRunFailed || e.Type == agent.EventRunCancelled {
+				terminalEvent = &e
+				continue
+			}
+
+			data, _ := json.Marshal(e)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
 		}
-		return
 	}
 
-	allMessages := append(
-		[]llm.ChatMessage{{Role: "user", Content: req.Content}},
-		result.NewMessages...,
-	)
+	if runResult != nil {
+		allMessages := append(
+			[]llm.ChatMessage{{Role: "user", Content: req.Content}},
+			runResult.NewMessages...,
+		)
 
-	docs, err := h.messageRepo.InsertMany(ctx, threadID, thread.AgentID.Hex(), userID, allMessages)
-	if err != nil {
-		log.Printf("[message] persist failed thread=%s err=%v", threadID, err)
-		writeError(w, http.StatusInternalServerError, "failed to save messages")
-		return
+		docs, err := h.messageRepo.InsertMany(ctx, threadID, thread.AgentID.Hex(), userID, allMessages)
+		if err != nil {
+			log.Printf("[message] persist failed thread=%s err=%v", threadID, err)
+			if terminalEvent != nil {
+				terminalEvent.Type = agent.EventRunFailed
+				terminalEvent.Error = &agent.ErrMeta{Code: "internal.persistence_error", Message: "Failed to persist messages"}
+			}
+		} else {
+			if terminalEvent != nil && terminalEvent.Usage != nil {
+				terminalEvent.Usage.PromptTokens += summarizeUsage.PromptTokens
+				terminalEvent.Usage.CompletionTokens += summarizeUsage.CompletionTokens
+				terminalEvent.Usage.TotalTokens += summarizeUsage.TotalTokens
+			}
+			_ = docs
+		}
+	} else if terminalEvent == nil {
+		terminalEvent = &agent.StreamEvent{
+			Type:  agent.EventRunFailed,
+			Time:  time.Now(),
+			Error: &agent.ErrMeta{Code: "internal.unknown", Message: "stream ended prematurely"},
+		}
 	}
 
-	totalUsage := llm.TokenUsage{
-		PromptTokens:     summarizeUsage.PromptTokens + result.Usage.PromptTokens,
-		CompletionTokens: summarizeUsage.CompletionTokens + result.Usage.CompletionTokens,
-		TotalTokens:      summarizeUsage.TotalTokens + result.Usage.TotalTokens,
+	if terminalEvent != nil {
+		data, _ := json.Marshal(*terminalEvent)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
 	}
-
-	msgs := make([]MessageResponse, len(docs))
-	for i, doc := range docs {
-		msgs[i] = toMessageResponse(doc)
-	}
-
-	writeJSON(w, http.StatusOK, SendMessageResponse{
-		Messages: msgs,
-		Steps:    result.Steps,
-		Usage:    totalUsage,
-	})
 }
 
 func toMessageResponse(doc model.MessageDocument) MessageResponse {
@@ -187,6 +228,7 @@ func toMessageResponse(doc model.MessageDocument) MessageResponse {
 		Role:       doc.Role,
 		Content:    doc.Content,
 		ToolCallID: doc.ToolCallID,
+		ToolCalls:  doc.ToolCalls,
 		ToolName:   doc.ToolName,
 		Metadata:   doc.Metadata,
 		CreatedAt:  doc.CreatedAt.UTC().Format(time.RFC3339Nano),
