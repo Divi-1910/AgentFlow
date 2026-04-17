@@ -230,6 +230,10 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 
 			latencyMs := time.Since(start).Milliseconds()
 
+			if len(result.Content) > 8000 {
+				result.Content = result.Content[:8000] + "\n\n...(truncated due to length limit)"
+			}
+
 			if err != nil {
 				errMsg := llm.ChatMessage{
 					Role:       "tool",

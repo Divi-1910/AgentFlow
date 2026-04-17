@@ -17,6 +17,8 @@ const (
 	EventRunCompleted   EventType = "run.completed"
 	EventRunFailed      EventType = "run.failed"
 	EventRunCancelled   EventType = "run.cancelled"
+	EventRunPersisted   EventType = "run.persisted"
+	EventRunPersistFail EventType = "run.persist_failed"
 	EventStepStarted    EventType = "step.started"
 	EventStepCompleted  EventType = "step.completed"
 	EventModelDelta     EventType = "model.delta"
@@ -98,13 +100,23 @@ func (s *ChannelSink) Emit(e StreamEvent) {
 	e.Seq = seq
 	e.Time = time.Now()
 
-	select {
-	case <-s.ctx.Done():
-		return // Do not block if client disconnects
-	case s.ch <- e:
-		// Emitted successfully
-	default:
-		// Optional: Log backpressure drops if you import "log" in events.go, but for now we just drop it to prevent deadlock
+	isCritical := e.Type == EventRunCompleted || e.Type == EventRunFailed || e.Type == EventRunCancelled || e.Type == EventToolCompleted || e.Type == EventToolFailed
+
+	if isCritical {
+		select {
+		case <-s.ctx.Done():
+			return // Do not block if client disconnects
+		case s.ch <- e:
+			// Emitted successfully
+		}
+	} else {
+		select {
+		case <-s.ctx.Done():
+			return
+		case s.ch <- e:
+		default:
+			// Drop non-critical updates to prevent channel deadlocks
+		}
 	}
 }
 

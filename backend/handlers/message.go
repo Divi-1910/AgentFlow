@@ -217,6 +217,18 @@ loop:
 		return
 	}
 
+	// Flush the final terminal event BEFORE persistence events
+	if terminalEvent != nil {
+		if out.res != nil && terminalEvent.Usage != nil {
+			terminalEvent.Usage.PromptTokens += summarizeUsage.PromptTokens
+			terminalEvent.Usage.CompletionTokens += summarizeUsage.CompletionTokens
+			terminalEvent.Usage.TotalTokens += summarizeUsage.TotalTokens
+		}
+		data, _ := json.Marshal(*terminalEvent)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
 	if out.res != nil {
 		allMessages := append(
 			[]llm.ChatMessage{{Role: "user", Content: req.Content}},
@@ -226,30 +238,24 @@ loop:
 		docs, err := h.messageRepo.InsertMany(ctx, threadID, thread.AgentID.Hex(), userID, allMessages)
 		if err != nil {
 			log.Printf("[message] persist failed thread=%s err=%v", threadID, err)
-			if terminalEvent != nil {
-				terminalEvent.Type = agent.EventRunFailed
-				terminalEvent.Error = &agent.ErrMeta{Code: "internal.persistence_error", Message: "Failed to persist messages"}
+			streamEvent := agent.StreamEvent{
+				Type:  agent.EventRunPersistFail,
+				Time:  time.Now(),
+				Error: &agent.ErrMeta{Code: "internal.persistence_error", Message: "Failed to persist messages"},
 			}
+			data, _ := json.Marshal(streamEvent)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
 		} else {
-			if terminalEvent != nil && terminalEvent.Usage != nil {
-				terminalEvent.Usage.PromptTokens += summarizeUsage.PromptTokens
-				terminalEvent.Usage.CompletionTokens += summarizeUsage.CompletionTokens
-				terminalEvent.Usage.TotalTokens += summarizeUsage.TotalTokens
-			}
 			_ = docs
+			streamEvent := agent.StreamEvent{
+				Type: agent.EventRunPersisted,
+				Time: time.Now(),
+			}
+			data, _ := json.Marshal(streamEvent)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
 		}
-	} else if terminalEvent == nil {
-		terminalEvent = &agent.StreamEvent{
-			Type:  agent.EventRunFailed,
-			Time:  time.Now(),
-			Error: &agent.ErrMeta{Code: "internal.unknown", Message: "stream ended prematurely"},
-		}
-	}
-
-	if terminalEvent != nil {
-		data, _ := json.Marshal(*terminalEvent)
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		flusher.Flush()
 	}
 }
 
