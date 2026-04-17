@@ -47,9 +47,16 @@ type Agent struct {
 }
 
 type RunContext struct {
+	RunID    string
+	ThreadID string
+	Attempt  int
+
 	Summary string
 	History []llm.ChatMessage
 	Input   string
+
+	// Non-nil when resuming from a checkpoint. Nil = fresh run.
+	Checkpoint *RunSnapshot
 }
 
 type RunResult struct {

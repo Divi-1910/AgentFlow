@@ -13,6 +13,8 @@ import (
 	"backend/llm"
 	"backend/model"
 	"backend/repository"
+
+	"github.com/google/uuid"
 )
 
 type MessageHandler struct {
@@ -21,6 +23,7 @@ type MessageHandler struct {
 	messageRepo *repository.MessageRepo
 	runtime     *agent.AgentRuntime
 	summarizer  *agent.Summarizer
+	runRepo     agent.CheckpointStore
 }
 
 func NewMessageHandler(
@@ -29,6 +32,7 @@ func NewMessageHandler(
 	messageRepo *repository.MessageRepo,
 	runtime *agent.AgentRuntime,
 	summarizer *agent.Summarizer,
+	runRepo agent.CheckpointStore,
 ) *MessageHandler {
 	return &MessageHandler{
 		agentRepo:   agentRepo,
@@ -36,6 +40,7 @@ func NewMessageHandler(
 		messageRepo: messageRepo,
 		runtime:     runtime,
 		summarizer:  summarizer,
+		runRepo:     runRepo,
 	}
 }
 
@@ -143,10 +148,15 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	history := agent.FlattenTurns(turns)
 
+	runID := uuid.NewString()
+
 	runCtx := agent.RunContext{
-		Summary: currentSummary,
-		History: history,
-		Input:   req.Content,
+		RunID:    runID,
+		ThreadID: threadID,
+		Attempt:  1,
+		Summary:  currentSummary,
+		History:  history,
+		Input:    req.Content,
 	}
 
 	flusher, ok := w.(http.Flusher)
@@ -159,6 +169,13 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
+
+	if h.runRepo != nil {
+		if err := h.runRepo.CreateRun(r.Context(), runID, threadID, ag.ID, userID); err != nil {
+			log.Printf("[message-handler] failed to create run doc: %v", err)
+			// Non-fatal, we can still run without checkpointing
+		}
+	}
 
 	runCtxStream, cancelStream := context.WithCancel(r.Context())
 	defer cancelStream()
@@ -173,7 +190,7 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		var (
-			res *agent.RunResult
+			res    *agent.RunResult
 			runErr error
 		)
 		defer func() {

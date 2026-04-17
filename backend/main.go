@@ -8,6 +8,7 @@ import (
 	"backend/middleware"
 	"backend/repository"
 	"backend/tools"
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -85,6 +86,8 @@ func main() {
 	agentsCol := db.GetCollection(dbName, "agents")
 	threadsCol := db.GetCollection(dbName, "threads")
 	messagesCol := db.GetCollection(dbName, "messages")
+	runsCol := db.GetCollection(dbName, "runs")
+	checkpointsCol := db.GetCollection(dbName, "run_checkpoints")
 
 	authHandler := &handlers.AuthHandler{
 		Users: usersCol,
@@ -101,8 +104,14 @@ func main() {
 	agentRepo := repository.NewAgentRepo(agentsCol, llmRegistryCol)
 	threadRepo := repository.NewThreadRepo(threadsCol)
 	messageRepo := repository.NewMessageRepo(messagesCol)
+	runRepo := repository.NewRunRepo(runsCol, checkpointsCol)
 
-	agentRuntime := agent.NewAgentRuntime(llmRegistry, toolRegistry)
+	// Ensure Mongo indexes for run/checkpoints
+	if err := runRepo.EnsureIndexes(context.Background()); err != nil {
+		log.Fatalf("failed to create run indexes: %v", err)
+	}
+
+	agentRuntime := agent.NewAgentRuntime(llmRegistry, toolRegistry).WithCheckpointStore(runRepo)
 	summarizer := agent.NewSummarizer(llmRegistry)
 
 	agentHandler := handlers.NewAgentHandler(agentRepo)
@@ -113,6 +122,14 @@ func main() {
 		messageRepo,
 		agentRuntime,
 		summarizer,
+		runRepo,
+	)
+	runHandler := handlers.NewRunHandler(
+		agentRepo,
+		threadRepo,
+		runRepo,
+		agentRuntime,
+		toolRegistry,
 	)
 
 	mux.HandleFunc("POST /api/auth/signup", authHandler.SignUp)
@@ -133,6 +150,9 @@ func main() {
 
 	mux.HandleFunc("POST /api/threads/{id}/messages", middleware.RequireAuth(messageHandler.Send))
 	mux.HandleFunc("GET /api/threads/{id}/messages", middleware.RequireAuth(messageHandler.List))
+
+	mux.HandleFunc("GET /api/runs/{id}", middleware.RequireAuth(runHandler.GetRun))
+	mux.HandleFunc("POST /api/runs/{id}/resume", middleware.RequireAuth(runHandler.ResumeRun))
 
 	port := os.Getenv("PORT")
 	if port == "" {

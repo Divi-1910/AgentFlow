@@ -12,13 +12,14 @@ import (
 
 	"backend/llm"
 	"backend/tools"
-
-	"github.com/google/uuid"
 )
 
+const checkpointFailureThreshold = 3
+
 type AgentRuntime struct {
-	llmRegistry  *llm.LLMRegistry
-	toolRegistry *tools.ToolRegistry
+	llmRegistry     *llm.LLMRegistry
+	toolRegistry    *tools.ToolRegistry
+	checkpointStore CheckpointStore // optional; nil = no checkpointing
 }
 
 func NewAgentRuntime(llmRegistry *llm.LLMRegistry, toolRegistry *tools.ToolRegistry) *AgentRuntime {
@@ -28,14 +29,23 @@ func NewAgentRuntime(llmRegistry *llm.LLMRegistry, toolRegistry *tools.ToolRegis
 	}
 }
 
+// WithCheckpointStore returns a copy of the runtime with a checkpoint store attached.
+func (r *AgentRuntime) WithCheckpointStore(store CheckpointStore) *AgentRuntime {
+	return &AgentRuntime{
+		llmRegistry:     r.llmRegistry,
+		toolRegistry:    r.toolRegistry,
+		checkpointStore: store,
+	}
+}
+
 func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext) (*RunResult, error) {
 	return r.runInternal(ctx, agent, runCtx, &NoopSink{})
 }
 
-func (r *AgentRuntime) RunStream(ctx context.Context, agent *Agent, runCtx RunContext, events chan<- StreamEvent) (*RunResult, error) {
-	runID := uuid.NewString()
-	sink := NewChannelSink(ctx, runID, events)
-	return r.runInternal(ctx, agent, runCtx, sink)
+func (r *AgentRuntime) RunStream(ctx context.Context, ag *Agent, runCtx RunContext, events chan<- StreamEvent) (*RunResult, error) {
+	// The runID is now deterministically created by the handler and passed in runCtx.
+	sink := NewChannelSink(ctx, runCtx.RunID, events)
+	return r.runInternal(ctx, ag, runCtx, sink)
 }
 
 type terminalState int
@@ -94,6 +104,29 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 				Error:      &ErrMeta{Code: classifyError(err), Message: errMsg},
 			})
 		}
+
+		if r.checkpointStore != nil {
+			runID := runCtx.RunID
+			switch state {
+			case stateSuccess:
+				_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "completed", "")
+			case stateCancelled:
+				_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "cancelled", "")
+			case stateFailed:
+				errMsg := "unknown error"
+				if err != nil {
+					errMsg = err.Error()
+				}
+				if IsResumable(err) {
+					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "resumable", errMsg)
+				} else if strings.Contains(errMsg, "manual resolution required") {
+					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "requires_manual_resolution", errMsg)
+				} else {
+					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "failed", errMsg)
+				}
+			}
+		}
+
 		sink.Close()
 	}()
 
@@ -113,21 +146,50 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		return nil, err
 	}
 
-	systemMsg := BuildSystemMessage(agent.SystemPrompt, runCtx.Summary)
+	var (
+		messages           []llm.ChatMessage
+		newMessages        []llm.ChatMessage
+		totalUsage         llm.TokenUsage
+		steps              int
+		toolFailures       map[string]int
+		checkpointFailures int
+	)
 
-	messages := make([]llm.ChatMessage, 0, 1+len(runCtx.History)+1+8)
-	messages = append(messages, systemMsg)
-	messages = append(messages, runCtx.History...)
-	messages = append(messages, llm.ChatMessage{
-		Role:    "user",
-		Content: runCtx.Input,
-	})
+	if runCtx.Checkpoint != nil {
+		// Resume path
+		s := runCtx.Checkpoint.State
+		messages = s.Messages
+		// System message is re-prepended fresh, avoiding DB drift.
+		systemMsg := BuildSystemMessage(agent.SystemPrompt, s.RawSummary)
+		messages = append([]llm.ChatMessage{systemMsg}, messages...)
 
-	newMessages := make([]llm.ChatMessage, 0, 8)
+		steps = s.StepsCompleted
+		totalUsage = s.TotalUsage
+		toolFailures = s.ToolFailures
+		if toolFailures == nil {
+			toolFailures = make(map[string]int)
+		}
+		newMessages = make([]llm.ChatMessage, 0, 8)
 
-	var totalUsage llm.TokenUsage
-	steps := 0
-	toolFailures := make(map[string]int)
+		sink.Emit(StreamEvent{
+			Type:    EventRunResumed,
+			Step:    steps,
+			Attempt: runCtx.Checkpoint.Meta.Attempt,
+		})
+	} else {
+		// Fresh run path
+		systemMsg := BuildSystemMessage(agent.SystemPrompt, runCtx.Summary)
+		messages = make([]llm.ChatMessage, 0, 1+len(runCtx.History)+1+8)
+		messages = append(messages, systemMsg)
+		messages = append(messages, runCtx.History...)
+		messages = append(messages, llm.ChatMessage{
+			Role:    "user",
+			Content: runCtx.Input,
+		})
+
+		newMessages = make([]llm.ChatMessage, 0, 8)
+		toolFailures = make(map[string]int)
+	}
 
 	for steps < maxSteps {
 		if ctx.Err() != nil {
@@ -189,6 +251,22 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 
 			sink.Emit(StreamEvent{Type: EventStepCompleted, Step: steps})
 
+			// Checkpoint at step.completed boundary
+			if r.checkpointStore != nil {
+				snapshot := buildSnapshot(runCtx, agent, messages, runCtx.Summary, steps, maxSteps, totalUsage, toolFailures, checkpointFailures)
+				if saveErr := r.checkpointStore.Save(ctx, snapshot); saveErr != nil {
+					checkpointFailures++
+					log.Printf("[runtime] checkpoint write failed step=%d failures=%d err=%v", steps, checkpointFailures, saveErr)
+					sink.Emit(StreamEvent{Type: EventStatusUpdated, Status: "checkpoint write failed — durability degraded", Step: steps})
+					if checkpointFailures >= checkpointFailureThreshold {
+						state = stateFailed
+						return nil, fmt.Errorf("checkpoint store unavailable after %d consecutive failures", checkpointFailures)
+					}
+				} else {
+					checkpointFailures = 0 // reset on success
+				}
+			}
+
 			state = stateSuccess
 			return &RunResult{
 				Output:      output,
@@ -235,6 +313,15 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 					Step:  steps,
 				})
 				return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, call.Name)
+			}
+
+			// Replay safety check for resumed runs
+			if runCtx.Checkpoint != nil {
+				policy := r.toolRegistry.ReplayPolicy(call.Name)
+				if policy == tools.NoReplay {
+					state = stateFailed
+					return nil, fmt.Errorf("tool %q is not safe to replay — manual resolution required", call.Name)
+				}
 			}
 
 			start := time.Now()
@@ -373,4 +460,46 @@ func (r *AgentRuntime) loadTools(agent *Agent) ([]llm.ToolDefinition, error) {
 		defs = append(defs, tool.Definition())
 	}
 	return defs, nil
+}
+
+func buildSnapshot(
+	runCtx RunContext, ag *Agent, messages []llm.ChatMessage, summary string,
+	steps, maxSteps int, usage llm.TokenUsage, toolFailures map[string]int,
+	checkpointFailures int,
+) RunSnapshot {
+
+	// Create meta representation of tools currently used/loaded.
+	// Since tools might not be executed yet, we collect what's configured on the agent.
+	toolsUsed := ag.Tools
+
+	// Ensure tools array isn't nil
+	if toolsUsed == nil {
+		toolsUsed = []string{}
+	}
+
+	return RunSnapshot{
+		Version: 1,
+		RunID:   runCtx.RunID,
+		State: RuntimeState{
+			Messages:       messages[1:], // Strip system message when storing!
+			RawSummary:     summary,
+			StepsCompleted: steps,
+			MaxSteps:       maxSteps,
+			TotalUsage:     usage,
+			ToolFailures:   toolFailures,
+		},
+		Meta: SnapshotMeta{
+			AgentID:            ag.ID,
+			ThreadID:           runCtx.ThreadID,
+			Provider:           ag.Provider,
+			Model:              ag.Model,
+			Temperature:        ag.Temperature,
+			ToolsUsed:          toolsUsed,
+			Attempt:            runCtx.Attempt,
+			Phase:              "step.completed",
+			CheckpointFailures: checkpointFailures,
+			LastCheckpointAt:   time.Now(),
+			CreatedAt:          time.Now(),
+		},
+	}
 }

@@ -19,6 +19,7 @@ const (
 	EventRunCancelled   EventType = "run.cancelled"
 	EventRunPersisted   EventType = "run.persisted"
 	EventRunPersistFail EventType = "run.persist_failed"
+	EventRunResumed     EventType = "run.resumed"
 	EventStepStarted    EventType = "step.started"
 	EventStepCompleted  EventType = "step.completed"
 	EventModelDelta     EventType = "model.delta"
