@@ -73,17 +73,18 @@ type EventSink interface {
 }
 
 type ChannelSink struct {
-	ctx   context.Context
-	mu    sync.Mutex
-	seq   int64
-	runID string
-	ch    chan<- StreamEvent
+	ctx       context.Context
+	mu        sync.Mutex
+	seq       int64
+	runID     string
+	ch        chan<- StreamEvent
+	closeOnce sync.Once
 }
 
 func NewChannelSink(ctx context.Context, runID string, ch chan<- StreamEvent) *ChannelSink {
 	return &ChannelSink{
 		ctx:   ctx,
-		seq   : 1,
+		seq:   1,
 		runID: runID,
 		ch:    ch,
 	}
@@ -100,28 +101,45 @@ func (s *ChannelSink) Emit(e StreamEvent) {
 	e.Seq = seq
 	e.Time = time.Now()
 
-	isCritical := e.Type == EventRunCompleted || e.Type == EventRunFailed || e.Type == EventRunCancelled || e.Type == EventToolCompleted || e.Type == EventToolFailed
+	isTier1 := e.Type == EventRunCompleted || e.Type == EventRunFailed || e.Type == EventRunCancelled || e.Type == EventToolCompleted || e.Type == EventToolFailed
+	isTier3 := e.Type == EventStatusUpdated
 
-	if isCritical {
+	if isTier1 {
 		select {
 		case <-s.ctx.Done():
-			return // Do not block if client disconnects
+			return
 		case s.ch <- e:
-			// Emitted successfully
 		}
-	} else {
+		return
+	}
+
+	if isTier3 {
 		select {
 		case <-s.ctx.Done():
 			return
 		case s.ch <- e:
 		default:
-			// Drop non-critical updates to prevent channel deadlocks
+
 		}
+		return
+	}
+
+	timeout := time.NewTimer(500 * time.Millisecond)
+	select {
+	case <-s.ctx.Done():
+		timeout.Stop()
+		return
+	case s.ch <- e:
+		timeout.Stop()
+	case <-timeout.C:
+
 	}
 }
 
 func (s *ChannelSink) Close() {
-	close(s.ch) // runtime owns the producer lifecycle
+	s.closeOnce.Do(func() {
+		close(s.ch)
+	})
 }
 
 type NoopSink struct{}

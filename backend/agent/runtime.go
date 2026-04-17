@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -37,7 +38,6 @@ func (r *AgentRuntime) RunStream(ctx context.Context, agent *Agent, runCtx RunCo
 	return r.runInternal(ctx, agent, runCtx, sink)
 }
 
-// terminalState ensures explicit lifecycle closure
 type terminalState int
 
 const (
@@ -47,7 +47,7 @@ const (
 )
 
 func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx RunContext, sink EventSink) (result *RunResult, err error) {
-	state := stateFailed // pessimism default
+	state := stateFailed
 	runStart := time.Now()
 
 	sink.Emit(StreamEvent{
@@ -57,7 +57,10 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 	})
 
 	defer func() {
+		var panicStackTrace string
 		if rec := recover(); rec != nil {
+			panicStackTrace = string(debug.Stack())
+			log.Printf("[runtime] PANIC RECOVERED: %v\n%s", rec, panicStackTrace)
 			err = fmt.Errorf("panic in runtime: %v", rec)
 			state = stateFailed
 		}
@@ -82,13 +85,23 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			sink.Emit(StreamEvent{Type: EventRunCancelled, DurationMs: duration})
 		case stateFailed:
 			errMsg := "unknown error"
+			errCode := "engine.runtime_error"
 			if err != nil {
 				errMsg = err.Error()
+				if strings.Contains(errMsg, "max steps") {
+					errCode = "engine.max_steps"
+				} else if strings.Contains(errMsg, "panic") {
+					errCode = "engine.panic"
+				} else if strings.Contains(errMsg, "not found in registry") {
+					errCode = "tool.not_found"
+				} else if strings.Contains(errMsg, "llm registry") {
+					errCode = "provider.unavailable"
+				}
 			}
 			sink.Emit(StreamEvent{
 				Type:       EventRunFailed,
 				DurationMs: duration,
-				Error:      &ErrMeta{Code: "runtime.error", Message: errMsg},
+				Error:      &ErrMeta{Code: errCode, Message: errMsg},
 			})
 		}
 		sink.Close()
@@ -101,7 +114,8 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 
 	client, err := r.llmRegistry.Get(agent.Provider)
 	if err != nil {
-		return nil, fmt.Errorf("runtime: %w", err)
+		err = fmt.Errorf("llm registry: %w", err)
+		return nil, err
 	}
 
 	toolDefs, err := r.loadTools(agent)
@@ -231,7 +245,10 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			latencyMs := time.Since(start).Milliseconds()
 
 			if len(result.Content) > 8000 {
-				result.Content = result.Content[:8000] + "\n\n...)"
+				r := []rune(result.Content)
+				if len(r) > 8000 {
+					result.Content = string(r[:8000]) + "\n\n...(truncated due to length limit)"
+				}
 			}
 
 			if err != nil {
