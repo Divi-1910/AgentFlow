@@ -105,10 +105,14 @@ func (s *ChannelSink) Emit(e StreamEvent) {
 	isTier3 := e.Type == EventStatusUpdated
 
 	if isTier1 {
+		// Tier 1: Never drop on transport cancel. Use a generous timeout in case channel is permanently dead.
+		timeout := time.NewTimer(5 * time.Second)
 		select {
-		case <-s.ctx.Done():
+		case <-timeout.C:
+			// Log missing tier 1 event if desired, but we drop to prevent infinite goroutine leak
 			return
 		case s.ch <- e:
+			timeout.Stop()
 		}
 		return
 	}

@@ -137,6 +137,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 
 	var totalUsage llm.TokenUsage
 	steps := 0
+	toolFailures := make(map[string]int)
 
 	for steps < maxSteps {
 		if ctx.Err() != nil {
@@ -176,6 +177,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		if len(resp.ToolCalls) == 0 {
 			output := strings.TrimSpace(resp.Content)
 			if output == "" {
+				state = stateFailed
 				return nil, ErrNoFinalOutput
 			}
 
@@ -239,19 +241,18 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			start := time.Now()
 
 			toolCtx, toolCancel := context.WithTimeout(ctx, 30*time.Second)
-			result, err := tool.Execute(toolCtx, call.Arguments)
+			toolResult, err := tool.Execute(toolCtx, call.Arguments)
 			toolCancel()
 
 			latencyMs := time.Since(start).Milliseconds()
 
-			if len(result.Content) > 8000 {
-				r := []rune(result.Content)
-				if len(r) > 8000 {
-					result.Content = string(r[:8000]) + "\n\n...(truncated due to length limit)"
-				}
-			}
-
 			if err != nil {
+				toolFailures[call.Name]++
+				if toolFailures[call.Name] >= 3 {
+					state = stateFailed
+					return nil, fmt.Errorf("tool %q exceeded failure threshold: %v", call.Name, err)
+				}
+
 				errMsg := llm.ChatMessage{
 					Role:       "tool",
 					ToolCallID: call.ID,
@@ -277,17 +278,24 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 				continue
 			}
 
+			if len(toolResult.Content) > 8000 {
+				r := []rune(toolResult.Content)
+				if len(r) > 8000 {
+					toolResult.Content = string(r[:8000]) + "\n\n...(truncated due to length limit)"
+				}
+			}
+
 			log.Printf("[runtime] ✓ tool=%s is_error=%v content_len=%d latency_ms=%d",
-				call.Name, result.IsError, len(result.Content), latencyMs)
+				call.Name, toolResult.IsError, len(toolResult.Content), latencyMs)
 
 			toolMsg := llm.ChatMessage{
 				Role:       "tool",
 				ToolCallID: call.ID,
-				Content:    result.Content,
+				Content:    toolResult.Content,
 				Metadata: map[string]any{
 					"tool_name":  call.Name,
 					"arguments":  string(call.Arguments),
-					"is_error":   result.IsError,
+					"is_error":   toolResult.IsError,
 					"latency_ms": latencyMs,
 				},
 			}
@@ -295,10 +303,10 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			newMessages = append(newMessages, toolMsg)
 
 			displayStr := fmt.Sprintf("Finished %s", call.Name)
-			if result.Content != "" && len(result.Content) < 50 {
-				displayStr = fmt.Sprintf("Result: %s", result.Content)
+			if toolResult.Content != "" && len(toolResult.Content) < 50 {
+				displayStr = fmt.Sprintf("Result: %s", toolResult.Content)
 			}
-			if result.IsError {
+			if toolResult.IsError {
 				displayStr = fmt.Sprintf("Error in %s", call.Name)
 			}
 
