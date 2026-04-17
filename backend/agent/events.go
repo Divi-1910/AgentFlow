@@ -102,6 +102,9 @@ func (s *ChannelSink) Emit(e StreamEvent) {
 	case <-s.ctx.Done():
 		return // Do not block if client disconnects
 	case s.ch <- e:
+		// Emitted successfully
+	default:
+		// Optional: Log backpressure drops if you import "log" in events.go, but for now we just drop it to prevent deadlock
 	}
 }
 

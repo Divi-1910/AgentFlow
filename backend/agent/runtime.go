@@ -11,6 +11,8 @@ import (
 
 	"backend/llm"
 	"backend/tools"
+
+	"github.com/google/uuid"
 )
 
 type AgentRuntime struct {
@@ -30,7 +32,7 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 }
 
 func (r *AgentRuntime) RunStream(ctx context.Context, agent *Agent, runCtx RunContext, events chan<- StreamEvent) (*RunResult, error) {
-	runID := fmt.Sprintf("run-%d", time.Now().UnixNano())
+	runID := uuid.NewString()
 	sink := NewChannelSink(ctx, runID, events)
 	return r.runInternal(ctx, agent, runCtx, sink)
 }
@@ -221,7 +223,11 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			}
 
 			start := time.Now()
-			result, err := tool.Execute(ctx, call.Arguments)
+
+			toolCtx, toolCancel := context.WithTimeout(ctx, 30*time.Second)
+			result, err := tool.Execute(toolCtx, call.Arguments)
+			toolCancel()
+
 			latencyMs := time.Since(start).Milliseconds()
 
 			if err != nil {

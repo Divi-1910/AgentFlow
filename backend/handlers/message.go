@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -149,26 +150,40 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	runCtxStream, cancelStream := context.WithCancel(r.Context())
+	defer cancelStream()
+
 	events := make(chan agent.StreamEvent, 128)
-	var runResult *agent.RunResult
+
+	type outcome struct {
+		res *agent.RunResult
+		err error
+	}
+	done := make(chan outcome, 1)
 
 	go func() {
-		res, _ := h.runtime.RunStream(ctx, ag, runCtx, events)
-		runResult = res
+		res, err := h.runtime.RunStream(runCtxStream, ag, runCtx, events)
+		done <- outcome{res, err}
 	}()
 
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	var terminalEvent *agent.StreamEvent
+	clientDisconnected := false
 
 loop:
 	for {
 		select {
-		case <-ctx.Done():
+		case <-runCtxStream.Done():
+			// Either transport disconnected or we canceled it intentionally
 			break loop
 		case <-ticker.C:
-			fmt.Fprintf(w, ": ping\n\n")
+			if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
+				clientDisconnected = true
+				cancelStream()
+				break loop
+			}
 			flusher.Flush()
 		case e, ok := <-events:
 			if !ok {
@@ -181,15 +196,31 @@ loop:
 			}
 
 			data, _ := json.Marshal(e)
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				clientDisconnected = true
+				cancelStream()
+				break loop
+			}
 			flusher.Flush()
 		}
 	}
 
-	if runResult != nil {
+	// Wait safely for the goroutine to firmly exit
+	out := <-done
+
+	if clientDisconnected {
+		// If client dropped early, still persist if anything returned, but don't bother trying to write the final event
+		if out.res != nil {
+			allMessages := append([]llm.ChatMessage{{Role: "user", Content: req.Content}}, out.res.NewMessages...)
+			_, _ = h.messageRepo.InsertMany(ctx, threadID, thread.AgentID.Hex(), userID, allMessages)
+		}
+		return
+	}
+
+	if out.res != nil {
 		allMessages := append(
 			[]llm.ChatMessage{{Role: "user", Content: req.Content}},
-			runResult.NewMessages...,
+			out.res.NewMessages...,
 		)
 
 		docs, err := h.messageRepo.InsertMany(ctx, threadID, thread.AgentID.Hex(), userID, allMessages)
