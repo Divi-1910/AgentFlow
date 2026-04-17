@@ -58,6 +58,10 @@ func (r *MessageRepo) InsertMany(
 			doc.ToolCallID = m.ToolCallID
 		}
 
+		if len(m.ToolCalls) > 0 {
+			doc.ToolCalls = m.ToolCalls
+		}
+
 		if m.Metadata != nil {
 			doc.Metadata = m.Metadata
 			if name, ok := m.Metadata["tool_name"].(string); ok {
@@ -117,6 +121,8 @@ func (r *MessageRepo) ListRecentByThread(ctx context.Context, threadID string, l
 			Role:       d.Role,
 			Content:    d.Content,
 			ToolCallID: d.ToolCallID,
+			ToolCalls:  d.ToolCalls,
+			Metadata:   d.Metadata,
 		}
 	}
 

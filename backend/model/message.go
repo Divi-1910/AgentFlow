@@ -2,6 +2,7 @@ package model
 
 import (
 	"time"
+	"backend/llm"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
@@ -16,6 +17,7 @@ type MessageDocument struct {
 	Content string `bson:"content" json:"content"`
 
 	ToolCallID string `bson:"tool_call_id,omitempty" json:"tool_call_id,omitempty"`
+	ToolCalls  []llm.ToolCall `bson:"tool_calls,omitempty" json:"tool_calls,omitempty"`
 
 	ToolName string `bson:"tool_name,omitempty" json:"tool_name,omitempty"`
 
