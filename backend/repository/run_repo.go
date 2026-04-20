@@ -13,13 +13,11 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-// Retention periods for checkpoint GC via MongoDB TTL indexes.
 const (
 	retentionCompleted = 7 * 24 * time.Hour
 	retentionFailed    = 30 * 24 * time.Hour
 )
 
-// RunRepo implements agent.CheckpointStore using MongoDB.
 type RunRepo struct {
 	runs        *mongo.Collection
 	checkpoints *mongo.Collection
@@ -29,9 +27,7 @@ func NewRunRepo(runs, checkpoints *mongo.Collection) *RunRepo {
 	return &RunRepo{runs: runs, checkpoints: checkpoints}
 }
 
-// EnsureIndexes should be called once at startup to create required indexes.
 func (r *RunRepo) EnsureIndexes(ctx context.Context) error {
-	// Unique index on run_id in runs collection
 	_, err := r.runs.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "run_id", Value: 1}},
 		Options: options.Index().SetUnique(true),
@@ -40,7 +36,6 @@ func (r *RunRepo) EnsureIndexes(ctx context.Context) error {
 		return fmt.Errorf("run_repo: runs index: %w", err)
 	}
 
-	// Compound index for latest checkpoint lookup: run_id asc, step desc
 	_, err = r.checkpoints.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{
 			{Key: "run_id", Value: 1},
@@ -51,7 +46,6 @@ func (r *RunRepo) EnsureIndexes(ctx context.Context) error {
 		return fmt.Errorf("run_repo: checkpoints index: %w", err)
 	}
 
-	// TTL index for automatic garbage collection
 	_, err = r.checkpoints.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "expires_at", Value: 1}},
 		Options: options.Index().SetSparse(true).SetExpireAfterSeconds(0),
@@ -63,7 +57,6 @@ func (r *RunRepo) EnsureIndexes(ctx context.Context) error {
 	return nil
 }
 
-// CreateRun inserts a new run document with status=running, attempt=1.
 func (r *RunRepo) CreateRun(ctx context.Context, runID, threadID, agentID, userID string) error {
 	now := time.Now()
 	doc := model.RunDocument{
@@ -83,7 +76,6 @@ func (r *RunRepo) CreateRun(ctx context.Context, runID, threadID, agentID, userI
 	return nil
 }
 
-// Save compresses and persists a RunSnapshot at the current step.
 func (r *RunRepo) Save(ctx context.Context, snapshot agent.RunSnapshot) error {
 	gz, err := agent.CompressSnapshot(snapshot)
 	if err != nil {
@@ -103,7 +95,6 @@ func (r *RunRepo) Save(ctx context.Context, snapshot agent.RunSnapshot) error {
 		return fmt.Errorf("run_repo: save checkpoint: %w", err)
 	}
 
-	// Update run's step counter
 	_, _ = r.runs.UpdateOne(ctx,
 		bson.M{"run_id": snapshot.RunID},
 		bson.M{"$set": bson.M{
@@ -115,7 +106,6 @@ func (r *RunRepo) Save(ctx context.Context, snapshot agent.RunSnapshot) error {
 	return nil
 }
 
-// LoadLatest returns the most recent checkpoint for a run.
 func (r *RunRepo) LoadLatest(ctx context.Context, runID string) (*agent.RunSnapshot, error) {
 	opts := options.FindOne().SetSort(bson.D{{Key: "step", Value: -1}})
 	var doc model.RunCheckpointDocument
@@ -134,7 +124,6 @@ func (r *RunRepo) LoadLatest(ctx context.Context, runID string) (*agent.RunSnaps
 	return snapshot, nil
 }
 
-// TransitionStatus atomically changes run status. Returns false if FROM didn't match.
 func (r *RunRepo) TransitionStatus(ctx context.Context, runID string, from, to string) (bool, error) {
 	res, err := r.runs.UpdateOne(ctx,
 		bson.M{"run_id": runID, "status": from},
@@ -146,7 +135,6 @@ func (r *RunRepo) TransitionStatus(ctx context.Context, runID string, from, to s
 	return res.MatchedCount > 0, nil
 }
 
-// UpdateStatus sets the run status and optional last_error.
 func (r *RunRepo) UpdateStatus(ctx context.Context, runID string, status string, lastError string) error {
 	update := bson.M{"status": status, "updated_at": time.Now()}
 	if lastError != "" {
@@ -160,7 +148,6 @@ func (r *RunRepo) UpdateStatus(ctx context.Context, runID string, status string,
 		return fmt.Errorf("run_repo: update status: %w", err)
 	}
 
-	// Set TTL on checkpoints when run reaches a terminal state
 	var retention time.Duration
 	switch model.RunStatus(status) {
 	case model.RunStatusCompleted:
@@ -178,7 +165,6 @@ func (r *RunRepo) UpdateStatus(ctx context.Context, runID string, status string,
 	return nil
 }
 
-// IncrementAttempt atomically increments the attempt counter and returns the new value.
 func (r *RunRepo) IncrementAttempt(ctx context.Context, runID string) (int, error) {
 	after := options.After
 	opts := options.FindOneAndUpdate().SetReturnDocument(after)
@@ -197,7 +183,6 @@ func (r *RunRepo) IncrementAttempt(ctx context.Context, runID string) (int, erro
 	return doc.Attempt, nil
 }
 
-// GetRun returns a lightweight view of the run's current state.
 func (r *RunRepo) GetRun(ctx context.Context, runID string) (*agent.RunInfo, error) {
 	var doc model.RunDocument
 	err := r.runs.FindOne(ctx, bson.M{"run_id": runID}).Decode(&doc)

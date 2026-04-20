@@ -159,7 +159,6 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		// Resume path
 		s := runCtx.Checkpoint.State
 		messages = s.Messages
-		// System message is re-prepended fresh, avoiding DB drift.
 		systemMsg := BuildSystemMessage(agent.SystemPrompt, s.RawSummary)
 		messages = append([]llm.ChatMessage{systemMsg}, messages...)
 
@@ -251,7 +250,6 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 
 			sink.Emit(StreamEvent{Type: EventStepCompleted, Step: steps})
 
-			// Checkpoint at step.completed boundary
 			if r.checkpointStore != nil {
 				snapshot := buildSnapshot(runCtx, agent, messages, runCtx.Summary, steps, maxSteps, totalUsage, toolFailures, checkpointFailures)
 				if saveErr := r.checkpointStore.Save(ctx, snapshot); saveErr != nil {
@@ -263,7 +261,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 						return nil, fmt.Errorf("checkpoint store unavailable after %d consecutive failures", checkpointFailures)
 					}
 				} else {
-					checkpointFailures = 0 // reset on success
+					checkpointFailures = 0
 				}
 			}
 
@@ -315,7 +313,6 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 				return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, call.Name)
 			}
 
-			// Replay safety check for resumed runs
 			if runCtx.Checkpoint != nil {
 				policy := r.toolRegistry.ReplayPolicy(call.Name)
 				if policy == tools.NoReplay {
@@ -326,7 +323,6 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 
 			start := time.Now()
 
-			// Fix #15: guard against already-cancelled context tripping the tool failure counter
 			if ctx.Err() != nil {
 				state = stateCancelled
 				return nil, ctx.Err()
@@ -416,8 +412,6 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 	return nil, ErrMaxStepsReached
 }
 
-// classifyError maps a runtime error to a stable error code for SSE consumers.
-// Uses errors.Is for sentinel errors — never string matching.
 func classifyError(err error) string {
 	if err == nil {
 		return "engine.runtime_error"
@@ -434,8 +428,6 @@ func classifyError(err error) string {
 	case errors.Is(err, context.DeadlineExceeded):
 		return "engine.timeout"
 	default:
-		// Only remaining string check: panic recovery wraps the value as a string.
-		// We cannot use errors.Is here because recovered panics are not typed errors.
 		if strings.Contains(err.Error(), "panic in runtime") {
 			return "engine.panic"
 		}
@@ -468,11 +460,8 @@ func buildSnapshot(
 	checkpointFailures int,
 ) RunSnapshot {
 
-	// Create meta representation of tools currently used/loaded.
-	// Since tools might not be executed yet, we collect what's configured on the agent.
 	toolsUsed := ag.Tools
 
-	// Ensure tools array isn't nil
 	if toolsUsed == nil {
 		toolsUsed = []string{}
 	}
@@ -481,7 +470,7 @@ func buildSnapshot(
 		Version: 1,
 		RunID:   runCtx.RunID,
 		State: RuntimeState{
-			Messages:       messages[1:], // Strip system message when storing!
+			Messages:       messages[1:],
 			RawSummary:     summary,
 			StepsCompleted: steps,
 			MaxSteps:       maxSteps,

@@ -9,13 +9,12 @@ import (
 	"time"
 )
 
-// ReplayPolicy classifies tool replay safety for checkpoint resume.
 type ReplayPolicy int
 
 const (
-	ReplaySafe      ReplayPolicy = iota // Pure: replay freely (web_search, calculator)
-	ReplayWithKey                       // Idempotent: safe with original call ID (V2)
-	NoReplay                            // Side-effecting: never auto-retry (send_email)
+	ReplaySafe ReplayPolicy = iota
+	ReplayWithKey
+	NoReplay
 )
 
 type ToolRegistry struct {
@@ -48,10 +47,9 @@ func NewToolRegistry() *ToolRegistry {
 
 func (r *ToolRegistry) Register(t Tool) {
 	r.tools[t.Name()] = t
-	r.policies[t.Name()] = ReplaySafe // default: all self-contained tools are pure
+	r.policies[t.Name()] = ReplaySafe
 }
 
-// RegisterWithPolicy registers a tool with an explicit replay safety policy.
 func (r *ToolRegistry) RegisterWithPolicy(t Tool, policy ReplayPolicy) {
 	r.tools[t.Name()] = t
 	r.policies[t.Name()] = policy

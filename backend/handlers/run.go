@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"backend/agent"
 	"backend/model"
@@ -16,6 +17,7 @@ import (
 type RunHandler struct {
 	agentRepo    *repository.AgentRepo
 	threadRepo   *repository.ThreadRepo
+	messageRepo  *repository.MessageRepo
 	runRepo      agent.CheckpointStore
 	runtime      *agent.AgentRuntime
 	toolRegistry *tools.ToolRegistry
@@ -24,6 +26,7 @@ type RunHandler struct {
 func NewRunHandler(
 	agentRepo *repository.AgentRepo,
 	threadRepo *repository.ThreadRepo,
+	messageRepo *repository.MessageRepo,
 	runRepo agent.CheckpointStore,
 	runtime *agent.AgentRuntime,
 	toolRegistry *tools.ToolRegistry,
@@ -31,13 +34,13 @@ func NewRunHandler(
 	return &RunHandler{
 		agentRepo:    agentRepo,
 		threadRepo:   threadRepo,
+		messageRepo:  messageRepo,
 		runRepo:      runRepo,
 		runtime:      runtime,
 		toolRegistry: toolRegistry,
 	}
 }
 
-// GetRun returns the current status and metadata of a run.
 func (h *RunHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
 	if runID == "" {
@@ -54,7 +57,6 @@ func (h *RunHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, info)
 }
 
-// ResumeRun resumes a resumable run from its latest checkpoint.
 func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
 	if runID == "" {
@@ -64,7 +66,6 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// 1. Check if run exists and is resumable
 	info, err := h.runRepo.GetRun(ctx, runID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "Run not found")
@@ -76,7 +77,6 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Atomically claim ownership (concurrency guard)
 	claimed, err := h.runRepo.TransitionStatus(ctx, runID, string(model.RunStatusResumable), string(model.RunStatusRunning))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Failed to transition run state")
@@ -87,7 +87,6 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Load latest checkpoint
 	snapshot, err := h.runRepo.LoadLatest(ctx, runID)
 	if err != nil {
 		_ = h.runRepo.UpdateStatus(ctx, runID, string(model.RunStatusFailed), "failed to load checkpoint")
@@ -95,14 +94,12 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Validate checkpoint structural integrity and tooling mismatch policies
 	if err := agent.ValidateSnapshot(snapshot, h.toolRegistry); err != nil {
 		_ = h.runRepo.UpdateStatus(ctx, runID, string(model.RunStatusFailed), fmt.Sprintf("snapshot invalid: %v", err))
 		writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("Checkpoint validation failed: %v", err))
 		return
 	}
 
-	// 5. Load associated agent domain to rebuild runtime deps
 	ag, err := h.agentRepo.GetByID(ctx, snapshot.Meta.AgentID, "")
 	if err != nil {
 		_ = h.runRepo.UpdateStatus(ctx, runID, string(model.RunStatusFailed), "agent not found")
@@ -110,7 +107,6 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 6. Increment attempt counter
 	newAttempt, err := h.runRepo.IncrementAttempt(ctx, runID)
 	if err != nil {
 		log.Printf("[resume] failed to increment attempt: %v", err)
@@ -118,7 +114,6 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 	}
 	snapshot.Meta.Attempt = newAttempt
 
-	// 7. Setup transport
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "Streaming unsupported")
@@ -135,7 +130,6 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 
 	events := make(chan agent.StreamEvent, 128)
 
-	// Build specialized run context for resume
 	runCtx := agent.RunContext{
 		RunID:      runID,
 		ThreadID:   snapshot.Meta.ThreadID,
@@ -143,10 +137,6 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 		Checkpoint: snapshot,
 	}
 
-	// The rest of the stream consumption looks identical to fresh run.
-	// Note: Checkpoint runs skip background summarization because
-	// the snapshot embeds its own summary truth.
-	
 	type outcome struct {
 		res *agent.RunResult
 		err error
@@ -154,38 +144,143 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 	done := make(chan outcome, 1)
 
 	go func() {
-		res, err := h.runtime.RunStream(runCtxStream, ag, runCtx, events)
-		done <- outcome{res, err}
+		var (
+			res    *agent.RunResult
+			runErr error
+		)
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("[resume] panic in RunStream: %v", rec)
+				runErr = fmt.Errorf("panic in stream execution: %v", rec)
+			}
+			done <- outcome{res, runErr}
+		}()
+		res, runErr = h.runtime.RunStream(runCtxStream, ag, runCtx, events)
 	}()
 
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	var terminalEvent *agent.StreamEvent
+	clientDisconnected := false
+
+loop:
 	for {
 		select {
-		case ev, ok := <-events:
-			if !ok {
-				events = nil
-				break
-			}
-			msg, err := json.Marshal(ev)
-			if err == nil {
-				_, _ = fmt.Fprintf(w, "data: %s\n\n", msg)
-				flusher.Flush()
-			}
 		case <-runCtxStream.Done():
-			cancelStream() // signal runtime to stop
-			
-			// We MUST drain remaining events to unblock runtime
-			for range events {
+			break loop
+		case <-ticker.C:
+			if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
+				clientDisconnected = true
+				cancelStream()
+				break loop
 			}
-			return
-		case out := <-done:
-			if out.res != nil && out.err == nil {
-				// Terminal state successfully completed in memory
+			flusher.Flush()
+		case e, ok := <-events:
+			if !ok {
+				break loop
 			}
-			return
+			if e.Type == agent.EventRunCompleted || e.Type == agent.EventRunFailed ||
+				e.Type == agent.EventRunCancelled || e.Type == agent.EventRunResumed {
+				if terminalEvent == nil || e.Type != agent.EventRunResumed {
+					terminalEvent = &e
+				}
+
+				if e.Type == agent.EventRunResumed {
+					data, _ := json.Marshal(e)
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
+					continue
+				}
+				continue
+			}
+			data, merr := json.Marshal(e)
+			if merr != nil {
+				continue
+			}
+			if _, ferr := fmt.Fprintf(w, "data: %s\n\n", data); ferr != nil {
+				clientDisconnected = true
+				cancelStream()
+				break loop
+			}
+			flusher.Flush()
 		}
-		
-		if events == nil {
-			break
+	}
+
+	out := <-done
+
+	// Drain any remaining events before deciding on terminal state
+draining:
+	for {
+		select {
+		case e, ok := <-events:
+			if !ok {
+				break draining
+			}
+			if e.Type == agent.EventRunCompleted || e.Type == agent.EventRunFailed || e.Type == agent.EventRunCancelled {
+				if terminalEvent == nil {
+					terminalEvent = &e
+				}
+			}
+		default:
+			break draining
+		}
+	}
+
+	if out.err != nil && terminalEvent == nil {
+		terminalEvent = &agent.StreamEvent{
+			Type:  agent.EventRunFailed,
+			Time:  time.Now(),
+			Error: &agent.ErrMeta{Code: "engine.runtime_error", Message: out.err.Error()},
+		}
+	}
+
+	if terminalEvent != nil && !clientDisconnected {
+		data, _ := json.Marshal(terminalEvent)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
+	if out.res != nil {
+		persistCtx, cancelPersist := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelPersist()
+
+		allMessages := out.res.NewMessages
+
+		docs, persistErr := h.threadRepo.GetByID(persistCtx, snapshot.Meta.ThreadID, "")
+		if persistErr == nil && docs != nil {
+			savedDocs, insertErr := h.messageRepo.InsertMany(
+				persistCtx,
+				snapshot.Meta.ThreadID,
+				docs.AgentID.Hex(),
+				ag.ID,
+				allMessages,
+			)
+			if insertErr != nil {
+				log.Printf("[resume] persist failed attempt=%d thread=%s err=%v", newAttempt, snapshot.Meta.ThreadID, insertErr)
+				if !clientDisconnected {
+					persistFailEvent := agent.StreamEvent{
+						Type:  agent.EventRunPersistFail,
+						Time:  time.Now(),
+						Error: &agent.ErrMeta{Code: "internal.persistence_error", Message: "Failed to persist messages"},
+					}
+					data, _ := json.Marshal(persistFailEvent)
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
+				}
+			} else {
+				log.Printf("[resume] persisted attempt=%d steps=%d thread=%s messages=%d",
+					newAttempt, out.res.Steps, snapshot.Meta.ThreadID, len(savedDocs))
+				if !clientDisconnected {
+					persistedEvent := agent.StreamEvent{
+						Type: agent.EventRunPersisted,
+						Time: time.Now(),
+					}
+					data, _ := json.Marshal(persistedEvent)
+					_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
+				}
+			}
 		}
 	}
 }

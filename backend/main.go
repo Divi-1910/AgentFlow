@@ -106,7 +106,6 @@ func main() {
 	messageRepo := repository.NewMessageRepo(messagesCol)
 	runRepo := repository.NewRunRepo(runsCol, checkpointsCol)
 
-	// Ensure Mongo indexes for run/checkpoints
 	if err := runRepo.EnsureIndexes(context.Background()); err != nil {
 		log.Fatalf("failed to create run indexes: %v", err)
 	}
@@ -127,6 +126,7 @@ func main() {
 	runHandler := handlers.NewRunHandler(
 		agentRepo,
 		threadRepo,
+		messageRepo,
 		runRepo,
 		agentRuntime,
 		toolRegistry,
