@@ -24,6 +24,7 @@ type MessageHandler struct {
 	runtime     *agent.AgentRuntime
 	summarizer  *agent.Summarizer
 	runRepo     agent.CheckpointStore
+	background  context.Context
 }
 
 func NewMessageHandler(
@@ -33,7 +34,11 @@ func NewMessageHandler(
 	runtime *agent.AgentRuntime,
 	summarizer *agent.Summarizer,
 	runRepo agent.CheckpointStore,
+	background context.Context,
 ) *MessageHandler {
+	if background == nil {
+		background = context.Background()
+	}
 	return &MessageHandler{
 		agentRepo:   agentRepo,
 		threadRepo:  threadRepo,
@@ -41,6 +46,7 @@ func NewMessageHandler(
 		runtime:     runtime,
 		summarizer:  summarizer,
 		runRepo:     runRepo,
+		background:  background,
 	}
 }
 
@@ -120,8 +126,6 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 		drop, keep := agent.SplitTurnsForCompaction(ag, currentSummary, turns)
 
 		if len(drop) > 0 {
-			bgCtx := context.Background()
-
 			go func(ctx context.Context, ag *agent.Agent, summary string, drop []agent.Turn) {
 				defer func() {
 					if rec := recover(); rec != nil {
@@ -140,7 +144,7 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 						log.Printf("[message-bg-summary] summary persist failed thread=%s err=%v", threadID, updateErr)
 					}
 				}
-			}(bgCtx, ag, currentSummary, drop)
+			}(h.background, ag, currentSummary, drop)
 
 			turns = keep
 		}

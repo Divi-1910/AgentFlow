@@ -81,6 +81,24 @@ func (r *AgentRepo) GetByID(ctx context.Context, agentID, userID string) (*agent
 	return r.toRuntimeAgent(ctx, doc), nil
 }
 
+func (r *AgentRepo) GetByIDSystem(ctx context.Context, agentID string) (*agent.Agent, error) {
+	aid, err := bson.ObjectIDFromHex(agentID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid agent_id: %w", err)
+	}
+
+	var doc model.AgentDocument
+	err = r.col.FindOne(ctx, bson.M{"_id": aid}).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return nil, fmt.Errorf("agent not found")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("agent_repo: find failed: %w", err)
+	}
+
+	return r.toRuntimeAgent(ctx, doc), nil
+}
+
 func (r *AgentRepo) ListByUser(ctx context.Context, userID string) ([]*agent.Agent, error) {
 	uid, err := bson.ObjectIDFromHex(userID)
 	if err != nil {

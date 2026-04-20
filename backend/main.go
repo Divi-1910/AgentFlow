@@ -13,6 +13,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -49,6 +51,9 @@ func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found or error loading it. Proceeding with system environment variables.")
 	}
+
+	appCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	mux := http.NewServeMux()
 
@@ -122,6 +127,7 @@ func main() {
 		agentRuntime,
 		summarizer,
 		runRepo,
+		appCtx,
 	)
 	runHandler := handlers.NewRunHandler(
 		agentRepo,

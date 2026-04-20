@@ -100,10 +100,10 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ag, err := h.agentRepo.GetByID(ctx, snapshot.Meta.AgentID, "")
+	ag, err := h.agentRepo.GetByIDSystem(ctx, snapshot.Meta.AgentID)
 	if err != nil {
-		_ = h.runRepo.UpdateStatus(ctx, runID, string(model.RunStatusFailed), "agent not found")
-		writeError(w, http.StatusInternalServerError, "Agent not found")
+		_ = h.runRepo.UpdateStatus(ctx, runID, string(model.RunStatusFailed), fmt.Sprintf("failed to load agent: %v", err))
+		writeError(w, http.StatusInternalServerError, "Failed to load agent for resume")
 		return
 	}
 
