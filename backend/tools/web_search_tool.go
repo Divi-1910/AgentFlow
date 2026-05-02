@@ -76,10 +76,6 @@ type tavilyResult struct {
 	Content string `json:"content"`
 }
 
-// Execute is idempotent on call.ID via a file-backed response cache. Tavily
-// search results for a given query are stable enough that re-issuing on
-// resume would usually return equivalent data, but caching the first result
-// removes any drift and avoids the extra API spend.
 func (t *WebSearchTool) Execute(ctx context.Context, call ToolCall) (*ToolResult, error) {
 	if cached, ok := t.cache.Get(call.ID); ok {
 		return cached, nil
