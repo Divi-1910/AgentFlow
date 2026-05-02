@@ -2,9 +2,11 @@ package agent
 
 import (
 	"errors"
+	"log/slog"
 	"time"
 
 	"backend/llm"
+	"backend/runtimectx"
 )
 
 var (
@@ -24,39 +26,33 @@ const (
 )
 
 type Agent struct {
-	ID          string
-	Name        string
-	Description string
-
-	Provider string
-	Model    string
-
-	SystemPrompt string
-	Tools        []string
-
+	ID                 string
+	Name               string
+	Description        string
+	Provider           string
+	Model              string
+	SystemPrompt       string
+	Tools              []string
 	ModelContextLimit  int
 	ContextWindow      int
 	ContextKeepRatio   float64
 	SummarizationModel string
-
-	MaxSteps    int
-	Temperature float64
-	MaxTokens   int
-
-	CreatedAt time.Time
+	MaxSteps           int
+	Temperature        float64
+	MaxTokens          int
+	CreatedAt          time.Time
 }
 
 type RunContext struct {
-	RunID    string
-	ThreadID string
-	Attempt  int
-
-	Summary string
-	History []llm.ChatMessage
-	Input   string
-
-	// Non-nil when resuming from a checkpoint. Nil = fresh run.
+	RunID      string
+	ThreadID   string
+	Attempt    int
+	Summary    string
+	History    []llm.ChatMessage
+	Input      string
 	Checkpoint *RunSnapshot
+	Memory     runtimectx.MemoryScope
+	Logger     *slog.Logger
 }
 
 type RunResult struct {

@@ -38,9 +38,9 @@ type calcArgs struct {
 	Expression string `json:"expression"`
 }
 
-func (t *CalculatorTool) Execute(_ context.Context, args json.RawMessage) (*ToolResult, error) {
+func (t *CalculatorTool) Execute(_ context.Context, call ToolCall) (*ToolResult, error) {
 	var input calcArgs
-	if err := json.Unmarshal(args, &input); err != nil {
+	if err := json.Unmarshal(call.Args, &input); err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidArgs, err.Error())
 	}
 	if strings.TrimSpace(input.Expression) == "" {

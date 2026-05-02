@@ -5,12 +5,13 @@ import (
 	"backend/db"
 	"backend/handlers"
 	"backend/llm"
+	"backend/memory"
 	"backend/middleware"
 	"backend/repository"
 	"backend/tools"
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -36,20 +37,21 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "OPTIONS" {
-			log.Printf("[%s] %s - Request initiated", r.Method, r.URL.Path)
+		if r.Method == "OPTIONS" {
+			next.ServeHTTP(w, r)
+			return
 		}
 		start := time.Now()
+		slog.Info("request", "method", r.Method, "path", r.URL.Path)
 		next.ServeHTTP(w, r)
-		if r.Method != "OPTIONS" {
-			log.Printf("[%s] %s - Completed in %v\n--", r.Method, r.URL.Path, time.Since(start))
-		}
+		slog.Info("request completed", "method", r.Method, "path", r.URL.Path,
+			"duration_ms", time.Since(start).Milliseconds())
 	})
 }
 
 func main() {
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found or error loading it. Proceeding with system environment variables.")
+		slog.Info("no .env file found, using system environment variables")
 	}
 
 	appCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -99,7 +101,14 @@ func main() {
 	}
 
 	llmRegistry := llm.NewLLMRegistry()
-	toolRegistry := tools.NewToolRegistry()
+
+	memorySvc, err := memory.NewServiceFromEnv()
+	if err != nil {
+		slog.Error("failed to initialize memory service", "error", err)
+		os.Exit(1)
+	}
+
+	toolRegistry := tools.NewToolRegistry(db.GetRedis(), memorySvc)
 
 	llmHandler := &handlers.LLMHandler{
 		LLMRegistry: llmRegistryCol,
@@ -112,13 +121,14 @@ func main() {
 	runRepo := repository.NewRunRepo(runsCol, checkpointsCol)
 
 	if err := runRepo.EnsureIndexes(context.Background()); err != nil {
-		log.Fatalf("failed to create run indexes: %v", err)
+		slog.Error("failed to create run indexes", "error", err)
+		os.Exit(1)
 	}
 
 	agentRuntime := agent.NewAgentRuntime(llmRegistry, toolRegistry).WithCheckpointStore(runRepo)
 	summarizer := agent.NewSummarizer(llmRegistry)
 
-	agentHandler := handlers.NewAgentHandler(agentRepo)
+	agentHandler := handlers.NewAgentHandler(agentRepo, toolRegistry)
 	threadHandler := handlers.NewThreadHandler(threadRepo, agentRepo)
 	messageHandler := handlers.NewMessageHandler(
 		agentRepo,
@@ -169,12 +179,14 @@ func main() {
 		Addr:              ":" + port,
 		Handler:           loggingMiddleware(corsMiddleware(mux)),
 		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("server listening on http://localhost:%s", port)
+	slog.Info("server listening", "addr", "http://localhost:"+port)
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("failed to start server: %v", err)
+		slog.Error("server stopped", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -190,6 +202,6 @@ func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
 	w.WriteHeader(statusCode)
 
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		log.Printf("failed to encode JSON response: %v", err)
+		slog.Error("failed to encode JSON response", "error", err)
 	}
 }

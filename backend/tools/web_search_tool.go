@@ -17,12 +17,14 @@ import (
 type WebSearchTool struct {
 	apiKey string
 	client *http.Client
+	cache  *dedupCache
 }
 
-func NewWebSearchTool(apiKey string, timeout time.Duration) *WebSearchTool {
+func NewWebSearchTool(apiKey string, timeout time.Duration, cache *dedupCache) *WebSearchTool {
 	return &WebSearchTool{
 		apiKey: apiKey,
 		client: &http.Client{Timeout: timeout},
+		cache:  cache,
 	}
 }
 
@@ -74,7 +76,22 @@ type tavilyResult struct {
 	Content string `json:"content"`
 }
 
-func (t *WebSearchTool) Execute(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
+// Execute is idempotent on call.ID via a file-backed response cache. Tavily
+// search results for a given query are stable enough that re-issuing on
+// resume would usually return equivalent data, but caching the first result
+// removes any drift and avoids the extra API spend.
+func (t *WebSearchTool) Execute(ctx context.Context, call ToolCall) (*ToolResult, error) {
+	if cached, ok := t.cache.Get(call.ID); ok {
+		return cached, nil
+	}
+	result, err := t.executeUncached(ctx, call.Args)
+	if err == nil && result != nil {
+		t.cache.Put(call.ID, result)
+	}
+	return result, err
+}
+
+func (t *WebSearchTool) executeUncached(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
 	var input searchArgs
 	if err := json.Unmarshal(args, &input); err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidArgs, err.Error())

@@ -1,20 +1,26 @@
 package handlers
 
 import (
+	"errors"
 	"encoding/json"
 	"net/http"
 	"time"
 
 	"backend/agent"
 	"backend/repository"
+	"backend/tools"
 )
 
 type AgentHandler struct {
-	agentRepo *repository.AgentRepo
+	agentRepo    *repository.AgentRepo
+	toolRegistry *tools.ToolRegistry
 }
 
-func NewAgentHandler(agentRepo *repository.AgentRepo) *AgentHandler {
-	return &AgentHandler{agentRepo: agentRepo}
+func NewAgentHandler(agentRepo *repository.AgentRepo, toolRegistry *tools.ToolRegistry) *AgentHandler {
+	return &AgentHandler{
+		agentRepo:    agentRepo,
+		toolRegistry: toolRegistry,
+	}
 }
 
 type CreateAgentRequest struct {
@@ -117,6 +123,10 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if req.Tools == nil {
 		req.Tools = []string{}
 	}
+	if err := h.validateTools(req.Tools); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	a := &agent.Agent{
 		Name:               req.Name,
@@ -207,6 +217,12 @@ func (h *AgentHandler) Update(w http.ResponseWriter, r *http.Request) {
 		ContextKeepRatio:   req.ContextKeepRatio,
 		SummarizationModel: req.SummarizationModel,
 	}
+	if req.Tools != nil {
+		if err := h.validateTools(*req.Tools); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 
 	updated, err := h.agentRepo.Update(r.Context(), r.PathValue("id"), userID, input)
 	if err != nil {
@@ -236,4 +252,13 @@ func (h *AgentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "agent deleted"})
+}
+
+func (h *AgentHandler) validateTools(toolNames []string) error {
+	for _, name := range toolNames {
+		if !h.toolRegistry.Has(name) {
+			return errors.New("unknown tool: " + name)
+		}
+	}
+	return nil
 }

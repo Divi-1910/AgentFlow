@@ -135,6 +135,17 @@ func (r *RunRepo) TransitionStatus(ctx context.Context, runID string, from, to s
 	return res.MatchedCount > 0, nil
 }
 
+func (r *RunRepo) TransitionStatusForUser(ctx context.Context, runID, userID string, from, to string) (bool, error) {
+	res, err := r.runs.UpdateOne(ctx,
+		bson.M{"run_id": runID, "user_id": userID, "status": from},
+		bson.M{"$set": bson.M{"status": to, "updated_at": time.Now()}},
+	)
+	if err != nil {
+		return false, fmt.Errorf("run_repo: transition status for user: %w", err)
+	}
+	return res.MatchedCount > 0, nil
+}
+
 func (r *RunRepo) UpdateStatus(ctx context.Context, runID string, status string, lastError string) error {
 	update := bson.M{"status": status, "updated_at": time.Now()}
 	if lastError != "" {
@@ -152,7 +163,7 @@ func (r *RunRepo) UpdateStatus(ctx context.Context, runID string, status string,
 	switch model.RunStatus(status) {
 	case model.RunStatusCompleted:
 		retention = retentionCompleted
-	case model.RunStatusFailed, model.RunStatusCancelled:
+	case model.RunStatusFailed, model.RunStatusCancelled, model.RunStatusInterrupted:
 		retention = retentionFailed
 	}
 	if retention > 0 {
@@ -195,6 +206,29 @@ func (r *RunRepo) GetRun(ctx context.Context, runID string) (*agent.RunInfo, err
 	return &agent.RunInfo{
 		RunID:          doc.RunID,
 		ThreadID:       doc.ThreadID,
+		AgentID:        doc.AgentID,
+		UserID:         doc.UserID,
+		Status:         string(doc.Status),
+		Attempt:        doc.Attempt,
+		StepsCompleted: doc.StepsCompleted,
+		LastError:      doc.LastError,
+	}, nil
+}
+
+func (r *RunRepo) GetRunForUser(ctx context.Context, runID, userID string) (*agent.RunInfo, error) {
+	var doc model.RunDocument
+	err := r.runs.FindOne(ctx, bson.M{"run_id": runID, "user_id": userID}).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return nil, fmt.Errorf("run_repo: run not found: %s", runID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("run_repo: get run for user: %w", err)
+	}
+	return &agent.RunInfo{
+		RunID:          doc.RunID,
+		ThreadID:       doc.ThreadID,
+		AgentID:        doc.AgentID,
+		UserID:         doc.UserID,
 		Status:         string(doc.Status),
 		Attempt:        doc.Attempt,
 		StepsCompleted: doc.StepsCompleted,

@@ -14,10 +14,15 @@ var (
 	ErrToolTimeout         = errors.New("Tool Timeout")
 )
 
+type ToolCall struct {
+	ID   string
+	Args json.RawMessage
+}
+
 type Tool interface {
 	Name() string
 	Definition() llm.ToolDefinition
-	Execute(ctx context.Context, args json.RawMessage) (*ToolResult, error)
+	Execute(ctx context.Context, call ToolCall) (*ToolResult, error)
 }
 
 type ToolResult struct {

@@ -1,17 +1,18 @@
 package agent
 
 import (
+	"backend/llm"
+	"backend/model"
+	"backend/runtimectx"
+	"backend/tools"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"runtime/debug"
 	"strings"
 	"time"
-
-	"backend/llm"
-	"backend/tools"
 )
 
 const checkpointFailureThreshold = 3
@@ -19,7 +20,7 @@ const checkpointFailureThreshold = 3
 type AgentRuntime struct {
 	llmRegistry     *llm.LLMRegistry
 	toolRegistry    *tools.ToolRegistry
-	checkpointStore CheckpointStore // optional; nil = no checkpointing
+	checkpointStore CheckpointStore
 }
 
 func NewAgentRuntime(llmRegistry *llm.LLMRegistry, toolRegistry *tools.ToolRegistry) *AgentRuntime {
@@ -29,7 +30,6 @@ func NewAgentRuntime(llmRegistry *llm.LLMRegistry, toolRegistry *tools.ToolRegis
 	}
 }
 
-// WithCheckpointStore returns a copy of the runtime with a checkpoint store attached.
 func (r *AgentRuntime) WithCheckpointStore(store CheckpointStore) *AgentRuntime {
 	return &AgentRuntime{
 		llmRegistry:     r.llmRegistry,
@@ -43,7 +43,6 @@ func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext)
 }
 
 func (r *AgentRuntime) RunStream(ctx context.Context, ag *Agent, runCtx RunContext, events chan<- StreamEvent) (*RunResult, error) {
-	// The runID is now deterministically created by the handler and passed in runCtx.
 	sink := NewChannelSink(ctx, runCtx.RunID, events)
 	return r.runInternal(ctx, ag, runCtx, sink)
 }
@@ -57,8 +56,14 @@ const (
 )
 
 func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx RunContext, sink EventSink) (result *RunResult, err error) {
+	logger := runCtx.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	state := stateFailed
 	runStart := time.Now()
+	var hasSnapshot bool
 
 	sink.Emit(StreamEvent{
 		Type:     EventRunStarted,
@@ -70,7 +75,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		var panicStackTrace string
 		if rec := recover(); rec != nil {
 			panicStackTrace = string(debug.Stack())
-			log.Printf("[runtime] PANIC RECOVERED: %v\n%s", rec, panicStackTrace)
+			logger.Error("panic recovered", "error", rec, "stack", panicStackTrace)
 			err = fmt.Errorf("panic in runtime: %v", rec)
 			state = stateFailed
 		}
@@ -111,16 +116,18 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			case stateSuccess:
 				_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "completed", "")
 			case stateCancelled:
-				_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "cancelled", "")
+				if hasSnapshot {
+					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, string(model.RunStatusInterrupted), "")
+				} else {
+					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, string(model.RunStatusFailed), "interrupted before first checkpoint")
+				}
 			case stateFailed:
 				errMsg := "unknown error"
 				if err != nil {
 					errMsg = err.Error()
 				}
-				if IsResumable(err) {
+				if IsResumable(err) && hasSnapshot {
 					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "resumable", errMsg)
-				} else if strings.Contains(errMsg, "manual resolution required") {
-					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "requires_manual_resolution", errMsg)
 				} else {
 					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "failed", errMsg)
 				}
@@ -153,10 +160,10 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		steps              int
 		toolFailures       map[string]int
 		checkpointFailures int
+		pendingToolCalls   []llm.ToolCall
 	)
 
 	if runCtx.Checkpoint != nil {
-		// Resume path
 		s := runCtx.Checkpoint.State
 		messages = s.Messages
 		systemMsg := BuildSystemMessage(agent.SystemPrompt, s.RawSummary)
@@ -168,7 +175,20 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		if toolFailures == nil {
 			toolFailures = make(map[string]int)
 		}
-		newMessages = make([]llm.ChatMessage, 0, 8)
+		newMessages = make([]llm.ChatMessage, 0)
+		hasSnapshot = true
+
+		if runCtx.Checkpoint.Meta.Phase == PhasePostModel {
+			if len(messages) == 0 || messages[len(messages)-1].Role != "assistant" {
+				return nil, fmt.Errorf(
+					"post_model resume: snapshot missing assistant message with tool calls",
+				)
+			}
+			pendingToolCalls = messages[len(messages)-1].ToolCalls
+			if len(pendingToolCalls) == 0 {
+				return nil, fmt.Errorf("post_model resume: no pending tool calls")
+			}
+		}
 
 		sink.Emit(StreamEvent{
 			Type:    EventRunResumed,
@@ -176,9 +196,8 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			Attempt: runCtx.Checkpoint.Meta.Attempt,
 		})
 	} else {
-		// Fresh run path
 		systemMsg := BuildSystemMessage(agent.SystemPrompt, runCtx.Summary)
-		messages = make([]llm.ChatMessage, 0, 1+len(runCtx.History)+1+8)
+		messages = make([]llm.ChatMessage, 0)
 		messages = append(messages, systemMsg)
 		messages = append(messages, runCtx.History...)
 		messages = append(messages, llm.ChatMessage{
@@ -186,7 +205,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			Content: runCtx.Input,
 		})
 
-		newMessages = make([]llm.ChatMessage, 0, 8)
+		newMessages = make([]llm.ChatMessage, 0)
 		toolFailures = make(map[string]int)
 	}
 
@@ -196,96 +215,137 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			return nil, ctx.Err()
 		}
 
-		sink.Emit(StreamEvent{Type: EventStepStarted, Step: steps + 1, MaxSteps: maxSteps})
-		sink.Emit(StreamEvent{Type: EventStatusUpdated, Status: "Calling model", Step: steps + 1})
+		var toolCalls []llm.ToolCall
 
-		log.Printf("[runtime] step=%d agent=%s provider=%s model=%s messages=%d",
-			steps+1, agent.Name, agent.Provider, agent.Model, len(messages))
-
-		temperature := agent.Temperature
-		if temperature == 0 {
-			temperature = DefaultTemperature
-		}
-		maxTokens := agent.MaxTokens
-		if maxTokens == 0 {
-			maxTokens = DefaultMaxTokens
-		}
-
-		resp, err := client.ChatCompletion(ctx, &llm.ChatRequest{
-			Model:       agent.Model,
-			Messages:    messages,
-			Tools:       toolDefs,
-			Temperature: temperature,
-			MaxTokens:   maxTokens,
-		})
-
-		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
-				state = stateCancelled
-				return nil, err
-			}
-			return nil, fmt.Errorf("runtime: llm call failed at step %d: %w", steps+1, err)
-		}
-
-		steps++
-		sink.Emit(StreamEvent{Type: EventModelCompleted, Step: steps})
-
-		totalUsage.PromptTokens += resp.Usage.PromptTokens
-		totalUsage.CompletionTokens += resp.Usage.CompletionTokens
-		totalUsage.TotalTokens += resp.Usage.TotalTokens
-
-		if len(resp.ToolCalls) == 0 {
-			output := strings.TrimSpace(resp.Content)
-			if output == "" {
-				state = stateFailed
-				return nil, ErrNoFinalOutput
+		if pendingToolCalls != nil {
+			toolCalls = pendingToolCalls
+			pendingToolCalls = nil
+			logger.Info("resuming from post_model snapshot",
+				"pending_tool_calls", len(toolCalls))
+		} else {
+			if r.checkpointStore != nil {
+				snapshot := buildSnapshot(
+					runCtx, agent, messages, runCtx.Summary, steps, maxSteps,
+					totalUsage, toolFailures, checkpointFailures, PhasePreModel, r.toolRegistry,
+				)
+				var saveErr error
+				if checkpointFailures, saveErr = r.trySaveCheckpoint(snapshot, sink, steps, checkpointFailures, hasSnapshot, logger); saveErr != nil {
+					state = stateFailed
+					return nil, saveErr
+				}
+				hasSnapshot = true
 			}
 
-			finalMsg := llm.ChatMessage{Role: "assistant", Content: resp.Content}
-			messages = append(messages, finalMsg)
-			newMessages = append(newMessages, finalMsg)
+			sink.Emit(StreamEvent{Type: EventStepStarted, Step: steps + 1, MaxSteps: maxSteps})
+			sink.Emit(StreamEvent{Type: EventStatusUpdated, Status: "Calling model", Step: steps + 1})
 
-			log.Printf("[runtime] done steps=%d prompt_tokens=%d completion_tokens=%d",
-				steps, totalUsage.PromptTokens, totalUsage.CompletionTokens)
+			logger.Info("calling model",
+				"step", steps+1,
+				"model", agent.Model,
+				"messages", len(messages))
 
-			sink.Emit(StreamEvent{Type: EventStepCompleted, Step: steps})
+			temperature := agent.Temperature
+			if temperature == 0 {
+				temperature = DefaultTemperature
+			}
+			maxTokens := agent.MaxTokens
+			if maxTokens == 0 {
+				maxTokens = DefaultMaxTokens
+			}
+
+			resp, err := client.ChatCompletion(ctx, &llm.ChatRequest{
+				Model:       agent.Model,
+				Messages:    messages,
+				Tools:       toolDefs,
+				Temperature: temperature,
+				MaxTokens:   maxTokens,
+			})
+
+			if err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+					state = stateCancelled
+					return nil, err
+				}
+				return nil, fmt.Errorf("runtime: llm call failed at step %d: %w", steps+1, err)
+			}
+
+			steps++
+			sink.Emit(StreamEvent{Type: EventModelCompleted, Step: steps})
+
+			totalUsage.PromptTokens += resp.Usage.PromptTokens
+			totalUsage.CompletionTokens += resp.Usage.CompletionTokens
+			totalUsage.TotalTokens += resp.Usage.TotalTokens
+
+			if len(resp.ToolCalls) == 0 {
+				output := strings.TrimSpace(resp.Content)
+				if output == "" {
+					state = stateFailed
+					return nil, ErrNoFinalOutput
+				}
+
+				finalMsg := llm.ChatMessage{Role: "assistant", Content: resp.Content}
+				messages = append(messages, finalMsg)
+				newMessages = append(newMessages, finalMsg)
+
+				logger.Info("run completed",
+					"steps", steps,
+					"prompt_tokens", totalUsage.PromptTokens,
+					"completion_tokens", totalUsage.CompletionTokens)
+
+				sink.Emit(StreamEvent{Type: EventStepCompleted, Step: steps})
+
+				if r.checkpointStore != nil {
+					snapshot := buildSnapshot(
+						runCtx, agent, messages, runCtx.Summary, steps, maxSteps,
+						totalUsage, toolFailures, checkpointFailures, PhaseStepCompleted, r.toolRegistry,
+					)
+					var saveErr error
+					if checkpointFailures, saveErr = r.trySaveCheckpoint(snapshot, sink, steps, checkpointFailures, hasSnapshot, logger); saveErr != nil {
+						state = stateFailed
+						return nil, saveErr
+					}
+					hasSnapshot = true
+				}
+
+				state = stateSuccess
+				return &RunResult{
+					Output:      output,
+					NewMessages: newMessages,
+					Steps:       steps,
+					Usage:       totalUsage,
+				}, nil
+			}
+
+			logger.Info("model returned tool calls",
+				"step", steps,
+				"tool_calls", len(resp.ToolCalls))
+
+			assistantMsg := llm.ChatMessage{
+				Role:      "assistant",
+				Content:   resp.Content,
+				ToolCalls: resp.ToolCalls,
+			}
+			messages = append(messages, assistantMsg)
+			newMessages = append(newMessages, assistantMsg)
 
 			if r.checkpointStore != nil {
-				snapshot := buildSnapshot(runCtx, agent, messages, runCtx.Summary, steps, maxSteps, totalUsage, toolFailures, checkpointFailures)
-				if saveErr := r.checkpointStore.Save(ctx, snapshot); saveErr != nil {
-					checkpointFailures++
-					log.Printf("[runtime] checkpoint write failed step=%d failures=%d err=%v", steps, checkpointFailures, saveErr)
-					sink.Emit(StreamEvent{Type: EventStatusUpdated, Status: "checkpoint write failed — durability degraded", Step: steps})
-					if checkpointFailures >= checkpointFailureThreshold {
-						state = stateFailed
-						return nil, fmt.Errorf("checkpoint store unavailable after %d consecutive failures", checkpointFailures)
-					}
-				} else {
-					checkpointFailures = 0
+				snapshot := buildSnapshot(
+					runCtx, agent, messages, runCtx.Summary, steps, maxSteps,
+					totalUsage, toolFailures, checkpointFailures, PhasePostModel, r.toolRegistry,
+				)
+				var saveErr error
+				if checkpointFailures, saveErr = r.trySaveCheckpoint(snapshot, sink, steps, checkpointFailures, hasSnapshot, logger); saveErr != nil {
+					state = stateFailed
+					return nil, saveErr
 				}
+				hasSnapshot = true
 			}
 
-			state = stateSuccess
-			return &RunResult{
-				Output:      output,
-				NewMessages: newMessages,
-				Steps:       steps,
-				Usage:       totalUsage,
-			}, nil
+			toolCalls = resp.ToolCalls
 		}
 
-		log.Printf("[runtime] step=%d tool_calls=%d", steps, len(resp.ToolCalls))
-
-		assistantMsg := llm.ChatMessage{
-			Role:      "assistant",
-			Content:   resp.Content,
-			ToolCalls: resp.ToolCalls,
-		}
-		messages = append(messages, assistantMsg)
-		newMessages = append(newMessages, assistantMsg)
-
-		for _, call := range resp.ToolCalls {
-			log.Printf("[runtime] executing tool=%s id=%s", call.Name, call.ID)
+		for _, call := range toolCalls {
+			logger.Info("executing tool", "tool", call.Name, "call_id", call.ID)
 
 			var rawArgs json.RawMessage
 			if json.Valid(call.Arguments) {
@@ -303,7 +363,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 
 			tool, err := r.toolRegistry.Get(call.Name)
 			if err != nil {
-				log.Printf("[runtime] ✗ tool not found: %s — aborting", call.Name)
+				logger.Error("tool not found, aborting", "tool", call.Name)
 				sink.Emit(StreamEvent{
 					Type:  EventToolFailed,
 					Tool:  &ToolMeta{ID: call.ID, Name: call.Name, Args: rawArgs},
@@ -311,14 +371,6 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 					Step:  steps,
 				})
 				return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, call.Name)
-			}
-
-			if runCtx.Checkpoint != nil {
-				policy := r.toolRegistry.ReplayPolicy(call.Name)
-				if policy == tools.NoReplay {
-					state = stateFailed
-					return nil, fmt.Errorf("tool %q is not safe to replay — manual resolution required", call.Name)
-				}
 			}
 
 			start := time.Now()
@@ -329,7 +381,11 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			}
 
 			toolCtx, toolCancel := context.WithTimeout(ctx, 30*time.Second)
-			toolResult, err := tool.Execute(toolCtx, call.Arguments)
+			toolCtx = runtimectx.WithMemoryScope(toolCtx, runCtx.Memory)
+			toolResult, err := tool.Execute(toolCtx, tools.ToolCall{
+				ID:   call.ID,
+				Args: call.Arguments,
+			})
 			toolCancel()
 
 			latencyMs := time.Since(start).Milliseconds()
@@ -354,7 +410,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 				}
 				messages = append(messages, errMsg)
 				newMessages = append(newMessages, errMsg)
-				log.Printf("[runtime] ✗ tool execution failed: %s err=%v", call.Name, err)
+				logger.Error("tool execution failed", "tool", call.Name, "error", err)
 
 				sink.Emit(StreamEvent{
 					Type:       EventToolFailed,
@@ -373,8 +429,11 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 				}
 			}
 
-			log.Printf("[runtime] ✓ tool=%s is_error=%v content_len=%d latency_ms=%d",
-				call.Name, toolResult.IsError, len(toolResult.Content), latencyMs)
+			logger.Info("tool completed",
+				"tool", call.Name,
+				"is_error", toolResult.IsError,
+				"content_len", len(toolResult.Content),
+				"latency_ms", latencyMs)
 
 			toolMsg := llm.ChatMessage{
 				Role:       "tool",
@@ -408,7 +467,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		sink.Emit(StreamEvent{Type: EventStepCompleted, Step: steps})
 	}
 
-	log.Printf("[runtime] max steps reached agent=%s steps=%d", agent.Name, steps)
+	logger.Warn("max steps reached", "steps", steps)
 	return nil, ErrMaxStepsReached
 }
 
@@ -457,11 +516,10 @@ func (r *AgentRuntime) loadTools(agent *Agent) ([]llm.ToolDefinition, error) {
 func buildSnapshot(
 	runCtx RunContext, ag *Agent, messages []llm.ChatMessage, summary string,
 	steps, maxSteps int, usage llm.TokenUsage, toolFailures map[string]int,
-	checkpointFailures int,
+	checkpointFailures int, phase string, registry *tools.ToolRegistry,
 ) RunSnapshot {
 
 	toolsUsed := ag.Tools
-
 	if toolsUsed == nil {
 		toolsUsed = []string{}
 	}
@@ -483,12 +541,68 @@ func buildSnapshot(
 			Provider:           ag.Provider,
 			Model:              ag.Model,
 			Temperature:        ag.Temperature,
+			ToolsetVersion:     ComputeToolsetVersion(registry),
 			ToolsUsed:          toolsUsed,
 			Attempt:            runCtx.Attempt,
-			Phase:              "step.completed",
+			Phase:              phase,
 			CheckpointFailures: checkpointFailures,
 			LastCheckpointAt:   time.Now(),
 			CreatedAt:          time.Now(),
 		},
 	}
+}
+
+func (r *AgentRuntime) trySaveCheckpoint(
+	snapshot RunSnapshot, sink EventSink, step, failures int, hasSnapshot bool, logger *slog.Logger,
+) (int, error) {
+	const (
+		checkpointMaxAttempts    = 3
+		checkpointPerAttemptTime = 1500 * time.Millisecond
+		checkpointBaseBackoff    = 75 * time.Millisecond
+	)
+
+	var lastErr error
+	for attempt := 0; attempt < checkpointMaxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(checkpointBaseBackoff * (1 << (attempt - 1))) // 75ms, 150ms
+		}
+		saveCtx, cancel := context.WithTimeout(context.Background(), checkpointPerAttemptTime)
+		lastErr = r.checkpointStore.Save(saveCtx, snapshot)
+		cancel()
+		if lastErr == nil {
+			return 0, nil
+		}
+		logger.Warn("checkpoint write attempt failed",
+			"step", step,
+			"phase", snapshot.Meta.Phase,
+			"attempt", attempt+1,
+			"error", lastErr,
+		)
+	}
+
+	failures++
+	logger.Warn("checkpoint write failed after retries",
+		"step", step,
+		"phase", snapshot.Meta.Phase,
+		"consecutive_failures", failures,
+		"error", lastErr,
+	)
+	sink.Emit(StreamEvent{
+		Type:   EventStatusUpdated,
+		Status: "checkpoint write failed — durability degraded",
+		Step:   step,
+	})
+	if failures >= checkpointFailureThreshold {
+		if hasSnapshot {
+			return failures, fmt.Errorf(
+				"%w after %d consecutive failures",
+				ErrCheckpointStoreUnavailable, failures,
+			)
+		}
+		return failures, fmt.Errorf(
+			"checkpoint store never available; cannot resume (%d consecutive failures)",
+			failures,
+		)
+	}
+	return failures, nil
 }

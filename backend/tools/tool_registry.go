@@ -1,58 +1,53 @@
 package tools
 
 import (
-	"backend/llm"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"sort"
 	"time"
-)
 
-type ReplayPolicy int
+	"backend/llm"
+	"backend/memory"
 
-const (
-	ReplaySafe ReplayPolicy = iota
-	ReplayWithKey
-	NoReplay
+	"github.com/redis/go-redis/v9"
 )
 
 type ToolRegistry struct {
-	tools    map[string]Tool
-	policies map[string]ReplayPolicy
+	tools map[string]Tool
 }
 
-func NewToolRegistry() *ToolRegistry {
+func NewToolRegistry(redisClient *redis.Client, memorySvc *memory.Service) *ToolRegistry {
 	r := &ToolRegistry{
-		tools:    make(map[string]Tool),
-		policies: make(map[string]ReplayPolicy),
+		tools: make(map[string]Tool),
 	}
 
 	r.Register(NewCalculatorTool())
-	log.Println("calculator tool registered")
+	slog.Info("tool registered", "name", "calculator")
 
-	r.Register(NewHTTPTool(30 * time.Second))
-	log.Println("http_request tool registered")
+	r.Register(NewHTTPTool(30*time.Second, newDedupCache(redisClient, "http_request")))
+	slog.Info("tool registered", "name", "http_request")
 
 	if key := os.Getenv("TAVILY_API_KEY"); key != "" {
-		r.Register(NewWebSearchTool(key, 30*time.Second))
-		log.Println("web_search tool registered")
+		r.Register(NewWebSearchTool(key, 30*time.Second, newDedupCache(redisClient, "web_search")))
+		slog.Info("tool registered", "name", "web_search")
 	} else {
-		log.Println("web_search tool skipped (TAVILY_API_KEY not set)")
+		slog.Info("tool skipped (TAVILY_API_KEY not set)", "name", "web_search")
 	}
-	log.Printf("%d tool(s) registered", len(r.tools))
-	return r
 
+	if memorySvc != nil {
+		r.Register(NewMemoryWriteTool(memorySvc))
+		r.Register(NewMemoryReadTool(memorySvc))
+		r.Register(NewMemorySearchTool(memorySvc))
+		slog.Info("tool registered", "name", "memory_write,memory_read,memory_search")
+	}
+
+	slog.Info("tool registry ready", "count", len(r.tools))
+	return r
 }
 
 func (r *ToolRegistry) Register(t Tool) {
 	r.tools[t.Name()] = t
-	r.policies[t.Name()] = ReplaySafe
-}
-
-func (r *ToolRegistry) RegisterWithPolicy(t Tool, policy ReplayPolicy) {
-	r.tools[t.Name()] = t
-	r.policies[t.Name()] = policy
 }
 
 func (r *ToolRegistry) Definitions() []llm.ToolDefinition {
@@ -79,4 +74,9 @@ func (r *ToolRegistry) Get(name string) (Tool, error) {
 		return nil, fmt.Errorf("%w: %s", ErrToolNotFound, name)
 	}
 	return t, nil
+}
+
+func (r *ToolRegistry) Has(name string) bool {
+	_, ok := r.tools[name]
+	return ok
 }

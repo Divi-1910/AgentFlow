@@ -4,15 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"backend/agent"
 	"backend/llm"
 	"backend/model"
 	"backend/repository"
+	"backend/runtimectx"
 
 	"github.com/google/uuid"
 )
@@ -25,6 +27,7 @@ type MessageHandler struct {
 	summarizer  *agent.Summarizer
 	runRepo     agent.CheckpointStore
 	background  context.Context
+	summarizing sync.Map
 }
 
 func NewMessageHandler(
@@ -81,10 +84,12 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 	threadID := r.PathValue("id")
 
 	var req SendMessageRequest
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+
 	if strings.TrimSpace(req.Content) == "" {
 		writeError(w, http.StatusBadRequest, "content is required")
 		return
@@ -126,33 +131,40 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 		drop, keep := agent.SplitTurnsForCompaction(ag, currentSummary, turns)
 
 		if len(drop) > 0 {
-			go func(ctx context.Context, ag *agent.Agent, summary string, drop []agent.Turn) {
-				defer func() {
-					if rec := recover(); rec != nil {
-						log.Printf("[message-bg-summary] panic recovered thread=%s rec=%v", threadID, rec)
-					}
-				}()
-
-				compactCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				defer cancel()
-
-				newSummary, _, err := h.summarizer.Summarize(compactCtx, ag, summary, drop)
-				if err != nil {
-					log.Printf("[message-bg-summary] summarization failed thread=%s err=%v", threadID, err)
-				} else {
-					if updateErr := h.threadRepo.UpdateSummary(compactCtx, threadID, userID, newSummary); updateErr != nil {
-						log.Printf("[message-bg-summary] summary persist failed thread=%s err=%v", threadID, updateErr)
-					}
-				}
-			}(h.background, ag, currentSummary, drop)
-
 			turns = keep
+
+			bgLogger := slog.With("thread_id", threadID)
+			if _, alreadyRunning := h.summarizing.LoadOrStore(threadID, struct{}{}); !alreadyRunning {
+				go func(ctx context.Context, ag *agent.Agent, summary string, drop []agent.Turn) {
+					defer h.summarizing.Delete(threadID)
+					defer func() {
+						if rec := recover(); rec != nil {
+							bgLogger.Error("bg summarization panic", "error", rec)
+						}
+					}()
+
+					compactCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+					defer cancel()
+
+					newSummary, _, err := h.summarizer.Summarize(compactCtx, ag, summary, drop)
+					if err != nil {
+						bgLogger.Error("bg summarization failed", "error", err)
+					} else {
+						if updateErr := h.threadRepo.UpdateSummary(compactCtx, threadID, userID, newSummary); updateErr != nil {
+							bgLogger.Error("bg summarization persist failed", "error", updateErr)
+						}
+					}
+				}(h.background, ag, currentSummary, drop)
+			} else {
+				bgLogger.Info("bg summarization skipped, already in flight")
+			}
 		}
 	}
 
 	history := agent.FlattenTurns(turns)
 
 	runID := uuid.NewString()
+	runLogger := slog.With("run_id", runID, "thread_id", threadID, "user_id", userID)
 
 	runCtx := agent.RunContext{
 		RunID:    runID,
@@ -161,6 +173,20 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 		Summary:  currentSummary,
 		History:  history,
 		Input:    req.Content,
+		Memory: runtimectx.MemoryScope{
+			UserID:   userID,
+			AgentID:  ag.ID,
+			ThreadID: threadID,
+		},
+		Logger: runLogger,
+	}
+
+	if h.runRepo != nil {
+		if err := h.runRepo.CreateRun(r.Context(), runID, threadID, ag.ID, userID); err != nil {
+			runLogger.Error("failed to create run document", "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to initialize run")
+			return
+		}
 	}
 
 	flusher, ok := w.(http.Flusher)
@@ -174,23 +200,11 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	if h.runRepo != nil {
-		if err := h.runRepo.CreateRun(r.Context(), runID, threadID, ag.ID, userID); err != nil {
-			log.Printf("[message-handler] failed to create run doc: %v", err)
-			// Non-fatal, we can still run without checkpointing
-		}
-	}
-
 	runCtxStream, cancelStream := context.WithCancel(r.Context())
 	defer cancelStream()
 
 	events := make(chan agent.StreamEvent, 128)
-
-	type outcome struct {
-		res *agent.RunResult
-		err error
-	}
-	done := make(chan outcome, 1)
+	done := make(chan runOutcome, 1)
 
 	go func() {
 		var (
@@ -199,93 +213,20 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 		)
 		defer func() {
 			if rec := recover(); rec != nil {
-				log.Printf("[message] panic in RunStream: %v", rec)
+				runLogger.Error("panic in RunStream", "error", rec)
 				runErr = fmt.Errorf("panic in stream execution: %v", rec)
 			}
-			done <- outcome{res, runErr}
+			done <- runOutcome{res, runErr}
 		}()
 		res, runErr = h.runtime.RunStream(runCtxStream, ag, runCtx, events)
 	}()
 
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
-	var terminalEvent *agent.StreamEvent
-	clientDisconnected := false
-
-loop:
-	for {
-		select {
-		case <-runCtxStream.Done():
-			break loop
-		case <-ticker.C:
-			if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
-				clientDisconnected = true
-				cancelStream()
-				break loop
-			}
-			flusher.Flush()
-		case e, ok := <-events:
-			if !ok {
-				break loop
-			}
-
-			if e.Type == agent.EventRunCompleted || e.Type == agent.EventRunFailed || e.Type == agent.EventRunCancelled {
-				if terminalEvent != nil {
-					log.Printf("[message] WARN: duplicate terminal event emitted thread=%s type=%s", threadID, e.Type)
-					continue
-				}
-				terminalEvent = &e
-				continue
-			}
-
-			data, err := json.Marshal(e)
-			if err != nil {
-				log.Printf("[message] WARN: failed to marshal stream event type=%s err=%v", e.Type, err)
-				continue
-			}
-			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
-				clientDisconnected = true
-				cancelStream()
-				break loop
-			}
-			flusher.Flush()
-		}
-	}
-
-	out := <-done
-
-	// Drain remaining events in case loop exited prematurely from canceled stream context
-draining:
-	for {
-		select {
-		case e, ok := <-events:
-			if !ok {
-				break draining
-			}
-			if e.Type == agent.EventRunCompleted || e.Type == agent.EventRunFailed || e.Type == agent.EventRunCancelled {
-				if terminalEvent == nil {
-					terminalEvent = &e
-				}
-			}
-		default:
-			break draining
-		}
-	}
-
-	if out.err != nil && terminalEvent == nil {
-		terminalEvent = &agent.StreamEvent{
-			Type:  agent.EventRunFailed,
-			Time:  time.Now(),
-			Error: &agent.ErrMeta{Code: "engine.runtime_error", Message: out.err.Error()},
-		}
-	}
-
-	// We MUST persist into a standalone context unbound to the user's connection status
+	sr := streamLoop(runCtxStream, cancelStream, w, flusher, events, done, runLogger)
+	out := sr.out
 	persistCtx, cancelPersist := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelPersist()
 
-	if clientDisconnected {
+	if sr.clientDisconnected {
 		if out.res != nil {
 			allMessages := append([]llm.ChatMessage{{Role: "user", Content: req.Content}}, out.res.NewMessages...)
 			_, _ = h.messageRepo.InsertMany(persistCtx, threadID, thread.AgentID.Hex(), userID, allMessages)
@@ -298,33 +239,22 @@ draining:
 			[]llm.ChatMessage{{Role: "user", Content: req.Content}},
 			out.res.NewMessages...,
 		)
-
 		docs, err := h.messageRepo.InsertMany(persistCtx, threadID, thread.AgentID.Hex(), userID, allMessages)
 		if err != nil {
-			log.Printf("[message] persist failed thread=%s err=%v", threadID, err)
-			streamEvent := agent.StreamEvent{
+			runLogger.Error("message persist failed", "error", err)
+			emitEvent(w, flusher, agent.StreamEvent{
 				Type:  agent.EventRunPersistFail,
 				Time:  time.Now(),
 				Error: &agent.ErrMeta{Code: "internal.persistence_error", Message: "Failed to persist messages"},
-			}
-			data, _ := json.Marshal(streamEvent)
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			})
 		} else {
-			log.Printf("[message] persisted thread=%s messages=%d", threadID, len(docs))
-			streamEvent := agent.StreamEvent{
-				Type: agent.EventRunPersisted,
-				Time: time.Now(),
-			}
-			data, _ := json.Marshal(streamEvent)
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			runLogger.Info("messages persisted", "count", len(docs))
+			emitEvent(w, flusher, agent.StreamEvent{Type: agent.EventRunPersisted, Time: time.Now()})
 		}
-		flusher.Flush()
 	}
 
-	if terminalEvent != nil {
-		data, _ := json.Marshal(*terminalEvent)
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		flusher.Flush()
+	if sr.terminalEvent != nil {
+		emitEvent(w, flusher, *sr.terminalEvent)
 	}
 }
 

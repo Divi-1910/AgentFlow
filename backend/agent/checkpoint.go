@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"backend/llm"
+	"backend/tools"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -12,12 +14,17 @@ import (
 	"slices"
 	"strings"
 	"time"
-
-	"backend/llm"
-	"backend/tools"
 )
 
 var supportedSnapshotVersions = []int{1}
+
+const (
+	PhasePreModel      = "pre_model"
+	PhasePostModel     = "post_model"
+	PhaseStepCompleted = "step.completed"
+)
+
+var ErrCheckpointStoreUnavailable = errors.New("checkpoint store unavailable")
 
 type RunSnapshot struct {
 	Version int          `json:"version"`
@@ -55,14 +62,18 @@ type CheckpointStore interface {
 	Save(ctx context.Context, snapshot RunSnapshot) error
 	LoadLatest(ctx context.Context, runID string) (*RunSnapshot, error)
 	TransitionStatus(ctx context.Context, runID string, from, to string) (bool, error)
+	TransitionStatusForUser(ctx context.Context, runID, userID string, from, to string) (bool, error)
 	UpdateStatus(ctx context.Context, runID string, status string, lastError string) error
 	IncrementAttempt(ctx context.Context, runID string) (int, error)
 	GetRun(ctx context.Context, runID string) (*RunInfo, error)
+	GetRunForUser(ctx context.Context, runID, userID string) (*RunInfo, error)
 }
 
 type RunInfo struct {
 	RunID          string `json:"run_id"`
 	ThreadID       string `json:"thread_id"`
+	AgentID        string `json:"agent_id,omitempty"`
+	UserID         string `json:"user_id,omitempty"`
 	Status         string `json:"status"`
 	Attempt        int    `json:"attempt"`
 	StepsCompleted int    `json:"steps_completed"`
@@ -88,7 +99,6 @@ func ValidateSnapshot(s *RunSnapshot, registry *tools.ToolRegistry) error {
 	if s.State.MaxSteps > 0 && s.State.StepsCompleted > s.State.MaxSteps {
 		return fmt.Errorf("snapshot step counter exceeds max: steps=%d max=%d", s.State.StepsCompleted, s.State.MaxSteps)
 	}
-	// Nil-safe toolFailures
 	if s.State.ToolFailures == nil {
 		s.State.ToolFailures = make(map[string]int)
 	}
@@ -101,19 +111,33 @@ func CanResume(meta SnapshotMeta, registry *tools.ToolRegistry) error {
 			return fmt.Errorf("tool %q is no longer registered — cannot resume safely", toolName)
 		}
 	}
-	current := ComputeToolsetVersion(registry)
-	if current != meta.ToolsetVersion {
-		fmt.Printf("Toolset version mismatch: %s != %s", current, meta.ToolsetVersion)
-	}
 	return nil
 }
 
+func ToolsetVersionWarning(meta SnapshotMeta, registry *tools.ToolRegistry) string {
+	if meta.ToolsetVersion == "" {
+		return "" // pre-versioning snapshot; no baseline to compare against
+	}
+	current := ComputeToolsetVersion(registry)
+	if current == meta.ToolsetVersion {
+		return ""
+	}
+	return fmt.Sprintf(
+		"toolset version changed since checkpoint (snapshot=%s current=%s tools_used=%v) — resume proceeds but tool behaviour may differ",
+		meta.ToolsetVersion, current, meta.ToolsUsed,
+	)
+}
+
 func ComputeToolsetVersion(registry *tools.ToolRegistry) string {
-	names := registry.Names()
-	sorted := make([]string, len(names))
-	copy(sorted, names)
-	slices.Sort(sorted)
-	h := sha256.Sum256([]byte(strings.Join(sorted, ",")))
+	defs := registry.Definitions()
+	var sb strings.Builder
+	for _, d := range defs {
+		sb.WriteString(d.Name)
+		sb.WriteByte(':')
+		sb.Write(d.Parameters)
+		sb.WriteByte('\n')
+	}
+	h := sha256.Sum256([]byte(sb.String()))
 	return hex.EncodeToString(h[:4])
 }
 
@@ -127,8 +151,7 @@ func IsResumable(err error) bool {
 	if errors.Is(err, context.Canceled) {
 		return true
 	}
-
-	if strings.Contains(err.Error(), "checkpoint store unavailable") {
+	if errors.Is(err, ErrCheckpointStoreUnavailable) {
 		return true
 	}
 	return false

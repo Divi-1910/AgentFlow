@@ -19,9 +19,10 @@ const maxHTTPResponseSize = 32 * 1024
 type HTTPTool struct {
 	client  *http.Client
 	blocked []*net.IPNet
+	cache   *dedupCache
 }
 
-func NewHTTPTool(timeout time.Duration) *HTTPTool {
+func NewHTTPTool(timeout time.Duration, cache *dedupCache) *HTTPTool {
 	blockedCIDRs := []string{
 		"127.0.0.0/8",
 		"10.0.0.0/8",
@@ -42,6 +43,7 @@ func NewHTTPTool(timeout time.Duration) *HTTPTool {
 	return &HTTPTool{
 		client:  &http.Client{Timeout: timeout},
 		blocked: blocked,
+		cache:   cache,
 	}
 }
 
@@ -85,7 +87,18 @@ type httpArgs struct {
 	Body    string            `json:"body,omitempty"`
 }
 
-func (t *HTTPTool) Execute(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
+func (t *HTTPTool) Execute(ctx context.Context, call ToolCall) (*ToolResult, error) {
+	if cached, ok := t.cache.Get(call.ID); ok {
+		return cached, nil
+	}
+	result, err := t.executeUncached(ctx, call.Args)
+	if err == nil && result != nil {
+		t.cache.Put(call.ID, result)
+	}
+	return result, err
+}
+
+func (t *HTTPTool) executeUncached(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
 	var input httpArgs
 	if err := json.Unmarshal(args, &input); err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidArgs, err.Error())
