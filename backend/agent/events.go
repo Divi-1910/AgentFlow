@@ -102,42 +102,21 @@ func (s *ChannelSink) Emit(e StreamEvent) {
 	e.Seq = seq
 	e.Time = time.Now()
 
-	isTier1 := e.Type == EventRunCompleted || e.Type == EventRunFailed || e.Type == EventRunCancelled || e.Type == EventToolCompleted || e.Type == EventToolFailed
-	isTier3 := e.Type == EventStatusUpdated
-
-	if isTier1 {
-		// Tier 1: Never drop on transport cancel. Use a generous timeout in case channel is permanently dead.
-		timeout := time.NewTimer(5 * time.Second)
-		select {
-		case <-timeout.C:
-			// Log missing tier 1 event if desired, but we drop to prevent infinite goroutine leak
-			return
-		case s.ch <- e:
-			timeout.Stop()
-		}
-		return
-	}
-
-	if isTier3 {
+	// Status events are informational — drop silently if the channel is full
+	// or the run is already done.
+	if e.Type == EventStatusUpdated {
 		select {
 		case <-s.ctx.Done():
-			return
 		case s.ch <- e:
 		default:
-
 		}
 		return
 	}
 
-	timeout := time.NewTimer(500 * time.Millisecond)
+	// All other events: deliver or drop when the run context is cancelled.
 	select {
 	case <-s.ctx.Done():
-		timeout.Stop()
-		return
 	case s.ch <- e:
-		timeout.Stop()
-	case <-timeout.C:
-
 	}
 }
 
