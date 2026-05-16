@@ -16,11 +16,10 @@ function ToggleLink({ to, label, isActive }) {
   return (
     <TransitionLink
       to={to}
-      className={`relative rounded-full px-6 py-2.5 font-headline text-[11px] font-bold uppercase tracking-[0.15em] transition-all duration-300 ${
-        isActive
-          ? 'bg-white text-black shadow-[0_2px_20px_rgba(255,255,255,0.2)]'
-          : 'text-white/40 hover:text-white'
-      }`}
+      className={`relative rounded-full px-6 py-2.5 font-headline text-[11px] font-bold uppercase tracking-[0.15em] transition-all duration-300 ${isActive
+        ? 'bg-white text-black shadow-[0_2px_20px_rgba(255,255,255,0.2)]'
+        : 'text-white/40 hover:text-white'
+        }`}
     >
       {label}
     </TransitionLink>
@@ -31,8 +30,8 @@ function ToggleLink({ to, label, isActive }) {
 function StatBadge({ value, label }) {
   return (
     <div className="flex flex-col">
-      <span className="font-headline text-3xl font-bold text-white">{value}</span>
-      <span className="mt-0.5 text-[11px] font-light uppercase tracking-[0.12em] text-white/30">{label}</span>
+      <span className="font-headline text-4xl font-bold text-white">{value}</span>
+      <span className="mt-1 text-[12px] font-light uppercase tracking-[0.12em] text-white/30">{label}</span>
     </div>
   )
 }
@@ -48,10 +47,10 @@ export default function AuthShell({
   onSubmit,
   children,
 }) {
-  const formRef      = useRef(null)
-  const titleRef     = useRef(null)
+  const formRef = useRef(null)
+  const titleRef = useRef(null)
   const brandLineRef = useRef(null)
-  const lineIndex    = useRef(0)
+  const lineIndex = useRef(0)
 
   // ── Form entrance animation (AnimeJS timeline) ────────────
   useEffect(() => {
@@ -127,7 +126,7 @@ export default function AuthShell({
               <span className="material-symbols-outlined text-[18px] text-black">hive</span>
             </div>
             <span className="font-headline text-xl font-extrabold tracking-tight text-white">
-              Agent<span className="font-light italic text-white/40">Flow</span>
+              Agent<span className="font-light italic text-white/100">Flow</span>
             </span>
           </TransitionLink>
 
@@ -137,7 +136,7 @@ export default function AuthShell({
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.8, ease: [0.16, 1, 0.3, 1] }}
-              className="font-headline text-[3.2rem] font-semibold uppercase leading-[1.0] tracking-tight text-white xl:text-[4rem]"
+              className="font-headline text-[4rem] font-semibold uppercase leading-[1.0] tracking-tight text-white xl:text-[5.2rem]"
             >
               Build any<br />
               <span className="text-white/25 font-light">agent.</span>
@@ -147,7 +146,7 @@ export default function AuthShell({
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               transition={{ delay: 0.3, duration: 0.8 }}
-              className="mt-6 max-w-xs text-[14px] font-light leading-relaxed text-white/35"
+              className="mt-6 max-w-sm text-[15px] font-light leading-relaxed text-white/35"
             >
               AgentFlow gives you the primitives to create ReAct agents for any use case — without the overhead.
             </motion.p>
@@ -159,10 +158,10 @@ export default function AuthShell({
               transition={{ delay: 0.5, duration: 0.8 }}
               className="mt-10 flex items-center gap-3"
             >
-              <div className="h-px w-6 bg-white/20" />
+              <div className="h-px w-8 bg-white/20" />
               <p
                 ref={brandLineRef}
-                className="font-headline text-[11px] font-bold uppercase tracking-[0.18em] text-white/35"
+                className="font-headline text-[12px] font-bold uppercase tracking-[0.18em] text-white/35"
               >
                 {BRAND_LINES[0]}
               </p>
@@ -194,19 +193,19 @@ export default function AuthShell({
               <span className="material-symbols-outlined text-[18px]">hive</span>
             </div>
             <span className="font-headline text-xl font-extrabold tracking-tight text-white">
-              Agent<span className="font-light italic text-white/40">Flow</span>
+              Agent<span className="font-light italic text-white/80">Flow</span>
             </span>
           </TransitionLink>
         </div>
 
         {/* Form area */}
         <div className="relative z-10 my-auto flex flex-col justify-center px-8 py-16 sm:px-14 xl:px-20">
-          <div className="w-full max-w-[420px]">
+          <div className="w-full max-w-[420px] mx-auto">
 
             {/* Toggle pill */}
             <div className="mb-12">
               <div className="inline-flex rounded-full bg-white/[0.04] p-1.5 ring-1 ring-white/[0.08] backdrop-blur-md">
-                <ToggleLink to="/login"  label="Log in"  isActive={mode === 'login'} />
+                <ToggleLink to="/login" label="Log in" isActive={mode === 'login'} />
                 <ToggleLink to="/signup" label="Sign up" isActive={mode === 'signup'} />
               </div>
             </div>

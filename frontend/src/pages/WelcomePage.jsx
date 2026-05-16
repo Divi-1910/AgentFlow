@@ -13,9 +13,9 @@ gsap.registerPlugin(ScrollTrigger)
 
 // ─── Data ────────────────────────────────────────────────────
 const TICKER_ITEMS = [
-  'Customer Support', 'Code Review', 'Data Analysis',
-  'Market Research', 'Content Creation', 'Sales Automation',
-  'Financial Modeling', 'Workflow Automation', 'Lead Scoring',
+  'Customer Support Agent', 'Code Reviewer', 'Data Analyst',
+  'Market Researcher', 'Content Creator', 'Sales Automator',
+  'Financial Modeler', 'Workflow Automator', 'Lead Scorer',
 ]
 
 const USE_CASES = [
@@ -41,7 +41,7 @@ function Ticker() {
       <div className="animate-marquee flex w-max items-center py-3">
         {duped.map((item, i) => (
           <span key={i} className="flex items-center">
-            <span className="px-8 font-headline text-[9px] font-bold uppercase tracking-[0.28em] text-white/[0.14]">
+            <span className="px-8 font-headline text-[9px] font-bold uppercase tracking-[0.28em] text-white/[0.5]">
               {item}
             </span>
             <span className="text-white/[0.07]">·</span>
@@ -61,7 +61,7 @@ function Wordmark({ size = 'md' }) {
         <span className={`material-symbols-outlined text-black ${sm ? 'text-[14px]' : 'text-[16px]'}`}>hive</span>
       </div>
       <span className={`font-headline font-extrabold tracking-tight text-white ${sm ? 'text-base' : 'text-lg'}`}>
-        Agent<span className="font-light italic text-white/25">Flow</span>
+        Agent<span className="font-light italic text-white/100">Flow</span>
       </span>
     </div>
   )
@@ -286,10 +286,10 @@ export default function WelcomePage() {
             <div className="overflow-hidden" style={{ lineHeight: 0.88 }}>
               <h1
                 ref={agentRef}
-                className="font-headline font-black uppercase tracking-[-0.03em]
+                className="font-headline font-black uppercase tracking-[-0.03em] text-white
                            text-[11vw] sm:text-[8.5vw] lg:text-[6vw]"
                 style={{
-                  WebkitTextStroke: '1.2px rgba(255,255,255,0.26)',
+                  WebkitTextStroke: '1.2px rgba(255,255,255,0.46)',
                   color: 'transparent',
                 }}
               >
@@ -301,7 +301,7 @@ export default function WelcomePage() {
             <div className="overflow-hidden" style={{ lineHeight: 0.88 }}>
               <h1
                 ref={canBeRef}
-                className="font-headline font-light uppercase tracking-[-0.02em] text-white/[0.08]
+                className="font-headline font-light uppercase tracking-[-0.02em] text-white/[0.28]
                            text-[11vw] sm:text-[8.5vw] lg:text-[6vw]"
               >
                 CAN BE
@@ -395,7 +395,7 @@ export default function WelcomePage() {
 
           <div className="mb-10 flex items-center gap-4">
             <div className="h-px w-6 bg-white/[0.08]" />
-            <span className="font-headline text-[8.5px] font-bold uppercase tracking-[0.3em] text-white/20">
+            <span className="font-headline text-[8.5px] font-bold uppercase tracking-[0.3em] text-white/40">
               How it thinks
             </span>
           </div>
@@ -411,12 +411,12 @@ export default function WelcomePage() {
             <div className="overflow-hidden" style={{ lineHeight: 0.88 }}>
               <h2 className="font-headline font-black uppercase tracking-tight
                              text-[9vw] sm:text-[7vw] lg:text-[5vw]"
-                style={{ WebkitTextStroke: '1px rgba(255,255,255,0.2)', color: 'transparent' }}>
+                style={{ WebkitTextStroke: '1px rgba(255,255,255,0.5)', color: 'transparent' }}>
                 Act.
               </h2>
             </div>
             <div className="overflow-hidden" style={{ lineHeight: 0.88 }}>
-              <h2 className="font-headline font-light uppercase tracking-tight text-white/[0.07]
+              <h2 className="font-headline font-light uppercase tracking-tight text-white/[0.65]
                              text-[9vw] sm:text-[7vw] lg:text-[5vw]">
                 Observe.
               </h2>
@@ -433,7 +433,7 @@ export default function WelcomePage() {
                                opacity-0 transition-opacity duration-500 group-hover:opacity-100" />
                 <span className="mb-7 block font-headline text-[8.5px] font-bold tracking-[0.3em] text-white/14">{n}</span>
                 <h3 className="mb-3 font-headline text-base font-bold uppercase tracking-widest text-white">{label}</h3>
-                <p className="text-[11px] font-light leading-relaxed text-white/25">{desc}</p>
+                <p className="text-[11px] font-light leading-relaxed text-white/45">{desc}</p>
               </div>
             ))}
           </div>
