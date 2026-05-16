@@ -115,8 +115,15 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user, err := h.users.FindByEmail(r.Context(), req.Email)
-	if err != nil || user == nil {
-		log.Printf("[Login] User not found: %s", req.Email)
+	if err != nil {
+		log.Printf("[Login] DB error for %s: %v", req.Email, err)
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+	if user == nil {
+		// Run a dummy bcrypt check to equalize timing with the password-mismatch
+		// path, preventing email enumeration via response-time measurement.
+		model.CompareDummy(req.Password)
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}

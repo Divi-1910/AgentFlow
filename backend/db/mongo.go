@@ -50,4 +50,3 @@ func GetCollection(dbName, collectionName string) *mongo.Collection {
 	return ConnectMongoDB().Database(dbName).Collection(collectionName)
 }
 
-var mu sync.Mutex

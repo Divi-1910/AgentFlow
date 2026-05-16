@@ -9,14 +9,12 @@ import (
 
 	"backend/agent"
 	"backend/model"
-	"backend/repository"
 	"backend/runtimectx"
 	"backend/tools"
 )
 
 type RunHandler struct {
 	agentRepo    agentStore
-	threadRepo   *repository.ThreadRepo
 	messageRepo  messageStore
 	runRepo      agent.CheckpointStore
 	runtime      runtimeExecutor
@@ -25,7 +23,6 @@ type RunHandler struct {
 
 func NewRunHandler(
 	agentRepo agentStore,
-	threadRepo *repository.ThreadRepo,
 	messageRepo messageStore,
 	runRepo agent.CheckpointStore,
 	runtime runtimeExecutor,
@@ -33,7 +30,6 @@ func NewRunHandler(
 ) *RunHandler {
 	return &RunHandler{
 		agentRepo:    agentRepo,
-		threadRepo:   threadRepo,
 		messageRepo:  messageRepo,
 		runRepo:      runRepo,
 		runtime:      runtime,

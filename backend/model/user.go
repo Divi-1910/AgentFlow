@@ -17,6 +17,20 @@ type User struct {
 	UpdatedAt time.Time     `bson:"updated_at" json:"updated_at"`
 }
 
+// dummyHash is a bcrypt hash (cost 12) computed once at startup. It is used
+// by CompareDummy to equalize login response timing when a user is not found,
+// preventing email-enumeration via timing differences (~80ms bcrypt vs ~1ms).
+var dummyHash = func() []byte {
+	h, _ := bcrypt.GenerateFromPassword([]byte("graas-dummy-sentinel-not-a-real-password"), 12)
+	return h
+}()
+
+// CompareDummy runs a bcrypt comparison that always fails. Call it when
+// FindByEmail returns nil to match the timing of a real password check.
+func CompareDummy(password string) {
+	_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
+}
+
 func (u *User) HashPassword(password string) error {
 	bytes, err := bcrypt.GenerateFromPassword([]byte(password), 12)
 	if err != nil {

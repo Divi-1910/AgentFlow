@@ -13,7 +13,6 @@ import (
 	"backend/handlers"
 	"backend/llm"
 	"backend/model"
-	"backend/repository"
 	"backend/tools"
 )
 
@@ -23,7 +22,6 @@ import (
 func newRunHandler(runRepo agent.CheckpointStore) *handlers.RunHandler {
 	return handlers.NewRunHandler(
 		&fakeAgentStore{},
-		(*repository.ThreadRepo)(nil),
 		&fakeMessageStore{},
 		runRepo,
 		&fakeRuntime{},
@@ -40,7 +38,6 @@ func newResumeRunHandler(
 ) *handlers.RunHandler {
 	return handlers.NewRunHandler(
 		as,
-		(*repository.ThreadRepo)(nil), // threadRepo never accessed in ResumeRun
 		ms,
 		repo,
 		rt,

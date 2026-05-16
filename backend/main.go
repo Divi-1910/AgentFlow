@@ -138,7 +138,6 @@ func main() {
 	)
 	runHandler := handlers.NewRunHandler(
 		agentRepo,
-		threadRepo,
 		messageRepo,
 		runRepo,
 		agentRuntime,
@@ -180,6 +179,17 @@ func main() {
 	}
 
 	slog.Info("server listening", "addr", "http://localhost:"+port)
+
+	// Shut down gracefully on SIGINT/SIGTERM. A 30-second window covers
+	// in-flight SSE streams; after that the OS will force-close.
+	go func() {
+		<-appCtx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			slog.Error("graceful shutdown failed", "error", err)
+		}
+	}()
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("server stopped", "error", err)
