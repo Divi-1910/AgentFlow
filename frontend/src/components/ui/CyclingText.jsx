@@ -3,18 +3,18 @@ import { animate } from 'animejs'
 
 const USE_CASES = [
   'customer support',
-  'code review',
-  'data analysis',
-  'market research',
-  'content creation',
-  'sales automation',
-  'financial modeling',
+  'code reviewer',
+  'data analyst',
+  'market researcher',
+  'content creator',
+  'sales automator',
+  'financial analyst',
   'anything you imagine',
 ]
 
 export default function CyclingText() {
   const [displayIndex, setDisplayIndex] = useState(0)
-  const spanRef     = useRef(null)
+  const spanRef = useRef(null)
   const isAnimating = useRef(false)
 
   useEffect(() => {
@@ -62,7 +62,7 @@ export default function CyclingText() {
       <span
         ref={spanRef}
         className="block font-headline font-light italic tracking-[-0.02em]
-                   text-white/30 select-none leading-[1.4]
+                   text-white/60 select-none leading-[1.4]
                    text-[5.5vw] sm:text-[4.2vw] lg:text-[3.2vw]"
       >
         {USE_CASES[displayIndex]}
