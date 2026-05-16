@@ -13,29 +13,45 @@ import (
 	"backend/agent"
 	"backend/llm"
 	"backend/model"
-	"backend/repository"
 	"backend/runtimectx"
 
 	"github.com/google/uuid"
 )
 
+// messageStore is the subset of repository.MessageRepo used by MessageHandler.
+type messageStore interface {
+	ListRecentByThread(ctx context.Context, threadID string, limit int) ([]llm.ChatMessage, error)
+	InsertMany(ctx context.Context, threadID, agentID, userID string, messages []llm.ChatMessage) ([]model.MessageDocument, error)
+	ListDocsByThread(ctx context.Context, threadID string, limit int) ([]model.MessageDocument, error)
+}
+
+// runtimeExecutor is the subset of agent.AgentRuntime used by MessageHandler.
+type runtimeExecutor interface {
+	RunStream(ctx context.Context, ag *agent.Agent, runCtx agent.RunContext, events chan<- agent.StreamEvent) (*agent.RunResult, error)
+}
+
+// summarizeExecutor is the subset of agent.Summarizer used by MessageHandler.
+type summarizeExecutor interface {
+	Summarize(ctx context.Context, ag *agent.Agent, existingSummary string, turns []agent.Turn) (string, llm.TokenUsage, error)
+}
+
 type MessageHandler struct {
-	agentRepo   *repository.AgentRepo
-	threadRepo  *repository.ThreadRepo
-	messageRepo *repository.MessageRepo
-	runtime     *agent.AgentRuntime
-	summarizer  *agent.Summarizer
+	agentRepo   agentStore
+	threadRepo  threadStore
+	messageRepo messageStore
+	runtime     runtimeExecutor
+	summarizer  summarizeExecutor
 	runRepo     agent.CheckpointStore
 	background  context.Context
 	summarizing sync.Map
 }
 
 func NewMessageHandler(
-	agentRepo *repository.AgentRepo,
-	threadRepo *repository.ThreadRepo,
-	messageRepo *repository.MessageRepo,
-	runtime *agent.AgentRuntime,
-	summarizer *agent.Summarizer,
+	agentRepo agentStore,
+	threadRepo threadStore,
+	messageRepo messageStore,
+	runtime runtimeExecutor,
+	summarizer summarizeExecutor,
 	runRepo agent.CheckpointStore,
 	background context.Context,
 ) *MessageHandler {

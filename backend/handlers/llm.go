@@ -1,20 +1,32 @@
 package handlers
 
 import (
-	"backend/llm"
-	"backend/model"
 	"context"
 	"encoding/json"
 	"log"
 	"net/http"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
+	"backend/llm"
+	"backend/model"
 )
 
+// llmModelStore retrieves available LLM model definitions.
+type llmModelStore interface {
+	ListAll(ctx context.Context) ([]model.LLMModel, error)
+}
+
+// llmClientRegistry resolves a registered LLM client by provider name.
+type llmClientRegistry interface {
+	Get(provider string) (llm.LLMClient, error)
+}
+
 type LLMHandler struct {
-	LLMRegistry *mongo.Collection
-	Registry    *llm.LLMRegistry
+	modelStore llmModelStore
+	registry   llmClientRegistry
+}
+
+func NewLLMHandler(modelStore llmModelStore, registry llmClientRegistry) *LLMHandler {
+	return &LLMHandler{modelStore: modelStore, registry: registry}
 }
 
 func (lh *LLMHandler) GetLLMs(w http.ResponseWriter, r *http.Request) {
@@ -23,22 +35,10 @@ func (lh *LLMHandler) GetLLMs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cursor, err := lh.LLMRegistry.Find(context.TODO(), bson.M{})
+	models, err := lh.modelStore.ListAll(r.Context())
 	if err != nil {
 		http.Error(w, "Internal Server Error while fetching models", http.StatusInternalServerError)
 		return
-	}
-	defer cursor.Close(context.TODO())
-
-	var models []model.LLMModel
-
-	if err := cursor.All(context.TODO(), &models); err != nil {
-		http.Error(w, "Error processing model data", http.StatusInternalServerError)
-		return
-	}
-
-	if models == nil {
-		models = []model.LLMModel{}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -109,7 +109,7 @@ func (lh *LLMHandler) Chat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client, err := lh.Registry.Get(req.Provider)
+	client, err := lh.registry.Get(req.Provider)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)

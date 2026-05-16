@@ -96,9 +96,8 @@ func main() {
 	runsCol := db.GetCollection(dbName, "runs")
 	checkpointsCol := db.GetCollection(dbName, "run_checkpoints")
 
-	authHandler := &handlers.AuthHandler{
-		Users: usersCol,
-	}
+	userRepo := repository.NewUserRepo(usersCol)
+	authHandler := handlers.NewAuthHandler(userRepo, nil) // nil → defaults to auth.GenerateToken
 
 	llmRegistry := llm.NewLLMRegistry()
 
@@ -110,10 +109,8 @@ func main() {
 
 	toolRegistry := tools.NewToolRegistry(db.GetRedis(), memorySvc)
 
-	llmHandler := &handlers.LLMHandler{
-		LLMRegistry: llmRegistryCol,
-		Registry:    llmRegistry,
-	}
+	llmModelRepo := repository.NewLLMModelRepo(llmRegistryCol)
+	llmHandler := handlers.NewLLMHandler(llmModelRepo, llmRegistry)
 
 	agentRepo := repository.NewAgentRepo(agentsCol, llmRegistryCol)
 	threadRepo := repository.NewThreadRepo(threadsCol)

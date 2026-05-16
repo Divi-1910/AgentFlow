@@ -11,6 +11,18 @@ type LLMRegistry struct {
 	clients map[string]LLMClient
 }
 
+// NewEmptyLLMRegistry returns an initialised but empty registry. Useful in
+// tests that register fake providers rather than reading from env vars.
+func NewEmptyLLMRegistry() *LLMRegistry {
+	return &LLMRegistry{clients: make(map[string]LLMClient)}
+}
+
+// Register adds a provider directly. Useful for testing and for dynamic
+// provider injection outside of NewLLMRegistry.
+func (r *LLMRegistry) Register(provider string, client LLMClient) {
+	r.clients[provider] = client
+}
+
 func NewLLMRegistry() *LLMRegistry {
 	r := &LLMRegistry{
 		clients: make(map[string]LLMClient),

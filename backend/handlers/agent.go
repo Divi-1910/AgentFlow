@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"encoding/json"
 	"net/http"
@@ -11,12 +12,22 @@ import (
 	"backend/tools"
 )
 
+// agentStore is the subset of repository.AgentRepo used by handlers.
+type agentStore interface {
+	Create(ctx context.Context, userID string, a *agent.Agent) (*agent.Agent, error)
+	GetByID(ctx context.Context, agentID, userID string) (*agent.Agent, error)
+	GetByIDSystem(ctx context.Context, agentID string) (*agent.Agent, error)
+	ListByUser(ctx context.Context, userID string) ([]*agent.Agent, error)
+	Update(ctx context.Context, agentID, userID string, input repository.UpdateAgentInput) (*agent.Agent, error)
+	Delete(ctx context.Context, agentID, userID string) error
+}
+
 type AgentHandler struct {
-	agentRepo    *repository.AgentRepo
+	agentRepo    agentStore
 	toolRegistry *tools.ToolRegistry
 }
 
-func NewAgentHandler(agentRepo *repository.AgentRepo, toolRegistry *tools.ToolRegistry) *AgentHandler {
+func NewAgentHandler(agentRepo agentStore, toolRegistry *tools.ToolRegistry) *AgentHandler {
 	return &AgentHandler{
 		agentRepo:    agentRepo,
 		toolRegistry: toolRegistry,

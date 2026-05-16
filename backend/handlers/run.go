@@ -15,20 +15,20 @@ import (
 )
 
 type RunHandler struct {
-	agentRepo    *repository.AgentRepo
+	agentRepo    agentStore
 	threadRepo   *repository.ThreadRepo
-	messageRepo  *repository.MessageRepo
+	messageRepo  messageStore
 	runRepo      agent.CheckpointStore
-	runtime      *agent.AgentRuntime
+	runtime      runtimeExecutor
 	toolRegistry *tools.ToolRegistry
 }
 
 func NewRunHandler(
-	agentRepo *repository.AgentRepo,
+	agentRepo agentStore,
 	threadRepo *repository.ThreadRepo,
-	messageRepo *repository.MessageRepo,
+	messageRepo messageStore,
 	runRepo agent.CheckpointStore,
-	runtime *agent.AgentRuntime,
+	runtime runtimeExecutor,
 	toolRegistry *tools.ToolRegistry,
 ) *RunHandler {
 	return &RunHandler{

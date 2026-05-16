@@ -1,20 +1,28 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
 
 	"backend/model"
-	"backend/repository"
 )
 
-type ThreadHandler struct {
-	threadRepo *repository.ThreadRepo
-	agentRepo  *repository.AgentRepo
+// threadStore is the subset of repository.ThreadRepo used by handlers.
+type threadStore interface {
+	Create(ctx context.Context, userID, agentID, title string) (*model.ThreadDocument, error)
+	GetByID(ctx context.Context, threadID, userID string) (*model.ThreadDocument, error)
+	ListByAgent(ctx context.Context, agentID, userID string) ([]*model.ThreadDocument, error)
+	UpdateSummary(ctx context.Context, threadID, userID, summary string) error
 }
 
-func NewThreadHandler(threadRepo *repository.ThreadRepo, agentRepo *repository.AgentRepo) *ThreadHandler {
+type ThreadHandler struct {
+	threadRepo threadStore
+	agentRepo  agentStore
+}
+
+func NewThreadHandler(threadRepo threadStore, agentRepo agentStore) *ThreadHandler {
 	return &ThreadHandler{
 		threadRepo: threadRepo,
 		agentRepo:  agentRepo,

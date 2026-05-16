@@ -80,3 +80,9 @@ func (r *ToolRegistry) Has(name string) bool {
 	_, ok := r.tools[name]
 	return ok
 }
+
+// NewEmptyRegistry returns an initialised but empty ToolRegistry.
+// Useful in tests that need to control exactly which tools are present.
+func NewEmptyRegistry() *ToolRegistry {
+	return &ToolRegistry{tools: make(map[string]Tool)}
+}
