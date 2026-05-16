@@ -492,3 +492,36 @@ func TestValidateDocumentPathRejectsMismatchedID(t *testing.T) {
 		t.Error("expected error for mismatched file name and document ID")
 	}
 }
+
+// ── validateSegment hardening ─────────────────────────────────────────────────
+
+func TestResolveWritePathRejectsOversizedMemoryID(t *testing.T) {
+	t.Parallel()
+	oversized := strings.Repeat("a", memory.MaxSegmentLen+1)
+	_, err := memory.ResolveWritePath("/root", validScope(), memory.ScopeThread, oversized)
+	if err == nil {
+		t.Errorf("expected error for memory_id of length %d (max %d)", len(oversized), memory.MaxSegmentLen)
+	}
+}
+
+func TestResolveWritePathRejectsControlCharInMemoryID(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{"null byte", "mem\x00id"},
+		{"tab", "mem\tid"},
+		{"newline", "mem\nid"},
+		{"DEL", "mem\x7fid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := memory.ResolveWritePath("/root", validScope(), memory.ScopeThread, tc.value)
+			if err == nil {
+				t.Errorf("expected error for memory_id with %s", tc.name)
+			}
+		})
+	}
+}

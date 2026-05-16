@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -58,13 +60,26 @@ func TestMain(m *testing.M) {
 // test-side data setup (e.g. pre-seeding a run document).
 type testEnv struct {
 	srv         *httptest.Server
-	runRepo     *repository.RunRepo     // exposed for run tests
-	llmModelCol *mongo.Collection       // exposed for LLM model seeding
+	runRepo     *repository.RunRepo // exposed for run tests
+	llmModelCol *mongo.Collection   // exposed for LLM model seeding
 }
 
-// newTestEnv creates a fresh HTTP test server for the calling test.
-// Every collection is test-scoped (named after t.Name()) and auto-dropped.
+// runtimeFn mirrors the unexported handlers.runtimeExecutor interface.
+// Both stubRuntime and scriptedRuntime satisfy this.
+type runtimeFn interface {
+	RunStream(ctx context.Context, ag *agent.Agent, runCtx agent.RunContext, events chan<- agent.StreamEvent) (*agent.RunResult, error)
+}
+
+// newTestEnv creates a fresh HTTP test server backed by a stubRuntime.
 func newTestEnv(t *testing.T) *testEnv {
+	t.Helper()
+	return newTestEnvWithRuntime(t, &stubRuntime{})
+}
+
+// newTestEnvWithRuntime creates a fresh HTTP test server using the supplied
+// runtime. Every collection is test-scoped (named after t.Name()) and
+// auto-dropped on test cleanup.
+func newTestEnvWithRuntime(t *testing.T, rt runtimeFn) *testEnv {
 	t.Helper()
 
 	col := func(prefix string) *mongo.Collection {
@@ -86,7 +101,6 @@ func newTestEnv(t *testing.T) *testEnv {
 	}
 
 	// Stubs ───────────────────────────────────────────────────────────────────
-	rt      := &stubRuntime{}
 	summ    := &stubSummarizer{}
 	llmReg  := llm.NewEmptyLLMRegistry()
 	toolReg := tools.NewEmptyRegistry()
@@ -198,6 +212,23 @@ func (e *testEnv) mustSignup(t *testing.T, email, password string) string {
 	return result.Token
 }
 
+// mustGetUserID fetches the authenticated user's ID from GET /api/auth/me.
+// The Me endpoint returns {"user": {"id": "...", ...}}.
+func (e *testEnv) mustGetUserID(t *testing.T, token string) string {
+	t.Helper()
+	resp := e.do(t, "GET", "/api/auth/me", nil, token)
+	var body struct {
+		User struct {
+			ID string `json:"id"`
+		} `json:"user"`
+	}
+	decodeBody(t, resp, &body)
+	if body.User.ID == "" {
+		t.Fatal("GET /api/auth/me: empty user ID")
+	}
+	return body.User.ID
+}
+
 // decodeBody reads and closes resp.Body, unmarshalling JSON into dst.
 func decodeBody(t *testing.T, resp *http.Response, dst any) {
 	t.Helper()
@@ -245,4 +276,49 @@ func (s *stubSummarizer) Summarize(
 	turns []agent.Turn,
 ) (string, llm.TokenUsage, error) {
 	return "stub summary", llm.TokenUsage{}, nil
+}
+
+// ── scriptedRuntime ───────────────────────────────────────────────────────────
+
+// scriptedCall describes one invocation of RunStream: the events to emit
+// (in order), the result to return, and an optional error.
+type scriptedCall struct {
+	events []agent.StreamEvent
+	result *agent.RunResult
+	err    error
+}
+
+// scriptedRuntime replays pre-configured calls in sequence. Each call to
+// RunStream emits the next entry's events, closes the channel, and returns
+// the configured result/error. If more calls arrive than configured, it
+// returns an error so the test notices.
+type scriptedRuntime struct {
+	mu      sync.Mutex
+	calls   []scriptedCall
+	callIdx int
+}
+
+func (s *scriptedRuntime) RunStream(
+	ctx context.Context,
+	ag *agent.Agent,
+	runCtx agent.RunContext,
+	events chan<- agent.StreamEvent,
+) (*agent.RunResult, error) {
+	s.mu.Lock()
+	if s.callIdx >= len(s.calls) {
+		idx := s.callIdx
+		s.mu.Unlock()
+		close(events)
+		return nil, fmt.Errorf("scriptedRuntime: no call configured for invocation %d (have %d)", idx+1, len(s.calls))
+	}
+	call := s.calls[s.callIdx]
+	s.callIdx++
+	s.mu.Unlock()
+
+	for _, e := range call.events {
+		e.RunID = runCtx.RunID
+		events <- e
+	}
+	close(events)
+	return call.result, call.err
 }

@@ -119,5 +119,13 @@ func validateSegment(name, value string) error {
 	if value == "." || value == ".." || strings.Contains(value, "/") || strings.Contains(value, `\`) {
 		return fmt.Errorf("%w: invalid %s", ErrInvalidDocument, name)
 	}
+	if len(value) > MaxSegmentLen {
+		return fmt.Errorf("%w: %s exceeds maximum length of %d", ErrInvalidDocument, name, MaxSegmentLen)
+	}
+	for _, c := range value {
+		if c < 0x20 || c == 0x7F {
+			return fmt.Errorf("%w: %s contains control character", ErrInvalidDocument, name)
+		}
+	}
 	return nil
 }

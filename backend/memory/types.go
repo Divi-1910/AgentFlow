@@ -19,13 +19,14 @@ const (
 )
 
 const (
-	DefaultSearchLimit  = 5
-	MaxSearchLimit      = 20
-	DefaultMaxBodyBytes = 8 * 1024
-	DefaultMaxFileBytes = 12 * 1024
-	MaxScannedFiles     = 500
-	MaxScannedBytes     = 8 * 1024 * 1024
+	DefaultSearchLimit   = 5
+	MaxSearchLimit       = 20
+	DefaultMaxBodyBytes  = 8 * 1024
+	DefaultMaxFileBytes  = 12 * 1024
+	MaxScannedFiles      = 500
+	MaxScannedBytes      = 8 * 1024 * 1024
 	DefaultSearchTimeout = 5 * time.Second
+	MaxSegmentLen        = 128
 )
 
 var (
