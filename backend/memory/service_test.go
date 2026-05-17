@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"sync"
 	"testing"
@@ -18,13 +19,17 @@ import (
 // fakeMetaStore is an in-memory implementation of memory.MetaStore for unit
 // tests. It is safe for concurrent use.
 type fakeMetaStore struct {
-	mu       sync.Mutex
-	records  map[string]*memory.MemoryDocument // key: agentID|scope|memoryID
-	stampErr error                             // if non-nil, StampRead returns this error
+	mu          sync.Mutex
+	records     map[string]*memory.MemoryDocument // key: agentID|scope|memoryID
+	softDeleted map[string]bool                   // tracks soft-deleted keys
+	stampErr    error                             // if non-nil, StampRead returns this error
 }
 
 func newFakeMeta() *fakeMetaStore {
-	return &fakeMetaStore{records: make(map[string]*memory.MemoryDocument)}
+	return &fakeMetaStore{
+		records:     make(map[string]*memory.MemoryDocument),
+		softDeleted: make(map[string]bool),
+	}
 }
 
 func (f *fakeMetaStore) metaKey(agentID, scope, memoryID string) string {
@@ -43,13 +48,19 @@ func (f *fakeMetaStore) Upsert(_ context.Context, doc memory.MemoryDocument) err
 	cp := doc
 	cp.LastReadAt = lastReadAt
 	f.records[k] = &cp
+	// Clear any prior soft-delete marker — re-writing revives the slot.
+	delete(f.softDeleted, k)
 	return nil
 }
 
 func (f *fakeMetaStore) FindOne(_ context.Context, agentID, scope, memoryID string) (*memory.MemoryDocument, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	doc, ok := f.records[f.metaKey(agentID, scope, memoryID)]
+	k := f.metaKey(agentID, scope, memoryID)
+	if f.softDeleted[k] {
+		return nil, nil
+	}
+	doc, ok := f.records[k]
 	if !ok {
 		return nil, nil
 	}
@@ -61,7 +72,10 @@ func (f *fakeMetaStore) FindActive(_ context.Context, execScope runtimectx.Memor
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var results []memory.MemoryDocument
-	for _, doc := range f.records {
+	for k, doc := range f.records {
+		if f.softDeleted[k] {
+			continue // soft-deleted — invisible to agents
+		}
 		if doc.ExpiresAt != nil && !doc.ExpiresAt.After(now) {
 			continue // expired
 		}
@@ -107,6 +121,32 @@ func (f *fakeMetaStore) StampRead(_ context.Context, agentID, scope, memoryID st
 	}
 	now := time.Now().UTC()
 	doc.LastReadAt = &now
+	return nil
+}
+
+func (f *fakeMetaStore) FindExpired(_ context.Context, now time.Time) ([]memory.MemoryDocument, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var results []memory.MemoryDocument
+	for k, doc := range f.records {
+		if f.softDeleted[k] {
+			continue // already soft-deleted — don't re-process
+		}
+		if doc.ExpiresAt != nil && !doc.ExpiresAt.After(now) {
+			cp := *doc
+			results = append(results, cp)
+		}
+	}
+	return results, nil
+}
+
+func (f *fakeMetaStore) SoftDelete(_ context.Context, agentID, scope, memoryID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := f.metaKey(agentID, scope, memoryID)
+	if _, ok := f.records[k]; ok {
+		f.softDeleted[k] = true
+	}
 	return nil
 }
 
@@ -500,6 +540,78 @@ func TestServiceSearchReturnsEmptyOnNoMatch(t *testing.T) {
 	}
 	if len(resp.Results) != 0 {
 		t.Errorf("expected 0 results, got %d", len(resp.Results))
+	}
+}
+
+// ── Cleanup worker ────────────────────────────────────────────────────────────
+
+func TestCleanupSoftDeletesExpiredRecords(t *testing.T) {
+	t.Parallel()
+	svc, root, meta := newSvc(t)
+	scope := validScope()
+
+	writeExpiredDoc(t, root, scope, "mem-cleanup", meta)
+
+	// runCleanup is unexported; trigger via a very short-interval worker.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.StartCleanupWorker(ctx, 10*time.Millisecond)
+	time.Sleep(50 * time.Millisecond) // let at least one tick fire
+
+	// Record must now be invisible to agents.
+	doc, err := meta.FindOne(context.Background(), scope.AgentID, memory.ScopeThread, "mem-cleanup")
+	if err != nil {
+		t.Fatalf("FindOne after cleanup: %v", err)
+	}
+	if doc != nil {
+		t.Error("expected soft-deleted record to be invisible (FindOne should return nil)")
+	}
+}
+
+func TestCleanupSkipsActiveRecords(t *testing.T) {
+	t.Parallel()
+	svc, _, meta := newSvc(t)
+	scope := validScope()
+
+	if _, err := svc.Write(context.Background(), scope, "mem-active", svcWriteArgs("keep me")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.StartCleanupWorker(ctx, 10*time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+
+	// Active record must still be visible.
+	doc, err := meta.FindOne(context.Background(), scope.AgentID, memory.ScopeThread, "mem-active")
+	if err != nil {
+		t.Fatalf("FindOne after cleanup: %v", err)
+	}
+	if doc == nil {
+		t.Error("expected active record to still be visible after cleanup sweep")
+	}
+}
+
+func TestCleanupFilePreservedOnDisk(t *testing.T) {
+	t.Parallel()
+	svc, root, meta := newSvc(t)
+	scope := validScope()
+
+	writeExpiredDoc(t, root, scope, "mem-audit", meta)
+
+	path, err := memory.ResolveWritePath(root, scope, memory.ScopeThread, "mem-audit")
+	if err != nil {
+		t.Fatalf("ResolveWritePath: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.StartCleanupWorker(ctx, 10*time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+
+	// File must still exist on disk after soft-delete.
+	if _, statErr := os.Stat(path); statErr != nil {
+		t.Errorf("expected file to remain on disk for audit, got: %v", statErr)
 	}
 }
 

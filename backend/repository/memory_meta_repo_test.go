@@ -305,6 +305,95 @@ func TestMemoryMetaRepoFindActiveFiltersType(t *testing.T) {
 	}
 }
 
+// ── FindExpired + SoftDelete ──────────────────────────────────────────────────
+
+func TestMemoryMetaRepoFindExpired(t *testing.T) {
+	t.Parallel()
+	repo := newMetaRepo(t)
+	ctx := context.Background()
+	scope := repoScope()
+	now := time.Now().UTC()
+	past := now.Add(-1 * time.Hour)
+	future := now.Add(24 * time.Hour)
+
+	base := memory.MemoryDocument{
+		UserID: scope.UserID, AgentID: scope.AgentID, ThreadID: scope.ThreadID,
+		Scope: memory.ScopeThread, Type: memory.TypeFact, Importance: 0.5, CreatedAt: now,
+	}
+	active := base; active.ID = "active"; active.ExpiresAt = &future
+	expired := base; expired.ID = "expired"; expired.ExpiresAt = &past
+	noTTL := base; noTTL.ID = "nottl"
+
+	for _, d := range []memory.MemoryDocument{active, expired, noTTL} {
+		if err := repo.Upsert(ctx, d); err != nil {
+			t.Fatalf("Upsert %s: %v", d.ID, err)
+		}
+	}
+
+	docs, err := repo.FindExpired(ctx, now)
+	if err != nil {
+		t.Fatalf("FindExpired: %v", err)
+	}
+	if len(docs) != 1 {
+		t.Errorf("expected 1 expired doc, got %d", len(docs))
+	}
+	if len(docs) > 0 && docs[0].ID != "expired" {
+		t.Errorf("expected expired doc, got %q", docs[0].ID)
+	}
+}
+
+func TestMemoryMetaRepoSoftDelete(t *testing.T) {
+	t.Parallel()
+	repo := newMetaRepo(t)
+	ctx := context.Background()
+	scope := repoScope()
+	now := time.Now().UTC()
+
+	doc := memory.MemoryDocument{
+		UserID: scope.UserID, AgentID: scope.AgentID, ThreadID: scope.ThreadID,
+		ID: "mem-soft", Scope: memory.ScopeThread, Type: memory.TypeFact,
+		Importance: 0.5, CreatedAt: now,
+	}
+	if err := repo.Upsert(ctx, doc); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	// SoftDelete — record must be invisible to FindOne.
+	if err := repo.SoftDelete(ctx, scope.AgentID, memory.ScopeThread, "mem-soft"); err != nil {
+		t.Fatalf("SoftDelete: %v", err)
+	}
+	got, err := repo.FindOne(ctx, scope.AgentID, memory.ScopeThread, "mem-soft")
+	if err != nil {
+		t.Fatalf("FindOne after SoftDelete: %v", err)
+	}
+	if got != nil {
+		t.Error("expected nil from FindOne after SoftDelete")
+	}
+
+	// FindActive must also exclude the soft-deleted record.
+	docs, err := repo.FindActive(ctx, scope, memory.ScopeThread, nil, now)
+	if err != nil {
+		t.Fatalf("FindActive: %v", err)
+	}
+	for _, d := range docs {
+		if d.ID == "mem-soft" {
+			t.Error("soft-deleted record appeared in FindActive results")
+		}
+	}
+
+	// Re-upsert (agent re-writes same slot) must revive the record.
+	if err := repo.Upsert(ctx, doc); err != nil {
+		t.Fatalf("re-Upsert: %v", err)
+	}
+	revived, err := repo.FindOne(ctx, scope.AgentID, memory.ScopeThread, "mem-soft")
+	if err != nil {
+		t.Fatalf("FindOne after re-Upsert: %v", err)
+	}
+	if revived == nil {
+		t.Error("expected record to be revived after re-Upsert, got nil")
+	}
+}
+
 // ── Isolation ─────────────────────────────────────────────────────────────────
 
 func TestMemoryMetaRepoKeyIsolation(t *testing.T) {

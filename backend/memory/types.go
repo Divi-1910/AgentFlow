@@ -90,6 +90,15 @@ type MetaStore interface {
 	// memoryID). Only updates existing records; never creates a new one.
 	StampRead(ctx context.Context, agentID, scope, memoryID string) error
 
+	// FindExpired returns all non-soft-deleted metadata records where expires_at
+	// is set and is on or before now. Used by the cleanup worker.
+	FindExpired(ctx context.Context, now time.Time) ([]MemoryDocument, error)
+
+	// SoftDelete marks (agentID, scope, memoryID) as deleted by setting
+	// deleted_at to now. The file on disk is preserved for audit purposes.
+	// Soft-deleted records are excluded from FindOne and FindActive results.
+	SoftDelete(ctx context.Context, agentID, scope, memoryID string) error
+
 	// EnsureIndexes creates the required MongoDB indexes (idempotent).
 	EnsureIndexes(ctx context.Context) error
 }

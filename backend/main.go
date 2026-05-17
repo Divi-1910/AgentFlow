@@ -114,6 +114,7 @@ func main() {
 		slog.Error("failed to initialize memory service", "error", err)
 		os.Exit(1)
 	}
+	memorySvc.StartCleanupWorker(appCtx, 7*24*time.Hour)
 
 	toolRegistry := tools.NewToolRegistry(db.GetRedis(), memorySvc)
 

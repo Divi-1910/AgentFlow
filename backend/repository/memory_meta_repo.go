@@ -15,7 +15,8 @@ import (
 
 // MemoryMetaRepo implements memory.MetaStore using MongoDB.
 // Each document in the collection holds all metadata for one memory record.
-// File content (body) is stored separately on disk.
+// File content (body) is stored separately on disk and is never deleted —
+// it is preserved on disk for audit/review purposes even after soft-deletion.
 type MemoryMetaRepo struct {
 	col *mongo.Collection
 }
@@ -25,6 +26,8 @@ func NewMemoryMetaRepo(col *mongo.Collection) *MemoryMetaRepo {
 }
 
 // memoryMetaBSON is the wire format for a memory_meta document.
+// deleted_at is set by the cleanup worker when a record expires; it is never
+// unset except by a new Upsert (agent re-writing the same memory slot).
 type memoryMetaBSON struct {
 	UserID     string     `bson:"user_id"`
 	AgentID    string     `bson:"agent_id"`
@@ -36,6 +39,7 @@ type memoryMetaBSON struct {
 	CreatedAt  time.Time  `bson:"created_at"`
 	ExpiresAt  *time.Time `bson:"expires_at"`
 	LastReadAt *time.Time `bson:"last_read_at"`
+	DeletedAt  *time.Time `bson:"deleted_at"`
 }
 
 func (r *MemoryMetaRepo) EnsureIndexes(ctx context.Context) error {
@@ -69,6 +73,8 @@ func (r *MemoryMetaRepo) EnsureIndexes(ctx context.Context) error {
 // Upsert creates or updates the metadata for a memory document.
 // last_read_at is intentionally excluded from the $set to preserve the
 // existing stamp value — it is managed exclusively by StampRead.
+// deleted_at is explicitly cleared so that re-writing a previously
+// soft-deleted slot revives it as a live record.
 func (r *MemoryMetaRepo) Upsert(ctx context.Context, doc memory.MemoryDocument) error {
 	filter := bson.D{
 		{Key: "agent_id", Value: doc.AgentID},
@@ -85,6 +91,7 @@ func (r *MemoryMetaRepo) Upsert(ctx context.Context, doc memory.MemoryDocument) 
 		{Key: "importance", Value: doc.Importance},
 		{Key: "created_at", Value: doc.CreatedAt},
 		{Key: "expires_at", Value: doc.ExpiresAt},
+		{Key: "deleted_at", Value: nil}, // clear any prior soft-delete marker
 	}}}
 	_, err := r.col.UpdateOne(ctx, filter, update, options.UpdateOne().SetUpsert(true))
 	if err != nil {
@@ -94,12 +101,13 @@ func (r *MemoryMetaRepo) Upsert(ctx context.Context, doc memory.MemoryDocument) 
 }
 
 // FindOne returns the metadata record for (agentID, scope, memoryID),
-// or (nil, nil) when no record exists.
+// or (nil, nil) when no record exists or the record has been soft-deleted.
 func (r *MemoryMetaRepo) FindOne(ctx context.Context, agentID, scope, memoryID string) (*memory.MemoryDocument, error) {
 	filter := bson.D{
 		{Key: "agent_id", Value: agentID},
 		{Key: "scope", Value: scope},
 		{Key: "memory_id", Value: memoryID},
+		{Key: "deleted_at", Value: nil}, // exclude soft-deleted records
 	}
 	var raw memoryMetaBSON
 	err := r.col.FindOne(ctx, filter).Decode(&raw)
@@ -113,8 +121,8 @@ func (r *MemoryMetaRepo) FindOne(ctx context.Context, agentID, scope, memoryID s
 	return &doc, nil
 }
 
-// FindActive returns all non-expired metadata records visible within
-// searchScope, applying scope-expansion rules:
+// FindActive returns all non-expired, non-soft-deleted metadata records
+// visible within searchScope, applying scope-expansion rules:
 //
 //	thread → thread records for this agent+thread
 //	agent  → agent records for this agent + thread records above
@@ -134,6 +142,7 @@ func (r *MemoryMetaRepo) FindActive(ctx context.Context, execScope runtimectx.Me
 	andClauses := bson.A{
 		bson.D{{Key: "$or", Value: scopeConditions}},
 		expiryFilter,
+		bson.D{{Key: "deleted_at", Value: nil}}, // exclude soft-deleted records
 	}
 	if typeFilter != nil {
 		andClauses = append(andClauses, bson.D{{Key: "type", Value: *typeFilter}})
@@ -174,6 +183,56 @@ func (r *MemoryMetaRepo) StampRead(ctx context.Context, agentID, scope, memoryID
 	_, err := r.col.UpdateOne(ctx, filter, update) // upsert=false (default)
 	if err != nil {
 		return fmt.Errorf("memory_meta_repo: stamp read: %w", err)
+	}
+	return nil
+}
+
+// FindExpired returns all non-soft-deleted metadata records where expires_at
+// is set and is on or before now. Results are capped at MaxScannedFiles —
+// remaining records are handled on the next weekly tick.
+func (r *MemoryMetaRepo) FindExpired(ctx context.Context, now time.Time) ([]memory.MemoryDocument, error) {
+	filter := bson.D{{Key: "$and", Value: bson.A{
+		bson.D{{Key: "expires_at", Value: bson.D{
+			{Key: "$ne", Value: nil},
+			{Key: "$lte", Value: now},
+		}}},
+		bson.D{{Key: "deleted_at", Value: nil}}, // don't re-process already soft-deleted
+	}}}
+	opts := options.Find().SetLimit(int64(memory.MaxScannedFiles))
+
+	cursor, err := r.col.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, fmt.Errorf("memory_meta_repo: find expired: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var raws []memoryMetaBSON
+	if err := cursor.All(ctx, &raws); err != nil {
+		return nil, fmt.Errorf("memory_meta_repo: decode expired: %w", err)
+	}
+
+	docs := make([]memory.MemoryDocument, len(raws))
+	for i, raw := range raws {
+		docs[i] = toMemoryDocument(raw)
+	}
+	return docs, nil
+}
+
+// SoftDelete marks (agentID, scope, memoryID) as deleted by setting deleted_at
+// to now. The corresponding file on disk is preserved for audit/review.
+// Soft-deleted records are excluded from FindOne and FindActive results.
+func (r *MemoryMetaRepo) SoftDelete(ctx context.Context, agentID, scope, memoryID string) error {
+	filter := bson.D{
+		{Key: "agent_id", Value: agentID},
+		{Key: "scope", Value: scope},
+		{Key: "memory_id", Value: memoryID},
+	}
+	update := bson.D{{Key: "$set", Value: bson.D{
+		{Key: "deleted_at", Value: time.Now().UTC()},
+	}}}
+	_, err := r.col.UpdateOne(ctx, filter, update)
+	if err != nil {
+		return fmt.Errorf("memory_meta_repo: soft delete: %w", err)
 	}
 	return nil
 }
