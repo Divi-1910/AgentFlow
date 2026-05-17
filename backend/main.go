@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -131,7 +132,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	agentRuntime := agent.NewAgentRuntime(llmRegistry, toolRegistry).WithCheckpointStore(runRepo)
+	platformPath := strings.TrimSpace(os.Getenv("PLATFORM_XML_PATH"))
+	if platformPath == "" {
+		platformPath = "platform.xml"
+	}
+	platformCfg, err := agent.LoadPlatformConfig(platformPath)
+	if err != nil {
+		slog.Error("failed to load platform config", "error", err, "path", platformPath)
+		os.Exit(1)
+	}
+	contextBuilder := agent.NewContextBuilder(platformCfg, memorySvc, memoryMetaRepo, toolRegistry)
+	agentRuntime := agent.NewAgentRuntime(llmRegistry, toolRegistry, contextBuilder).WithCheckpointStore(runRepo)
 	summarizer := agent.NewSummarizer(llmRegistry)
 
 	agentHandler := handlers.NewAgentHandler(agentRepo, toolRegistry)

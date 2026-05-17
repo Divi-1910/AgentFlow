@@ -20,13 +20,19 @@ const checkpointFailureThreshold = 3
 type AgentRuntime struct {
 	llmRegistry     *llm.LLMRegistry
 	toolRegistry    *tools.ToolRegistry
+	contextBuilder  *ContextBuilder
 	checkpointStore CheckpointStore
 }
 
-func NewAgentRuntime(llmRegistry *llm.LLMRegistry, toolRegistry *tools.ToolRegistry) *AgentRuntime {
+func NewAgentRuntime(
+	llmRegistry *llm.LLMRegistry,
+	toolRegistry *tools.ToolRegistry,
+	contextBuilder *ContextBuilder,
+) *AgentRuntime {
 	return &AgentRuntime{
-		llmRegistry:  llmRegistry,
-		toolRegistry: toolRegistry,
+		llmRegistry:    llmRegistry,
+		toolRegistry:   toolRegistry,
+		contextBuilder: contextBuilder,
 	}
 }
 
@@ -34,12 +40,25 @@ func (r *AgentRuntime) WithCheckpointStore(store CheckpointStore) *AgentRuntime 
 	return &AgentRuntime{
 		llmRegistry:     r.llmRegistry,
 		toolRegistry:    r.toolRegistry,
+		contextBuilder:  r.contextBuilder,
 		checkpointStore: store,
 	}
 }
 
 func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext) (*RunResult, error) {
 	return r.runInternal(ctx, agent, runCtx, &NoopSink{})
+}
+
+// EstimateSystemPromptTokens returns an approximate token cost for the
+// system message that ContextBuilder would assemble for (agent, runCtx).
+// It is the accurate input to summarization decisions: callers that have
+// access to the runtime should use this instead of the fallback heuristic
+// in agent.ShouldSummarize.
+func (r *AgentRuntime) EstimateSystemPromptTokens(ctx context.Context, agent *Agent, runCtx RunContext) int {
+	if r.contextBuilder == nil {
+		return 0
+	}
+	return r.contextBuilder.EstimateSystemPromptTokens(ctx, agent, runCtx)
 }
 
 func (r *AgentRuntime) RunStream(ctx context.Context, ag *Agent, runCtx RunContext, events chan<- StreamEvent) (*RunResult, error) {
@@ -165,10 +184,6 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 
 	if runCtx.Checkpoint != nil {
 		s := runCtx.Checkpoint.State
-		messages = s.Messages
-		systemMsg := BuildSystemMessage(agent.SystemPrompt, s.RawSummary)
-		messages = append([]llm.ChatMessage{systemMsg}, messages...)
-
 		steps = s.StepsCompleted
 		totalUsage = s.TotalUsage
 		toolFailures = s.ToolFailures
@@ -178,16 +193,17 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		newMessages = make([]llm.ChatMessage, 0)
 		hasSnapshot = true
 
-		if runCtx.Checkpoint.Meta.Phase == PhasePostModel {
-			if len(messages) == 0 || messages[len(messages)-1].Role != "assistant" {
-				return nil, fmt.Errorf(
-					"post_model resume: snapshot missing assistant message with tool calls",
-				)
-			}
-			pendingToolCalls = messages[len(messages)-1].ToolCalls
-			if len(pendingToolCalls) == 0 {
-				return nil, fmt.Errorf("post_model resume: no pending tool calls")
-			}
+		// Promote snapshot state into runCtx so the ContextBuilder renders
+		// <state> with the correct phase / step counter, and recover a
+		// best-effort LastAction from the most recent tool message so that
+		// a resumed run still surfaces what just happened.
+		runCtx.Phase = runCtx.Checkpoint.Meta.Phase
+		runCtx.StepsCompleted = s.StepsCompleted
+		if strings.TrimSpace(runCtx.Summary) == "" {
+			runCtx.Summary = s.RawSummary
+		}
+		if runCtx.LastAction == "" {
+			runCtx.LastAction = deriveLastActionFromMessages(s.Messages)
 		}
 
 		sink.Emit(StreamEvent{
@@ -196,17 +212,31 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			Attempt: runCtx.Checkpoint.Meta.Attempt,
 		})
 	} else {
-		systemMsg := BuildSystemMessage(agent.SystemPrompt, runCtx.Summary)
-		messages = make([]llm.ChatMessage, 0)
-		messages = append(messages, systemMsg)
-		messages = append(messages, runCtx.History...)
-		messages = append(messages, llm.ChatMessage{
-			Role:    "user",
-			Content: runCtx.Input,
-		})
-
+		if runCtx.Phase == "" {
+			runCtx.Phase = PhasePreModel
+		}
 		newMessages = make([]llm.ChatMessage, 0)
 		toolFailures = make(map[string]int)
+	}
+
+	if r.contextBuilder == nil {
+		return nil, fmt.Errorf("runtime: context builder is not configured")
+	}
+	messages, err = r.contextBuilder.Build(ctx, agent, runCtx)
+	if err != nil {
+		return nil, fmt.Errorf("runtime: context build: %w", err)
+	}
+
+	if runCtx.Checkpoint != nil && runCtx.Checkpoint.Meta.Phase == PhasePostModel {
+		if len(messages) == 0 || messages[len(messages)-1].Role != "assistant" {
+			return nil, fmt.Errorf(
+				"post_model resume: snapshot missing assistant message with tool calls",
+			)
+		}
+		pendingToolCalls = messages[len(messages)-1].ToolCalls
+		if len(pendingToolCalls) == 0 {
+			return nil, fmt.Errorf("post_model resume: no pending tool calls")
+		}
 	}
 
 	for steps < maxSteps {
@@ -253,9 +283,25 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 				maxTokens = DefaultMaxTokens
 			}
 
+			// Refresh the system message with the live <state> block before
+			// every call so step / phase / last_action are not stale across
+			// iterations. The static prefix stays byte-identical for caching.
+			runCtx.Phase = PhasePreModel
+			runCtx.StepsCompleted = steps
+			sysContent, sysErr := r.contextBuilder.BuildSystemContent(ctx, agent, runCtx)
+			if sysErr != nil {
+				return nil, fmt.Errorf("runtime: refresh system message: %w", sysErr)
+			}
+			messages[0] = llm.ChatMessage{Role: "system", Content: sysContent}
+
+			// Apply display-only tool-result truncation to a copy. The
+			// canonical `messages` slice stays untruncated so checkpoints
+			// preserve full evidence across resumes.
+			forLLM := r.contextBuilder.RenderForLLM(messages)
+
 			resp, err := client.ChatCompletion(ctx, &llm.ChatRequest{
 				Model:       agent.Model,
-				Messages:    messages,
+				Messages:    forLLM,
 				Tools:       toolDefs,
 				Temperature: temperature,
 				MaxTokens:   maxTokens,
@@ -410,6 +456,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 				}
 				messages = append(messages, errMsg)
 				newMessages = append(newMessages, errMsg)
+				runCtx.LastAction = fmt.Sprintf("%s → error", call.Name)
 				logger.Error("tool execution failed", "tool", call.Name, "error", err)
 
 				sink.Emit(StreamEvent{
@@ -448,6 +495,11 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			}
 			messages = append(messages, toolMsg)
 			newMessages = append(newMessages, toolMsg)
+			if toolResult.IsError {
+				runCtx.LastAction = fmt.Sprintf("%s → error", call.Name)
+			} else {
+				runCtx.LastAction = fmt.Sprintf("%s → success", call.Name)
+			}
 
 			displayStr := fmt.Sprintf("Finished %s", call.Name)
 			if toolResult.Content != "" && len(toolResult.Content) < 50 {
@@ -495,6 +547,34 @@ func classifyError(err error) string {
 		}
 		return "engine.runtime_error"
 	}
+}
+
+// deriveLastActionFromMessages walks the snapshot messages newest-first and
+// returns a short description of the most recent tool execution, e.g.
+// "calculator → success" or "memory_write → error". Returns "" when no tool
+// message is present (typical of a fresh pre_model snapshot).
+//
+// Used on resume to repopulate runCtx.LastAction so the model still sees what
+// happened just before the interruption.
+func deriveLastActionFromMessages(messages []llm.ChatMessage) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
+		if m.Role != "tool" {
+			continue
+		}
+		toolName, _ := m.Metadata["tool_name"].(string)
+		if toolName == "" {
+			toolName = "tool"
+		}
+		outcome := "success"
+		if isErr, ok := m.Metadata["is_error"].(bool); ok && isErr {
+			outcome = "error"
+		} else if strings.HasPrefix(m.Content, "[error]") {
+			outcome = "error"
+		}
+		return fmt.Sprintf("%s → %s", toolName, outcome)
+	}
+	return ""
 }
 
 func (r *AgentRuntime) loadTools(agent *Agent) ([]llm.ToolDefinition, error) {

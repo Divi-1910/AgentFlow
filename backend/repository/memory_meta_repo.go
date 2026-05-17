@@ -40,10 +40,13 @@ type memoryMetaBSON struct {
 	ExpiresAt  *time.Time `bson:"expires_at"`
 	LastReadAt *time.Time `bson:"last_read_at"`
 	DeletedAt  *time.Time `bson:"deleted_at"`
+	Summary    string     `bson:"summary,omitempty"`
 }
 
 func (r *MemoryMetaRepo) EnsureIndexes(ctx context.Context) error {
-	// Primary lookup: unique per (agent_id, scope, memory_id).
+	// Primary lookup for ScopeAgent / ScopeThread: unique per
+	// (agent_id, scope, memory_id). ScopeUser duplicates are prevented
+	// separately by the partial user-scope index below.
 	_, err := r.col.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{
 			{Key: "agent_id", Value: 1},
@@ -54,6 +57,24 @@ func (r *MemoryMetaRepo) EnsureIndexes(ctx context.Context) error {
 	})
 	if err != nil {
 		return fmt.Errorf("memory_meta_repo: primary index: %w", err)
+	}
+
+	// Partial unique index for ScopeUser: exactly one record per
+	// (user_id, memory_id) when scope == "user", regardless of which
+	// agent originally wrote it. This makes user-scope identity
+	// consistent across the read/write/file-path layers.
+	_, err = r.col.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{
+			{Key: "user_id", Value: 1},
+			{Key: "memory_id", Value: 1},
+		},
+		Options: options.Index().
+			SetUnique(true).
+			SetName("user_scope_unique").
+			SetPartialFilterExpression(bson.D{{Key: "scope", Value: memory.ScopeUser}}),
+	})
+	if err != nil {
+		return fmt.Errorf("memory_meta_repo: user-scope unique index: %w", err)
 	}
 
 	// Query index to accelerate FindActive (scope + expiry filter).
@@ -75,11 +96,28 @@ func (r *MemoryMetaRepo) EnsureIndexes(ctx context.Context) error {
 // existing stamp value — it is managed exclusively by StampRead.
 // deleted_at is explicitly cleared so that re-writing a previously
 // soft-deleted slot revives it as a live record.
+//
+// For ScopeUser memories the filter is keyed on (user_id, scope, memory_id)
+// — user-scope memories are conceptually attached to the user, not the
+// writing agent. Any other agent overwriting a user-scope memory will
+// update the same metadata row instead of creating a duplicate.
+//
+// For ScopeAgent / ScopeThread memories the filter is keyed on
+// (agent_id, scope, memory_id) as before, preserving per-agent isolation.
 func (r *MemoryMetaRepo) Upsert(ctx context.Context, doc memory.MemoryDocument) error {
-	filter := bson.D{
-		{Key: "agent_id", Value: doc.AgentID},
-		{Key: "scope", Value: doc.Scope},
-		{Key: "memory_id", Value: doc.ID},
+	var filter bson.D
+	if doc.Scope == memory.ScopeUser {
+		filter = bson.D{
+			{Key: "user_id", Value: doc.UserID},
+			{Key: "scope", Value: doc.Scope},
+			{Key: "memory_id", Value: doc.ID},
+		}
+	} else {
+		filter = bson.D{
+			{Key: "agent_id", Value: doc.AgentID},
+			{Key: "scope", Value: doc.Scope},
+			{Key: "memory_id", Value: doc.ID},
+		}
 	}
 	update := bson.D{{Key: "$set", Value: bson.D{
 		{Key: "user_id", Value: doc.UserID},
@@ -91,6 +129,7 @@ func (r *MemoryMetaRepo) Upsert(ctx context.Context, doc memory.MemoryDocument) 
 		{Key: "importance", Value: doc.Importance},
 		{Key: "created_at", Value: doc.CreatedAt},
 		{Key: "expires_at", Value: doc.ExpiresAt},
+		{Key: "summary", Value: doc.Summary},
 		{Key: "deleted_at", Value: nil}, // clear any prior soft-delete marker
 	}}}
 	_, err := r.col.UpdateOne(ctx, filter, update, options.UpdateOne().SetUpsert(true))
@@ -98,6 +137,34 @@ func (r *MemoryMetaRepo) Upsert(ctx context.Context, doc memory.MemoryDocument) 
 		return fmt.Errorf("memory_meta_repo: upsert: %w", err)
 	}
 	return nil
+}
+
+// FindOneUserScoped returns the user-scoped record (regardless of writer
+// AgentID) for (userID, memoryID), or (nil, nil) when no record exists or
+// the record has been soft-deleted. Cross-agent visibility of ScopeUser
+// memories requires looking up by user_id rather than agent_id.
+//
+// If two agents independently wrote a user-scoped memory with the same
+// memoryID for the same userID (rare but possible — see memory_write_tool's
+// deriveMemoryID), the most recently created record is returned.
+func (r *MemoryMetaRepo) FindOneUserScoped(ctx context.Context, userID, memoryID string) (*memory.MemoryDocument, error) {
+	filter := bson.D{
+		{Key: "user_id", Value: userID},
+		{Key: "scope", Value: memory.ScopeUser},
+		{Key: "memory_id", Value: memoryID},
+		{Key: "deleted_at", Value: nil},
+	}
+	opts := options.FindOne().SetSort(bson.D{{Key: "created_at", Value: -1}})
+	var raw memoryMetaBSON
+	err := r.col.FindOne(ctx, filter, opts).Decode(&raw)
+	if err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("memory_meta_repo: find one user-scoped: %w", err)
+	}
+	doc := toMemoryDocument(raw)
+	return &doc, nil
 }
 
 // FindOne returns the metadata record for (agentID, scope, memoryID),
@@ -280,5 +347,6 @@ func toMemoryDocument(raw memoryMetaBSON) memory.MemoryDocument {
 		CreatedAt:  raw.CreatedAt,
 		ExpiresAt:  raw.ExpiresAt,
 		LastReadAt: raw.LastReadAt,
+		Summary:    raw.Summary,
 	}
 }

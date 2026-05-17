@@ -31,6 +31,7 @@ func (t *CalculatorTool) Definition() llm.ToolDefinition {
 			},
 			"required": ["expression"]
 		}`),
+		Instructions: "Use the calculator for every numeric computation, however trivial. Never compute in prose — pass the whole expression in one call. Combine multiple steps into a single expression with parentheses rather than chaining several calls.",
 	}
 }
 

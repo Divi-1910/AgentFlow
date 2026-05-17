@@ -21,7 +21,7 @@ type User struct {
 // by CompareDummy to equalize login response timing when a user is not found,
 // preventing email-enumeration via timing differences (~80ms bcrypt vs ~1ms).
 var dummyHash = func() []byte {
-	h, _ := bcrypt.GenerateFromPassword([]byte("graas-dummy-sentinel-not-a-real-password"), 12)
+	h, _ := bcrypt.GenerateFromPassword([]byte("dummy-sentinel-not-a-real-password"), 12)
 	return h
 }()
 

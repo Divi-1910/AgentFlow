@@ -39,7 +39,20 @@ func (f *fakeMetaStore) metaKey(agentID, scope, memoryID string) string {
 func (f *fakeMetaStore) Upsert(_ context.Context, doc memory.MemoryDocument) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// User-scope memories are conceptually keyed by (user_id, memory_id) —
+	// the real repo enforces this with a partial unique index. Mirror that
+	// here so any cross-agent overwrite reuses the same record and tests
+	// can't accidentally rely on the agent_id being part of the user-scope
+	// identity.
 	k := f.metaKey(doc.AgentID, doc.Scope, doc.ID)
+	if doc.Scope == memory.ScopeUser {
+		for existingKey, existing := range f.records {
+			if existing.Scope == memory.ScopeUser && existing.UserID == doc.UserID && existing.ID == doc.ID {
+				k = existingKey
+				break
+			}
+		}
+	}
 	// Preserve last_read_at on upsert — mirrors the MongoDB $set behaviour.
 	var lastReadAt *time.Time
 	if existing, ok := f.records[k]; ok {
@@ -66,6 +79,25 @@ func (f *fakeMetaStore) FindOne(_ context.Context, agentID, scope, memoryID stri
 	}
 	cp := *doc
 	return &cp, nil
+}
+
+func (f *fakeMetaStore) FindOneUserScoped(_ context.Context, userID, memoryID string) (*memory.MemoryDocument, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var best *memory.MemoryDocument
+	for k, doc := range f.records {
+		if f.softDeleted[k] {
+			continue
+		}
+		if doc.Scope != memory.ScopeUser || doc.UserID != userID || doc.ID != memoryID {
+			continue
+		}
+		if best == nil || doc.CreatedAt.After(best.CreatedAt) {
+			cp := *doc
+			best = &cp
+		}
+	}
+	return best, nil
 }
 
 func (f *fakeMetaStore) FindActive(_ context.Context, execScope runtimectx.MemoryScope, searchScope string, typeFilter *string, now time.Time) ([]memory.MemoryDocument, error) {
@@ -237,6 +269,48 @@ func TestServiceWriteRoundTrip(t *testing.T) {
 	}
 }
 
+func TestServiceWritePopulatesSummary(t *testing.T) {
+	t.Parallel()
+	svc, _, meta := newSvc(t)
+
+	body := "# DB notes\nPostgreSQL 14, users + orders.\nMigrations in /db/migrations."
+	if _, err := svc.Write(context.Background(), validScope(), "mem-summary", svcWriteArgs(body)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	doc, err := meta.FindOne(context.Background(), validScope().AgentID, memory.ScopeThread, "mem-summary")
+	if err != nil {
+		t.Fatalf("FindOne: %v", err)
+	}
+	if doc == nil {
+		t.Fatal("expected document, got nil")
+	}
+	if doc.Summary != "DB notes" {
+		t.Errorf("Summary: got %q, want %q", doc.Summary, "DB notes")
+	}
+}
+
+func TestServiceWriteSummaryFallsBackToFirstNonHeaderLine(t *testing.T) {
+	t.Parallel()
+	svc, _, meta := newSvc(t)
+
+	body := "User prefers concise responses."
+	if _, err := svc.Write(context.Background(), validScope(), "mem-plain", svcWriteArgs(body)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	doc, err := meta.FindOne(context.Background(), validScope().AgentID, memory.ScopeThread, "mem-plain")
+	if err != nil {
+		t.Fatalf("FindOne: %v", err)
+	}
+	if doc == nil {
+		t.Fatal("expected document, got nil")
+	}
+	if doc.Summary != "User prefers concise responses." {
+		t.Errorf("Summary: got %q, want %q", doc.Summary, body)
+	}
+}
+
 func TestServiceWriteExistingFileRequiresRead(t *testing.T) {
 	t.Parallel()
 	svc, _, _ := newSvc(t)
@@ -358,6 +432,118 @@ func TestServiceWriteWithTTLSetsExpiresAt(t *testing.T) {
 	}
 	if result.ExpiresAt == nil {
 		t.Fatal("expected ExpiresAt to be set when TTLDays is provided")
+	}
+}
+
+// TestServiceUserScopeWriteIsUserKeyedAcrossAgents covers review round 3
+// issue #2: a user-scope memory must have a single canonical metadata row
+// regardless of which agent wrote it. Two writes from different agents to
+// the same memory_id must:
+//   1. surface a single row (no duplicate metadata)
+//   2. enforce the read-before-write guard so an agent that has never read
+//      it cannot blindly overwrite it
+func TestServiceUserScopeWriteIsUserKeyedAcrossAgents(t *testing.T) {
+	t.Parallel()
+	svc, _, meta := newSvc(t)
+
+	agentB := runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-B", ThreadID: "thread-B"}
+	agentA := runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-A", ThreadID: "thread-A"}
+
+	// Agent B writes the user memory.
+	if _, err := svc.Write(context.Background(), agentB, "lang-pref",
+		svcUserPrefArgs("v1: prefer Marathi")); err != nil {
+		t.Fatalf("agent B write: %v", err)
+	}
+
+	// Agent A overwrites WITHOUT having read it — must be rejected.
+	_, err := svc.Write(context.Background(), agentA, "lang-pref",
+		svcUserPrefArgs("v2: agent A clobber"))
+	if !errors.Is(err, memory.ErrReadBeforeWrite) {
+		t.Fatalf("expected ErrReadBeforeWrite for cross-agent blind overwrite, got: %v", err)
+	}
+
+	// Agent A reads it (this is the cross-agent read path, which stamps the
+	// writer-agent's record).
+	if _, err := svc.Read(context.Background(), agentA, memory.MemoryReadArgs{
+		MemoryID: "lang-pref",
+		Scope:    memory.ScopeUser,
+	}); err != nil {
+		t.Fatalf("agent A read: %v", err)
+	}
+
+	// Now agent A can overwrite.
+	if _, err := svc.Write(context.Background(), agentA, "lang-pref",
+		svcUserPrefArgs("v3: agent A update")); err != nil {
+		t.Fatalf("agent A write after read: %v", err)
+	}
+
+	// Verify there is only ONE canonical row for (user-1, user, lang-pref).
+	rows := 0
+	meta.mu.Lock()
+	for _, doc := range meta.records {
+		if doc.Scope == memory.ScopeUser && doc.UserID == "user-1" && doc.ID == "lang-pref" {
+			rows++
+		}
+	}
+	meta.mu.Unlock()
+	if rows != 1 {
+		t.Errorf("user-scope metadata rows: got %d, want 1 (no duplicates across agents)", rows)
+	}
+
+	// And the canonical doc must reflect the latest writer.
+	doc, err := meta.FindOneUserScoped(context.Background(), "user-1", "lang-pref")
+	if err != nil {
+		t.Fatalf("FindOneUserScoped: %v", err)
+	}
+	if doc == nil {
+		t.Fatal("expected document, got nil")
+	}
+	if doc.AgentID != "agent-A" {
+		t.Errorf("AgentID after agent-A overwrite: got %q, want agent-A", doc.AgentID)
+	}
+}
+
+// svcUserPrefArgs returns MemoryWriteArgs for a user-scoped preference.
+func svcUserPrefArgs(content string) memory.MemoryWriteArgs {
+	return memory.MemoryWriteArgs{
+		Content:    content,
+		Type:       memory.TypePreference,
+		Scope:      memory.ScopeUser,
+		Importance: 0.5,
+	}
+}
+
+// TestServiceUserScopeReadWorksAcrossAgents is the end-to-end regression for
+// review issue #2 (round 2): agent B writes a user memory, agent A — which
+// has never seen the memory before — must still be able to read it. Without
+// the user-keyed lookup path this fails because FindOne filters by AgentID.
+func TestServiceUserScopeReadWorksAcrossAgents(t *testing.T) {
+	t.Parallel()
+	svc, _, _ := newSvc(t)
+
+	agentB := runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-B", ThreadID: "thread-B"}
+	agentA := runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-A", ThreadID: "thread-A"}
+
+	args := memory.MemoryWriteArgs{
+		Content:    "User prefers Marathi for casual chat.",
+		Type:       memory.TypePreference,
+		Scope:      memory.ScopeUser,
+		Importance: 0.6,
+	}
+	if _, err := svc.Write(context.Background(), agentB, "lang-pref", args); err != nil {
+		t.Fatalf("agent B write: %v", err)
+	}
+
+	// Agent A — never wrote this memory — must still be able to read it.
+	read, err := svc.Read(context.Background(), agentA, memory.MemoryReadArgs{
+		MemoryID: "lang-pref",
+		Scope:    memory.ScopeUser,
+	})
+	if err != nil {
+		t.Fatalf("agent A read (cross-agent user-scoped): %v", err)
+	}
+	if read.Content != args.Content {
+		t.Errorf("Content: got %q, want %q", read.Content, args.Content)
 	}
 }
 

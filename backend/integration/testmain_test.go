@@ -68,6 +68,7 @@ type testEnv struct {
 // Both stubRuntime and scriptedRuntime satisfy this.
 type runtimeFn interface {
 	RunStream(ctx context.Context, ag *agent.Agent, runCtx agent.RunContext, events chan<- agent.StreamEvent) (*agent.RunResult, error)
+	EstimateSystemPromptTokens(ctx context.Context, ag *agent.Agent, runCtx agent.RunContext) int
 }
 
 // newTestEnv creates a fresh HTTP test server backed by a stubRuntime.
@@ -266,6 +267,12 @@ func (s *stubRuntime) RunStream(
 	}, nil
 }
 
+// EstimateSystemPromptTokens returns 0 so the message handler falls back to
+// the conservative agent.ShouldSummarize heuristic in tests.
+func (s *stubRuntime) EstimateSystemPromptTokens(_ context.Context, _ *agent.Agent, _ agent.RunContext) int {
+	return 0
+}
+
 // stubSummarizer returns immediately with a no-op summary.
 type stubSummarizer struct{}
 
@@ -321,4 +328,10 @@ func (s *scriptedRuntime) RunStream(
 	}
 	close(events)
 	return call.result, call.err
+}
+
+// EstimateSystemPromptTokens returns 0 so the message handler falls back to
+// the conservative agent.ShouldSummarize heuristic in tests.
+func (s *scriptedRuntime) EstimateSystemPromptTokens(_ context.Context, _ *agent.Agent, _ agent.RunContext) int {
+	return 0
 }

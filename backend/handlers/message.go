@@ -27,6 +27,7 @@ type messageStore interface {
 // runtimeExecutor is the subset of agent.AgentRuntime used by MessageHandler.
 type runtimeExecutor interface {
 	RunStream(ctx context.Context, ag *agent.Agent, runCtx agent.RunContext, events chan<- agent.StreamEvent) (*agent.RunResult, error)
+	EstimateSystemPromptTokens(ctx context.Context, ag *agent.Agent, runCtx agent.RunContext) int
 }
 
 // summarizeExecutor is the subset of agent.Summarizer used by MessageHandler.
@@ -141,8 +142,35 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	currentSummary := thread.Summary
 
-	if agent.ShouldSummarize(ag, currentSummary, turns) {
-		drop, keep := agent.SplitTurnsForCompaction(ag, currentSummary, turns)
+	// Use the runtime's ContextBuilder to size the system message accurately
+	// (it accounts for platform XML, tool instructions, user_preferences
+	// caps, and the context wrapper). Fall back to the static-overhead
+	// heuristic in ShouldSummarize when the runtime can't produce an
+	// estimate (e.g. in tests where the builder isn't wired).
+	estimateRunCtx := agent.RunContext{
+		ThreadID: threadID,
+		Summary:  currentSummary,
+		Memory:   runtimectx.MemoryScope{UserID: userID, AgentID: ag.ID, ThreadID: threadID},
+	}
+	sysTokens := h.runtime.EstimateSystemPromptTokens(ctx, ag, estimateRunCtx)
+	var (
+		shouldCompact bool
+		drop, keep    []agent.Turn
+	)
+	if sysTokens > 0 {
+		shouldCompact = agent.ShouldSummarizeWithSysTokens(ag, sysTokens, turns)
+	} else {
+		shouldCompact = agent.ShouldSummarize(ag, currentSummary, turns)
+	}
+
+	if shouldCompact {
+		if sysTokens > 0 {
+			// Use the builder-derived estimate so the keep budget reflects
+			// the full system message — not just summary length.
+			drop, keep = agent.SplitTurnsForCompactionWithSysTokens(ag, sysTokens, turns)
+		} else {
+			drop, keep = agent.SplitTurnsForCompaction(ag, currentSummary, turns)
+		}
 
 		if len(drop) > 0 {
 			turns = keep

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"backend/llm"
 	"backend/tools"
@@ -167,15 +168,29 @@ func newTestRuntime(lm llm.LLMClient, store CheckpointStore) (*AgentRuntime, *Ag
 	rt := &AgentRuntime{
 		llmRegistry:     llmReg,
 		toolRegistry:    toolReg,
+		contextBuilder:  newTestContextBuilder(toolReg),
 		checkpointStore: store,
 	}
 	ag := &Agent{
-		Provider: "fake",
-		Model:    "fake-model",
-		Tools:    []string{"calculator"},
-		MaxSteps: 5,
+		Provider:     "fake",
+		Model:        "fake-model",
+		Tools:        []string{"calculator"},
+		SystemPrompt: "You are a test agent.",
+		MaxSteps:     5,
 	}
 	return rt, ag
+}
+
+// newTestContextBuilder constructs a ContextBuilder that is safe for unit
+// tests: no platform XML, no memory backend. The builder skips memory and
+// preference layers when those backends are nil, so it produces a minimal but
+// well-formed system message.
+func newTestContextBuilder(toolReg *tools.ToolRegistry) *ContextBuilder {
+	return &ContextBuilder{
+		platform:     &PlatformConfig{Body: "<platform>test platform</platform>"},
+		toolRegistry: toolReg,
+		now:          func() time.Time { return time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC) },
+	}
 }
 
 func newTestRunCtx(input string) RunContext {
@@ -651,6 +666,125 @@ func TestResumeFromPreModelPhaseCallsLLMNormally(t *testing.T) {
 	}
 	if !sink.has(EventRunResumed) {
 		t.Error("want EventRunResumed emitted, not found")
+	}
+}
+
+// ── Runtime exposes the builder's system-prompt estimate ─────────────────────
+
+func TestRuntimeEstimateSystemPromptTokensDelegatesToBuilder(t *testing.T) {
+	t.Parallel()
+	rt, ag := newTestRuntime(&fakeLLM{}, nil)
+	rc := newTestRunCtx("hello")
+
+	got := rt.EstimateSystemPromptTokens(context.Background(), ag, rc)
+	if got <= 0 {
+		t.Errorf("expected a positive estimate from the wired ContextBuilder, got %d", got)
+	}
+	// And: the same call without a wired builder returns 0 so the message
+	// handler falls back to the heuristic.
+	bare := &AgentRuntime{}
+	if got := bare.EstimateSystemPromptTokens(context.Background(), ag, rc); got != 0 {
+		t.Errorf("expected 0 when contextBuilder is nil, got %d", got)
+	}
+}
+
+// ── Resumed run advances step in <state> (regression for review issue #1) ────
+
+func TestRuntimeOnResumeStateAdvancesPastSnapshotStep(t *testing.T) {
+	t.Parallel()
+	// Snapshot at step 2, with a tool message so we can also verify
+	// LastAction is reconstructed. Resume continues with another tool call
+	// then a final answer, producing two more LLM calls (step 3 and step 4).
+	snap := RunSnapshot{
+		Version: 1,
+		RunID:   "run-resume-step",
+		State: RuntimeState{
+			Messages: []llm.ChatMessage{
+				{Role: "user", Content: "compute things"},
+				{Role: "assistant", Content: "first call", ToolCalls: []llm.ToolCall{{ID: "tc-a", Name: "calculator"}}},
+				{Role: "tool", ToolCallID: "tc-a", Content: "Result: 1",
+					Metadata: map[string]any{"tool_name": "calculator", "is_error": false}},
+			},
+			StepsCompleted: 2,
+			MaxSteps:       10,
+			ToolFailures:   map[string]int{},
+		},
+		Meta: SnapshotMeta{Phase: PhasePreModel, ToolsUsed: []string{"calculator"}},
+	}
+
+	lm := &fakeLLM{
+		replies: []fakeReply{
+			toolCallReply("calculator", "tc-b", json.RawMessage(`{"expression":"2+2"}`)),
+			textReply("done"),
+		},
+	}
+	rt, ag := newTestRuntime(lm, nil)
+	ag.MaxSteps = 10
+
+	runCtx := newTestRunCtx("")
+	runCtx.RunID = "run-resume-step"
+	runCtx.Checkpoint = &snap
+
+	if _, err := rt.runInternal(context.Background(), ag, runCtx, &captureEventSink{}); err != nil {
+		t.Fatalf("runInternal: %v", err)
+	}
+	if lm.callCount() != 2 {
+		t.Fatalf("expected 2 LLM calls on resume, got %d", lm.callCount())
+	}
+
+	first := lm.calls[0].Messages[0].Content
+	second := lm.calls[1].Messages[0].Content
+
+	// First call after resume: state must reflect step 2 (snapshot value),
+	// AND LastAction must be reconstructed from the snapshot tool message.
+	if !strings.Contains(first, "step: 2/") {
+		t.Errorf("first resumed call should report step 2, got:\n%s", first)
+	}
+	if !strings.Contains(first, "last_action: calculator → success") {
+		t.Errorf("first resumed call should reconstruct LastAction, got:\n%s", first)
+	}
+	// Second call: step must advance past snapshot value.
+	if !strings.Contains(second, "step: 3/") {
+		t.Errorf("second resumed call should report step 3 (advanced past snapshot), got:\n%s", second)
+	}
+}
+
+// ── Dynamic state refresh between LLM calls (regression for review issue #1) ─
+
+func TestRuntimeRefreshesStateBetweenLLMCalls(t *testing.T) {
+	t.Parallel()
+	// First reply: a tool call. Second reply: a final answer.
+	lm := &fakeLLM{
+		replies: []fakeReply{
+			toolCallReply("calculator", "tc-1", json.RawMessage(`{"expression":"1+1"}`)),
+			textReply("done"),
+		},
+	}
+	rt, ag := newTestRuntime(lm, nil)
+	runCtx := newTestRunCtx("compute 1+1")
+
+	if _, err := rt.Run(context.Background(), ag, runCtx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if lm.callCount() != 2 {
+		t.Fatalf("expected 2 LLM calls, got %d", lm.callCount())
+	}
+
+	first := lm.calls[0].Messages[0].Content
+	second := lm.calls[1].Messages[0].Content
+
+	if !strings.Contains(first, "step: 0/") {
+		t.Errorf("first call should report step 0, content:\n%s", first)
+	}
+	if !strings.Contains(second, "step: 1/") {
+		t.Errorf("second call should report step 1, content:\n%s", second)
+	}
+	// last_action must appear only after a tool has executed.
+	if strings.Contains(first, "last_action") {
+		t.Errorf("first call should not yet have last_action: %s", first)
+	}
+	if !strings.Contains(second, "last_action: calculator → success") {
+		t.Errorf("second call should report last_action: calculator → success, got:\n%s", second)
 	}
 }
 

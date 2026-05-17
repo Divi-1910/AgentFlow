@@ -79,6 +79,12 @@ func (f *fakeRuntime) RunStream(ctx context.Context, ag *agent.Agent, runCtx age
 	return &agent.RunResult{Output: "ok", Steps: 1}, nil
 }
 
+// EstimateSystemPromptTokens returns 0 so the message handler falls back to
+// the conservative agent.ShouldSummarize heuristic in tests.
+func (f *fakeRuntime) EstimateSystemPromptTokens(_ context.Context, _ *agent.Agent, _ agent.RunContext) int {
+	return 0
+}
+
 // ── fakeSummarizer ────────────────────────────────────────────────────────────
 
 type fakeSummarizer struct{}

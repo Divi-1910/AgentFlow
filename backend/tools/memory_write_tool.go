@@ -38,6 +38,7 @@ func (t *MemoryWriteTool) Definition() llm.ToolDefinition {
 			},
 			"required": ["content", "type", "scope", "importance"]
 		}`),
+		Instructions: "Use memory_write when the user states a durable preference, fact, or decision that should outlast the current turn. Pick the narrowest scope: thread for things tied to this conversation, agent for things across this user's chats with you, user for cross-agent preferences. Start the content with a one-line summary — it becomes the preview in <memories><index>. Set ttl_days for facts that go stale (deadlines, on-call rotations); omit it for stable preferences. Before overwriting an existing memory ID, call memory_read first.",
 	}
 }
 

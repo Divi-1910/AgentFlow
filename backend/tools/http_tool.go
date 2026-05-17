@@ -77,6 +77,7 @@ func (t *HTTPTool) Definition() llm.ToolDefinition {
 			},
 			"required": ["method", "url"]
 		}`),
+		Instructions: "Use http_request only for endpoints the user explicitly named or that you derived from a known integration. Prefer GET for reads; for any mutating method (POST/PUT/PATCH/DELETE) confirm with the user in the same turn before calling. Always include an Accept or Content-Type header that matches what the endpoint expects, and never pass user-supplied tokens in the URL — put them in headers.",
 	}
 }
 

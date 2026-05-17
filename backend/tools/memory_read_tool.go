@@ -33,6 +33,7 @@ func (t *MemoryReadTool) Definition() llm.ToolDefinition {
 			},
 			"required": ["memory_id", "scope"]
 		}`),
+		Instructions: "Use memory_read to fetch the full body of a memory you have already seen in <memories><index>. Always call memory_read before any memory_write that overwrites an existing memory ID — writes without a recent read are rejected. Do not call memory_read for user-scoped memories that already appear in <user_preferences> in full.",
 	}
 }
 

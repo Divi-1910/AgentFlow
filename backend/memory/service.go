@@ -100,8 +100,17 @@ func (s *Service) Write(ctx context.Context, execScope runtimectx.MemoryScope, m
 	}
 
 	// ── Read-before-write guardrail ───────────────────────────────────────────
+	// User-scope memories are keyed by (user_id, memory_id) across all agents,
+	// so the existence check has to use FindOneUserScoped — otherwise an
+	// agent that has never touched a user memory can blindly overwrite a
+	// memory written by another agent for the same user.
 	now := time.Now().UTC()
-	existing, err := s.meta.FindOne(ctx, execScope.AgentID, args.Scope, memoryID)
+	var existing *MemoryDocument
+	if args.Scope == ScopeUser {
+		existing, err = s.meta.FindOneUserScoped(ctx, execScope.UserID, memoryID)
+	} else {
+		existing, err = s.meta.FindOne(ctx, execScope.AgentID, args.Scope, memoryID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("memory: meta lookup: %w", err)
 	}
@@ -137,6 +146,7 @@ func (s *Service) Write(ctx context.Context, execScope runtimectx.MemoryScope, m
 		Importance: importance,
 		CreatedAt:  createdAt,
 		ExpiresAt:  expiresAt,
+		Summary:    extractSummary(body),
 		Body:       body,
 	}
 
@@ -170,6 +180,10 @@ func (s *Service) Write(ctx context.Context, execScope runtimectx.MemoryScope, m
 // Read fetches a memory document's metadata from MongoDB and its content from
 // disk. On success it stamps last_read_at in MongoDB (best-effort: a stamp
 // failure is logged but never surfaces to the caller).
+//
+// For ScopeUser the lookup is user-keyed, so a user-scoped memory written by
+// any agent for the same user is readable. For ScopeAgent / ScopeThread the
+// lookup is agent-keyed as before.
 func (s *Service) Read(ctx context.Context, execScope runtimectx.MemoryScope, args MemoryReadArgs) (*ReadResult, error) {
 	if err := validateExecutionScope(execScope); err != nil {
 		return nil, err
@@ -181,7 +195,13 @@ func (s *Service) Read(ctx context.Context, execScope runtimectx.MemoryScope, ar
 		return nil, err
 	}
 
-	doc, err := s.meta.FindOne(ctx, execScope.AgentID, args.Scope, args.MemoryID)
+	var doc *MemoryDocument
+	var err error
+	if args.Scope == ScopeUser {
+		doc, err = s.meta.FindOneUserScoped(ctx, execScope.UserID, args.MemoryID)
+	} else {
+		doc, err = s.meta.FindOne(ctx, execScope.AgentID, args.Scope, args.MemoryID)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("memory: meta lookup: %w", err)
 	}
@@ -192,6 +212,10 @@ func (s *Service) Read(ctx context.Context, execScope runtimectx.MemoryScope, ar
 		return nil, ErrExpiredMemory
 	}
 
+	// For ScopeUser, the on-disk path depends only on user_id, so we can
+	// reuse the resolver with the execScope (which has the calling user's
+	// id). For other scopes the execScope already names the right agent /
+	// thread that resolves the path.
 	path, err := ResolveReadPath(s.cfg.Root, execScope, args.Scope, args.MemoryID)
 	if err != nil {
 		return nil, err
@@ -203,12 +227,51 @@ func (s *Service) Read(ctx context.Context, execScope runtimectx.MemoryScope, ar
 	doc.Body = strings.TrimSpace(string(data))
 
 	// Stamp last_read_at — enables subsequent writes within the window.
-	if stampErr := s.meta.StampRead(ctx, execScope.AgentID, args.Scope, args.MemoryID); stampErr != nil {
+	// For ScopeUser we stamp the record's actual writer-agent so the stamp
+	// targets the right Mongo document.
+	stampAgent := execScope.AgentID
+	if args.Scope == ScopeUser {
+		stampAgent = doc.AgentID
+	}
+	if stampErr := s.meta.StampRead(ctx, stampAgent, args.Scope, args.MemoryID); stampErr != nil {
 		slog.Warn("memory: failed to stamp last_read_at", "error", stampErr,
-			"agent_id", execScope.AgentID, "scope", args.Scope, "memory_id", args.MemoryID)
+			"agent_id", stampAgent, "scope", args.Scope, "memory_id", args.MemoryID)
 	}
 
 	return toReadResult(*doc), nil
+}
+
+// ReadByMeta reads the on-disk body for an already-discovered metadata
+// record. It bypasses the metadata FindOne lookup that Read performs (which
+// scopes by execScope.AgentID) and does NOT stamp last_read_at — it is
+// intended for context-injection paths where the caller already has the
+// document via FindActive and wants the body without affecting read-window
+// semantics.
+//
+// In particular, this is the path the ContextBuilder uses to materialise
+// user-scoped memories: those records may have been written by any agent for
+// the same user, so the current run's AgentID must not gate access to them.
+func (s *Service) ReadByMeta(_ context.Context, doc MemoryDocument) (string, error) {
+	if err := validateSegment("memory_id", doc.ID); err != nil {
+		return "", err
+	}
+	if !validScope(doc.Scope) {
+		return "", ErrInvalidScope
+	}
+	docScope := runtimectx.MemoryScope{
+		UserID:   doc.UserID,
+		AgentID:  doc.AgentID,
+		ThreadID: doc.ThreadID,
+	}
+	path, err := ResolveReadPath(s.cfg.Root, docScope, doc.Scope, doc.ID)
+	if err != nil {
+		return "", err
+	}
+	data, err := ReadFileLimited(path, s.cfg.MaxFileBytes)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 // Search finds memory documents whose body content matches the ripgrep pattern.
@@ -356,6 +419,30 @@ func snippetAroundLine(body string, absoluteLine int) string {
 		snippet += "\n..."
 	}
 	return snippet
+}
+
+// extractSummary returns a short preview of body for the memory index:
+// the first non-empty line, with leading markdown heading markers stripped,
+// capped at SummaryMaxChars runes (with an ellipsis if truncated). Operates
+// on []rune so multi-byte UTF-8 sequences are never split mid-rune.
+func extractSummary(body string) string {
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		trimmed = strings.TrimLeft(trimmed, "#")
+		trimmed = strings.TrimSpace(trimmed)
+		if trimmed == "" {
+			continue
+		}
+		r := []rune(trimmed)
+		if len(r) > SummaryMaxChars {
+			return string(r[:SummaryMaxChars-1]) + "…"
+		}
+		return trimmed
+	}
+	return ""
 }
 
 func toReadResult(doc MemoryDocument) *ReadResult {

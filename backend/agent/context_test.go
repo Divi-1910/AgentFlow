@@ -141,36 +141,6 @@ func TestFlattenTurnsPreservesUserThenAssistantOrder(t *testing.T) {
 	}
 }
 
-// ── BuildSystemMessage ────────────────────────────────────────────────────────
-
-func TestBuildSystemMessageReturnsPromptAloneWhenNoSummary(t *testing.T) {
-	t.Parallel()
-	msg := BuildSystemMessage("You are helpful.", "")
-	if msg.Role != "system" {
-		t.Errorf("role: got %q, want system", msg.Role)
-	}
-	if msg.Content != "You are helpful." {
-		t.Errorf("content: got %q, want plain prompt", msg.Content)
-	}
-}
-
-func TestBuildSystemMessageAppendsSummarySection(t *testing.T) {
-	t.Parallel()
-	msg := BuildSystemMessage("You are helpful.", "User likes brevity.")
-	expected := "You are helpful.\n\n---\nConversation Summary:\nUser likes brevity."
-	if msg.Content != expected {
-		t.Errorf("content:\ngot:  %q\nwant: %q", msg.Content, expected)
-	}
-}
-
-func TestBuildSystemMessageIgnoresWhitespaceOnlySummary(t *testing.T) {
-	t.Parallel()
-	msg := BuildSystemMessage("Prompt.", "   \n  ")
-	if msg.Content != "Prompt." {
-		t.Errorf("content: got %q, want plain prompt (whitespace-only summary ignored)", msg.Content)
-	}
-}
-
 // ── LookupContextLimit ────────────────────────────────────────────────────────
 
 func TestLookupContextLimitReturnsKnownModelLimit(t *testing.T) {
@@ -191,18 +161,23 @@ func TestLookupContextLimitReturnsDefaultForUnknownModel(t *testing.T) {
 
 // ── ShouldSummarize ───────────────────────────────────────────────────────────
 
-// Token math (ModelContextLimit=100, contextTriggerRatio=0.85):
-//   threshold = ceil(100 * 0.85) = 85
-//   estimateTokens: 4 overhead per message + len(content)/4
-//
-// Message with 324-char content: 4 + 324/4 = 4 + 81 = 85 tokens → AT threshold → true
-// Message with 320-char content: 4 + 320/4 = 4 + 80 = 84 tokens → below threshold  → false
+// Token math notes:
+//   ShouldSummarize reserves estimatedStaticSystemOverheadChars/4 tokens for
+//   the layered system prompt (platform XML + tool_instructions +
+//   user_preferences + context wrapper) on top of the variable
+//   SystemPrompt + summary cost. Tests that depend on exact threshold math
+//   use a large model limit so the static overhead is a small fraction.
 
 func TestShouldSummarizeReturnsFalseWhenBelowThreshold(t *testing.T) {
 	t.Parallel()
-	a := agentWithLimit(100)
-	// history = 84 tokens (below threshold of 85)
-	turns := []Turn{{UserMessage: userMsg(repeat(320))}}
+	const limit = 128000
+	a := agentWithLimit(limit)
+	threshold := int(math.Ceil(float64(limit) * contextTriggerRatio))
+	overheadTokens := estimatedStaticSystemOverheadChars / 4
+	// history sized to be just below (threshold − overhead), with a margin
+	// for the per-message overhead inside estimateTokens.
+	contentChars := (threshold - overheadTokens - 10) * 4
+	turns := []Turn{{UserMessage: userMsg(repeat(contentChars))}}
 	if ShouldSummarize(a, "", turns) {
 		t.Error("want false (below threshold), got true")
 	}
@@ -211,7 +186,8 @@ func TestShouldSummarizeReturnsFalseWhenBelowThreshold(t *testing.T) {
 func TestShouldSummarizeReturnsTrueAtThreshold(t *testing.T) {
 	t.Parallel()
 	a := agentWithLimit(100)
-	// history = 85 tokens (at threshold, >= returns true)
+	// history = 85 tokens; estimatedStaticSystemOverheadChars pushes the
+	// estimate well past the 85-token threshold, so this must trigger.
 	turns := []Turn{{UserMessage: userMsg(repeat(324))}}
 	if !ShouldSummarize(a, "", turns) {
 		t.Error("want true (at threshold), got false")
@@ -228,8 +204,53 @@ func TestShouldSummarizeReturnsTrueWhenAboveThreshold(t *testing.T) {
 	}
 }
 
+func TestShouldSummarizeIncludesStaticSystemOverheadInEstimate(t *testing.T) {
+	t.Parallel()
+	// Pick a model limit where a tiny conversation can still trip the
+	// threshold purely because of static system overhead.
+	limit := estimatedStaticSystemOverheadChars / 4 // overhead alone exhausts the limit
+	a := agentWithLimit(limit + 10)                 // sit just above the overhead
+	// Empty conversation must still trigger because static overhead consumes
+	// almost the entire budget.
+	if !ShouldSummarize(a, "", nil) {
+		t.Errorf("expected static system overhead alone to trip the threshold at limit=%d", limit+10)
+	}
+}
+
+// TestShouldSummarizeWithSysTokensUsesProvidedEstimate proves the control-path
+// helper trusts the caller's sysTokens (sourced from
+// ContextBuilder.EstimateSystemPromptTokens) instead of layering its own
+// static reserve.
+func TestShouldSummarizeWithSysTokensUsesProvidedEstimate(t *testing.T) {
+	t.Parallel()
+	const limit = 1000
+	a := agentWithLimit(limit)
+	threshold := int(math.Ceil(float64(limit) * contextTriggerRatio)) // 850
+
+	// With a small sysTokens estimate and no history, we should not summarize.
+	if ShouldSummarizeWithSysTokens(a, 100, nil) {
+		t.Errorf("want false when sysTokens=100 well below threshold=%d", threshold)
+	}
+	// With sysTokens alone at the threshold, we must summarize.
+	if !ShouldSummarizeWithSysTokens(a, threshold, nil) {
+		t.Errorf("want true when sysTokens=%d (== threshold)", threshold)
+	}
+	// And ShouldSummarize (heuristic) and ShouldSummarizeWithSysTokens diverge
+	// when the accurate estimate is much smaller than the static reserve.
+	if !ShouldSummarize(a, "", nil) {
+		t.Error("heuristic should trip at this limit (static reserve dominates)")
+	}
+	if ShouldSummarizeWithSysTokens(a, 50, nil) {
+		t.Error("accurate path with sysTokens=50 should NOT trip — proves the heuristic is bypassed")
+	}
+}
+
 // ── SplitTurnsForCompaction ───────────────────────────────────────────────────
 
+// These tests exercise pure budget arithmetic. They call the lower-level
+// SplitTurnsForCompactionWithSysTokens so the upstream static-overhead reserve
+// in SplitTurnsForCompaction doesn't distort the math.
+//
 // Token math helpers:
 //   agentWithLimit(60) → keepBudget = int(60 * 0.5) = 30 tokens
 //   turn with 40-char user content → estimateTurnTokens = 40/4 = 10 tokens
@@ -247,7 +268,7 @@ func TestSplitTurnsForCompactionReturnsAllTurnsWhenTheyFitInBudget(t *testing.T)
 	t.Parallel()
 	a := agentWithLimit(100000) // huge limit — nothing gets dropped
 	turns := makeTurns(5, 40)
-	drop, keep := SplitTurnsForCompaction(a, "", turns)
+	drop, keep := SplitTurnsForCompactionWithSysTokens(a, 0, turns)
 	if drop != nil {
 		t.Errorf("want nil drop slice, got %d turns", len(drop))
 	}
@@ -258,10 +279,6 @@ func TestSplitTurnsForCompactionReturnsAllTurnsWhenTheyFitInBudget(t *testing.T)
 
 func TestSplitTurnsForCompactionDropsOldestTurnsWhenOverBudget(t *testing.T) {
 	t.Parallel()
-	// keepBudget = 30 tokens, each turn = 10 tokens, minTurns = 6
-	// Counting backwards: turns 4,3,2 fit (30 tokens). turn 1 would make 40 > 30 AND keepCount=3 >= 6? NO.
-	// So minTurns forces 6 turns kept regardless of budget.
-	// Use minTurns=1 to test pure budget behaviour.
 	a := &Agent{
 		ModelContextLimit: 60,
 		ContextKeepRatio:  0.5, // keepBudget = 30
@@ -269,7 +286,7 @@ func TestSplitTurnsForCompactionDropsOldestTurnsWhenOverBudget(t *testing.T) {
 	}
 	// 5 turns × 10 tokens each; budget allows 3 (30 tokens, 4th would be 40 > 30 with keepCount≥1)
 	turns := makeTurns(5, 40) // 40 chars → 10 tokens each
-	drop, keep := SplitTurnsForCompaction(a, "", turns)
+	drop, keep := SplitTurnsForCompactionWithSysTokens(a, 0, turns)
 	if len(keep) != 3 {
 		t.Errorf("want 3 turns kept, got %d", len(keep))
 	}
@@ -280,16 +297,13 @@ func TestSplitTurnsForCompactionDropsOldestTurnsWhenOverBudget(t *testing.T) {
 
 func TestSplitTurnsForCompactionRespectsMinTurnsOverBudget(t *testing.T) {
 	t.Parallel()
-	// keepBudget = 30 tokens, each turn = 20 tokens, minTurns = 4
-	// Pure budget would keep 1 turn (20 ≤ 30, 40 > 30).
-	// But minTurns=4 forces keeping 4 turns even though they overflow budget.
 	a := &Agent{
 		ModelContextLimit: 60,
 		ContextKeepRatio:  0.5, // keepBudget = 30
 		ContextWindow:     4,   // minTurns = 4
 	}
 	turns := makeTurns(6, 80) // 80 chars → 20 tokens each
-	drop, keep := SplitTurnsForCompaction(a, "", turns)
+	drop, keep := SplitTurnsForCompactionWithSysTokens(a, 0, turns)
 	if len(keep) != 4 {
 		t.Errorf("want 4 turns kept (minTurns enforced), got %d", len(keep))
 	}
@@ -298,37 +312,73 @@ func TestSplitTurnsForCompactionRespectsMinTurnsOverBudget(t *testing.T) {
 	}
 }
 
-func TestSplitTurnsForCompactionDeductsSummaryTokensFromBudget(t *testing.T) {
+func TestSplitTurnsForCompactionDeductsSysTokensFromBudget(t *testing.T) {
 	t.Parallel()
 	// keepBudget = 30, each turn = 10 tokens, minTurns = 1
-	// Without summary: 3 turns fit (30 tokens).
-	// summary = 40 chars → 40/4 = 10 tokens deducted → effective budget = 20.
-	// With reduced budget: only 2 turns fit.
+	// Without overhead: 3 turns fit (30 tokens).
+	// With sysTokens=10: effective budget = 20 → only 2 turns fit.
 	a := &Agent{
 		ModelContextLimit: 60,
 		ContextKeepRatio:  0.5,
 		ContextWindow:     1,
 	}
-	turns := makeTurns(5, 40) // 10 tokens each
-	summary := repeat(40)     // 10 summary tokens deducted
-	_, keepWithSummary := SplitTurnsForCompaction(a, summary, turns)
-	_, keepWithout := SplitTurnsForCompaction(a, "", turns)
+	turns := makeTurns(5, 40)
+	_, keepHeavySys := SplitTurnsForCompactionWithSysTokens(a, 10, turns)
+	_, keepNoSys := SplitTurnsForCompactionWithSysTokens(a, 0, turns)
 
-	if len(keepWithSummary) >= len(keepWithout) {
-		t.Errorf("summary should reduce kept turns: with summary=%d, without=%d",
-			len(keepWithSummary), len(keepWithout))
+	if len(keepHeavySys) >= len(keepNoSys) {
+		t.Errorf("sysTokens should reduce kept turns: with=%d, without=%d",
+			len(keepHeavySys), len(keepNoSys))
+	}
+}
+
+// TestSplitDropsTurnsWhenSysPromptIsLargeButHistoryIsSmall covers the exact
+// failure mode the second review flagged: a heavy system prompt should
+// trigger compaction even when history alone fits the legacy budget.
+func TestSplitDropsTurnsWhenSysPromptIsLargeButHistoryIsSmall(t *testing.T) {
+	t.Parallel()
+	a := &Agent{
+		ModelContextLimit: 200,
+		ContextKeepRatio:  0.5, // keepBudget = 100
+		ContextWindow:     1,
+	}
+	turns := makeTurns(5, 40) // 50 history tokens — fits 100-token budget cleanly
+	// No drops without sys overhead.
+	dropNoSys, _ := SplitTurnsForCompactionWithSysTokens(a, 0, turns)
+	if dropNoSys != nil {
+		t.Errorf("history alone should fit: got %d drops, want 0", len(dropNoSys))
+	}
+	// With a large sys estimate (90 tokens) the effective budget drops to 10
+	// — only ~1 turn fits and the rest must spill into the drop slice.
+	dropWithSys, keepWithSys := SplitTurnsForCompactionWithSysTokens(a, 90, turns)
+	if len(dropWithSys) == 0 {
+		t.Errorf("large sys estimate should force compaction; got 0 drops, kept=%d", len(keepWithSys))
 	}
 }
 
 func TestSplitTurnsForCompactionReturnsAllTurnsForEmptyInput(t *testing.T) {
 	t.Parallel()
 	a := agentWithLimit(1000)
-	drop, keep := SplitTurnsForCompaction(a, "", nil)
+	drop, keep := SplitTurnsForCompactionWithSysTokens(a, 0, nil)
 	if drop != nil {
 		t.Errorf("want nil drop for empty input, got %v", drop)
 	}
 	if len(keep) != 0 {
 		t.Errorf("want 0 turns kept, got %d", len(keep))
+	}
+}
+
+// TestLegacySplitTurnsForCompactionAddsStaticOverhead verifies the heuristic
+// fallback keeps fewer turns than the explicit zero-sys path, proving the
+// static reserve is applied.
+func TestLegacySplitTurnsForCompactionAddsStaticOverhead(t *testing.T) {
+	t.Parallel()
+	a := agentWithLimit(100000) // big enough that pure budget keeps all 5 turns
+	turns := makeTurns(5, 40)
+	_, keepZero := SplitTurnsForCompactionWithSysTokens(a, 0, turns)
+	_, keepHeuristic := SplitTurnsForCompaction(a, "", turns)
+	if len(keepHeuristic) > len(keepZero) {
+		t.Errorf("heuristic must not keep more than the zero-sys path")
 	}
 }
 

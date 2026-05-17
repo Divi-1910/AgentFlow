@@ -47,6 +47,10 @@ type ToolDefinition struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	Parameters  json.RawMessage `json:"parameters"`
+	// Instructions are usage hints for the model (e.g. "always set expiry").
+	// They are injected into the system prompt by the ContextBuilder, not sent
+	// to the LLM as part of the tool schema, hence json:"-".
+	Instructions string `json:"-"`
 }
 
 type ToolCall struct {

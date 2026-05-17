@@ -50,6 +50,7 @@ func (t *WebSearchTool) Definition() llm.ToolDefinition {
 			},
 			"required": ["query"]
 		}`),
+		Instructions: "Use web_search for facts that depend on current events, recent prices, news, or anything the date in <context><state> suggests is time-sensitive. Use specific, well-scoped queries — proper nouns, exact phrases, dates — rather than full questions. Default max_results to 3-5; only raise it when an initial search returns thin results. Cite the source URL in your reply when you use a web search result as the basis for a factual claim.",
 	}
 }
 

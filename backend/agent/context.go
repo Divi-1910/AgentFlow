@@ -1,9 +1,7 @@
 package agent
 
 import (
-	"fmt"
 	"math"
-	"strings"
 
 	"backend/llm"
 )
@@ -106,27 +104,61 @@ func FlattenTurns(turns []Turn) []llm.ChatMessage {
 	return msgs
 }
 
-func BuildSystemMessage(systemPrompt, summary string) llm.ChatMessage {
-	content := systemPrompt
-	if strings.TrimSpace(summary) != "" {
-		content = fmt.Sprintf("%s\n\n---\nConversation Summary:\n%s", systemPrompt, summary)
-	}
-	return llm.ChatMessage{Role: "system", Content: content}
+// estimatedStaticSystemOverheadChars is the FALLBACK reserve used by
+// ShouldSummarize when the caller does not have access to a ContextBuilder.
+// It is intentionally conservative: better to summarize a turn early than
+// to overflow the model's context. Callers that do have a builder should
+// prefer ShouldSummarizeWithSysTokens with the builder's accurate estimate.
+const estimatedStaticSystemOverheadChars = 12000 // ~3000 tokens
+
+// ShouldSummarize is the heuristic fallback for summarization triggering:
+// it uses a fixed conservative reserve for the layered system message
+// because it has no access to the runtime's ContextBuilder.
+//
+// In the control path the message handler calls ShouldSummarizeWithSysTokens
+// with a builder-derived estimate. This function remains for callers that
+// cannot reach the runtime.
+func ShouldSummarize(a *Agent, summary string, turns []Turn) bool {
+	sysTokens := (len(a.SystemPrompt) + len(summary) + estimatedStaticSystemOverheadChars) / 4
+	return ShouldSummarizeWithSysTokens(a, sysTokens, turns)
 }
 
-func ShouldSummarize(a *Agent, summary string, turns []Turn) bool {
+// ShouldSummarizeWithSysTokens returns true when the run is approaching the
+// model's context window. sysTokens is the caller's best estimate of the
+// system message size in tokens (typically from
+// ContextBuilder.EstimateSystemPromptTokens). This avoids the fixed-overhead
+// approximation in ShouldSummarize and is the accurate input to compaction.
+func ShouldSummarizeWithSysTokens(a *Agent, sysTokens int, turns []Turn) bool {
 	modelLimit := resolveContextLimit(a)
 	threshold := int(math.Ceil(float64(modelLimit) * contextTriggerRatio))
-
-	sysMsg := BuildSystemMessage(a.SystemPrompt, summary)
-	sysTokens := len(sysMsg.Content) / 4
-
 	historyTokens := estimateTokens(FlattenTurns(turns))
-
 	return sysTokens+historyTokens >= threshold
 }
 
+// SplitTurnsForCompaction is the heuristic fallback used when the caller
+// does not have a sys-token estimate. It approximates the static system
+// overhead by subtracting only the summary tokens from the keep budget.
+//
+// In the control path, prefer SplitTurnsForCompactionWithSysTokens so the
+// keep budget reflects the full assembled system message — that is the
+// only way to drop turns when the prompt is heavy on platform/tool/memory
+// content and the history is otherwise modest.
 func SplitTurnsForCompaction(a *Agent, summary string, turns []Turn) (drop, keep []Turn) {
+	sysTokens := len(summary)/4 + estimatedStaticSystemOverheadChars/4
+	return SplitTurnsForCompactionWithSysTokens(a, sysTokens, turns)
+}
+
+// SplitTurnsForCompactionWithSysTokens selects which turns to keep so that
+// the rendered system message plus the kept history fits inside the
+// configured keep budget. sysTokens is the builder-derived estimate of the
+// full system message (platform + agent + tool_instructions +
+// user_preferences + context).
+//
+// The function preserves the minimum-turns floor (a.ContextWindow) — turns
+// inside that floor are never dropped even if the budget is exceeded, so
+// the model always sees recent context. It is the caller's responsibility
+// to handle hard overflow above the floor.
+func SplitTurnsForCompactionWithSysTokens(a *Agent, sysTokens int, turns []Turn) (drop, keep []Turn) {
 	if len(turns) == 0 {
 		return nil, turns
 	}
@@ -138,9 +170,7 @@ func SplitTurnsForCompaction(a *Agent, summary string, turns []Turn) (drop, keep
 		keepRatio = DefaultContextKeepRatio
 	}
 	keepBudget := int(float64(modelLimit) * keepRatio)
-
-	summaryTokens := len(summary) / 4
-	keepBudget -= summaryTokens
+	keepBudget -= sysTokens
 	if keepBudget < 0 {
 		keepBudget = 0
 	}

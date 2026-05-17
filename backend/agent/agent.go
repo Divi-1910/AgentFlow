@@ -53,6 +53,21 @@ type RunContext struct {
 	Checkpoint *RunSnapshot
 	Memory     runtimectx.MemoryScope
 	Logger     *slog.Logger
+
+	// Phase reflects the runtime execution phase (PhasePreModel,
+	// PhasePostModel, PhaseStepCompleted). Surfaced to the model inside
+	// <context><state>.
+	Phase string
+
+	// LastAction is a short human-readable description of the most recent
+	// tool execution outcome, e.g. "memory_write(id=user-tone) → success".
+	// Surfaced to the model inside <context><state>.
+	LastAction string
+
+	// StepsCompleted is the number of agent loop steps completed before this
+	// invocation. Zero for fresh runs; copied from the checkpoint snapshot
+	// for resumes. Surfaced to the model inside <context><state>.
+	StepsCompleted int
 }
 
 type RunResult struct {

@@ -35,6 +35,7 @@ func (t *MemorySearchTool) Definition() llm.ToolDefinition {
 			},
 			"required": ["pattern", "scope"]
 		}`),
+		Instructions: "Use memory_search to find older memories that are not in <memories><index>. Prefer short literal patterns (a name, a keyword) over phrases. The result returns snippets only — follow up with memory_read(id) to get the full content of a hit. Pick the broadest scope you need: user covers everything visible, agent skips user-level, thread is just this conversation.",
 	}
 }
 

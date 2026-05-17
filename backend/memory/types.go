@@ -63,8 +63,16 @@ type MemoryDocument struct {
 	CreatedAt  time.Time
 	ExpiresAt  *time.Time
 	LastReadAt *time.Time
-	Body       string // populated only after reading the file
+	// Summary is a short preview (first non-empty stripped line of the body,
+	// capped at SummaryMaxChars). Stored in the metadata so the ContextBuilder
+	// can render <memories><index> entries without per-request file I/O.
+	Summary string
+	Body    string // populated only after reading the file
 }
+
+// SummaryMaxChars caps the length of the Summary preview stored alongside
+// memory metadata.
+const SummaryMaxChars = 200
 
 // MetaStore is the persistence interface for memory metadata.
 // The concrete implementation stores records in MongoDB.
@@ -78,6 +86,12 @@ type MetaStore interface {
 	// FindOne returns the metadata record for (agentID, scope, memoryID),
 	// or (nil, nil) when no record exists.
 	FindOne(ctx context.Context, agentID, scope, memoryID string) (*MemoryDocument, error)
+
+	// FindOneUserScoped returns the user-scoped record for (userID, memoryID),
+	// regardless of which agent originally wrote it. ScopeUser memories are
+	// reachable across agents for the same user, so reads must not gate on
+	// the current run's AgentID. Returns (nil, nil) when no record exists.
+	FindOneUserScoped(ctx context.Context, userID, memoryID string) (*MemoryDocument, error)
 
 	// FindActive returns all non-expired metadata records visible within the
 	// given searchScope, honouring the scope-expansion rules:
