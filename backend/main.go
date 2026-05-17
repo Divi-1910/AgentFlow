@@ -102,7 +102,14 @@ func main() {
 
 	llmRegistry := llm.NewLLMRegistry()
 
-	memorySvc, err := memory.NewServiceFromEnv()
+	memoryMetaCol := db.GetCollection(dbName, "memory_meta")
+	memoryMetaRepo := repository.NewMemoryMetaRepo(memoryMetaCol)
+	if err := memoryMetaRepo.EnsureIndexes(context.Background()); err != nil {
+		slog.Error("failed to create memory meta indexes", "error", err)
+		os.Exit(1)
+	}
+
+	memorySvc, err := memory.NewServiceFromEnv(memoryMetaRepo)
 	if err != nil {
 		slog.Error("failed to initialize memory service", "error", err)
 		os.Exit(1)

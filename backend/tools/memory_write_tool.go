@@ -59,6 +59,9 @@ func (t *MemoryWriteTool) Execute(ctx context.Context, call ToolCall) (*ToolResu
 
 	result, err := t.service.Write(ctx, scope, memoryID, input)
 	if err != nil {
+		if errors.Is(err, memory.ErrReadBeforeWrite) {
+			return toolJSONError(errors.New("Read this file using memory_read : Before making a write"))
+		}
 		if isMemoryArgError(err) {
 			return nil, fmt.Errorf("%w: %s", ErrInvalidArgs, err.Error())
 		}

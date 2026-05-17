@@ -8,6 +8,8 @@ import (
 	"backend/runtimectx"
 )
 
+// ResolveWritePath derives the filesystem path for a memory document.
+// Path structure: {root}/{user_id}/{scope}[/{scope_id}]/{memory_id}.md
 func ResolveWritePath(root string, scope runtimectx.MemoryScope, requestedScope, memoryID string) (string, error) {
 	if err := validateExecutionScope(scope); err != nil {
 		return "", err
@@ -31,73 +33,13 @@ func ResolveWritePath(root string, scope runtimectx.MemoryScope, requestedScope,
 	}
 }
 
+// ResolveReadPath is an alias for ResolveWritePath — the read and write paths
+// for a memory document are identical.
 func ResolveReadPath(root string, scope runtimectx.MemoryScope, requestedScope, memoryID string) (string, error) {
 	return ResolveWritePath(root, scope, requestedScope, memoryID)
 }
 
-func ResolveSearchRoots(root string, scope runtimectx.MemoryScope, requestedScope string) ([]string, error) {
-	if err := validateExecutionScope(scope); err != nil {
-		return nil, err
-	}
-	if !validScope(requestedScope) {
-		return nil, ErrInvalidScope
-	}
-
-	threadRoot := filepath.Join(root, scope.UserID, ScopeThread, scope.ThreadID)
-	agentRoot := filepath.Join(root, scope.UserID, ScopeAgent, scope.AgentID)
-	userRoot := filepath.Join(root, scope.UserID, ScopeUser)
-
-	switch requestedScope {
-	case ScopeThread:
-		return []string{threadRoot}, nil
-	case ScopeAgent:
-		return []string{agentRoot, threadRoot}, nil
-	case ScopeUser:
-		return []string{userRoot, agentRoot, threadRoot}, nil
-	default:
-		return nil, ErrInvalidScope
-	}
-}
-
-func ValidateDocumentPath(root, path string, doc MemoryDocument) error {
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidDocument, err)
-	}
-	if strings.HasPrefix(rel, "..") {
-		return fmt.Errorf("%w: path escapes root", ErrInvalidDocument)
-	}
-	parts := strings.Split(filepath.ToSlash(rel), "/")
-	if len(parts) < 3 {
-		return fmt.Errorf("%w: invalid path shape", ErrInvalidDocument)
-	}
-
-	fileName := parts[len(parts)-1]
-	fileID := strings.TrimSuffix(fileName, filepath.Ext(fileName))
-	if fileID != doc.ID {
-		return fmt.Errorf("%w: file name and id mismatch", ErrInvalidDocument)
-	}
-
-	scopeDir := parts[1]
-	switch scopeDir {
-	case ScopeThread:
-		if len(parts) != 4 || doc.Scope != ScopeThread || parts[2] != doc.ThreadID {
-			return fmt.Errorf("%w: thread path does not match document metadata", ErrInvalidDocument)
-		}
-	case ScopeAgent:
-		if len(parts) != 4 || doc.Scope != ScopeAgent || parts[2] != doc.AgentID {
-			return fmt.Errorf("%w: agent path does not match document metadata", ErrInvalidDocument)
-		}
-	case ScopeUser:
-		if len(parts) != 3 || doc.Scope != ScopeUser {
-			return fmt.Errorf("%w: user path does not match document metadata", ErrInvalidDocument)
-		}
-	default:
-		return fmt.Errorf("%w: unknown scope directory", ErrInvalidDocument)
-	}
-
-	return nil
-}
+// ── Internal validation ───────────────────────────────────────────────────────
 
 func validateExecutionScope(scope runtimectx.MemoryScope) error {
 	if err := validateSegment("user_id", scope.UserID); err != nil {

@@ -22,7 +22,10 @@ type rgText struct {
 	Text string `json:"text"`
 }
 
-func SearchCandidates(ctx context.Context, rgPath, pattern string, files []string, bodyStartLines map[string]int) (map[string]int, error) {
+// SearchCandidates runs ripgrep over files and returns a map of
+// file path → first matching line number. Files are plain text (no frontmatter),
+// so every line is part of the body — no offset adjustment needed.
+func SearchCandidates(ctx context.Context, rgPath, pattern string, files []string) (map[string]int, error) {
 	if len(files) == 0 {
 		return map[string]int{}, nil
 	}
@@ -38,6 +41,7 @@ func SearchCandidates(ctx context.Context, rgPath, pattern string, files []strin
 
 	if err := cmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			// Exit code 1 means no matches — not an error.
 			return map[string]int{}, nil
 		}
 		return nil, fmt.Errorf("memory: rg failed: %w: %s", err, stderr.String())
@@ -61,10 +65,7 @@ func SearchCandidates(ctx context.Context, rgPath, pattern string, files []strin
 			return nil, fmt.Errorf("memory: parse rg match: %w", err)
 		}
 
-		bodyStart, ok := bodyStartLines[data.Path.Text]
-		if !ok || data.LineNumber < bodyStart {
-			continue
-		}
+		// Record only the first hit per file.
 		if _, exists := hits[data.Path.Text]; !exists {
 			hits[data.Path.Text] = data.LineNumber
 		}
