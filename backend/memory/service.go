@@ -287,31 +287,27 @@ func (s *Service) collectCandidates(roots []string, typeFilter *string) ([]candi
 	totalBytes := int64(0)
 
 	for _, root := range roots {
-		files, err := ListMarkdownFiles(root)
+		entries, err := listMarkdownFileEntries(root)
 		if err != nil {
 			return nil, err
 		}
-		for _, path := range files {
+		for _, entry := range entries {
 			if len(candidates) >= MaxScannedFiles {
 				return nil, ErrSearchBudgetExceeded
 			}
-			info, err := os.Stat(path)
-			if err != nil {
-				return nil, fmt.Errorf("memory: stat candidate: %w", err)
-			}
-			totalBytes += info.Size()
+			totalBytes += entry.Size
 			if totalBytes > MaxScannedBytes {
 				return nil, ErrSearchBudgetExceeded
 			}
 
-			doc, err := s.readDocument(path)
+			doc, err := s.readDocument(entry.Path)
 			if err != nil {
 				if errors.Is(err, ErrInvalidDocument) {
 					continue
 				}
 				return nil, err
 			}
-			if err := ValidateDocumentPath(s.cfg.Root, path, doc); err != nil {
+			if err := ValidateDocumentPath(s.cfg.Root, entry.Path, doc); err != nil {
 				continue
 			}
 			if isExpired(doc, now) {
@@ -322,9 +318,9 @@ func (s *Service) collectCandidates(roots []string, typeFilter *string) ([]candi
 			}
 
 			candidates = append(candidates, candidate{
-				Path: path,
+				Path: entry.Path,
 				Doc:  doc,
-				Size: info.Size(),
+				Size: entry.Size,
 			})
 		}
 	}

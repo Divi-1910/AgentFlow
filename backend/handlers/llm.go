@@ -2,11 +2,10 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
-	"log"
 	"net/http"
 
 	"backend/llm"
+	"backend/middleware"
 	"backend/model"
 )
 
@@ -31,18 +30,17 @@ func NewLLMHandler(modelStore llmModelStore, registry llmClientRegistry) *LLMHan
 
 func (lh *LLMHandler) GetLLMs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
 	models, err := lh.modelStore.ListAll(r.Context())
 	if err != nil {
-		http.Error(w, "Internal Server Error while fetching models", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "failed to fetch models")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(models)
+	writeJSON(w, http.StatusOK, models)
 }
 
 type chatRequest struct {
@@ -70,50 +68,35 @@ type chatResponse struct {
 	Usage     llm.TokenUsage `json:"usage"`
 }
 
-type chatErrorResponse struct {
-	Error string `json:"error"`
-}
-
 func (lh *LLMHandler) Chat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
+	logger := middleware.LoggerFromContext(r.Context())
+
 	var req chatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(chatErrorResponse{Error: "invalid request body: " + err.Error()})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
 	if req.Provider == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(chatErrorResponse{Error: "provider is required"})
+		writeError(w, http.StatusBadRequest, "provider is required")
 		return
 	}
-
 	if req.Model == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(chatErrorResponse{Error: "model is required"})
+		writeError(w, http.StatusBadRequest, "model is required")
 		return
 	}
-
 	if len(req.Messages) == 0 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(chatErrorResponse{Error: "messages cannot be empty"})
+		writeError(w, http.StatusBadRequest, "messages cannot be empty")
 		return
 	}
 
 	client, err := lh.registry.Get(req.Provider)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(chatErrorResponse{Error: err.Error()})
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -136,21 +119,20 @@ func (lh *LLMHandler) Chat(w http.ResponseWriter, r *http.Request) {
 		Params:      req.Params,
 	}
 
-	log.Printf("[chat] provider=%s model=%s messages=%d", req.Provider, req.Model, len(req.Messages))
+	logger.Info("chat: request", "provider", req.Provider, "model", req.Model, "messages", len(req.Messages))
 
 	resp, err := client.ChatCompletion(r.Context(), chatReq)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(chatErrorResponse{Error: err.Error()})
+		logger.Error("chat: provider error", "provider", req.Provider, "model", req.Model, "error", err)
+		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 
-	log.Printf("[chat] success model=%s prompt_tokens=%d completion_tokens=%d",
-		resp.Model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	logger.Info("chat: success", "model", resp.Model,
+		"prompt_tokens", resp.Usage.PromptTokens,
+		"completion_tokens", resp.Usage.CompletionTokens)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(chatResponse{
+	writeJSON(w, http.StatusOK, chatResponse{
 		Provider:  req.Provider,
 		Content:   resp.Content,
 		ToolCalls: resp.ToolCalls,

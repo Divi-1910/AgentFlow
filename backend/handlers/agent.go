@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"errors"
-	"encoding/json"
 	"net/http"
 	"time"
 
@@ -121,8 +120,7 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req CreateAgentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -210,8 +208,7 @@ func (h *AgentHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req UpdateAgentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 

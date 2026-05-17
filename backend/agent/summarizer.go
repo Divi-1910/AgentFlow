@@ -3,7 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -65,9 +65,17 @@ Return only the updated summary.`, input),
 		if callErr == nil {
 			break
 		}
+		// If the context was cancelled or timed out, return immediately.
+		// There is no point retrying, and the "retrying in Xs" log below
+		// would be misleading — the select would bail out anyway.
+		if ctx.Err() != nil {
+			return "", llm.TokenUsage{}, ctx.Err()
+		}
 		if attempt < maxAttempts {
 			backoff := time.Duration(attempt*attempt) * time.Second
-			log.Printf("[summarizer] attempt %d/%d failed, retrying in %s: %v", attempt, maxAttempts, backoff, callErr)
+			slog.Warn("summarizer: attempt failed, retrying",
+				"attempt", attempt, "max_attempts", maxAttempts,
+				"backoff", backoff, "error", callErr)
 			select {
 			case <-ctx.Done():
 				return "", llm.TokenUsage{}, ctx.Err()
@@ -76,12 +84,13 @@ Return only the updated summary.`, input),
 		}
 	}
 	if callErr != nil {
-		log.Printf("[summarizer] ✗ all %d attempts failed: %v", maxAttempts, callErr)
+		slog.Error("summarizer: all attempts failed", "attempts", maxAttempts, "error", callErr)
 		return "", llm.TokenUsage{}, callErr
 	}
 
 	summary := strings.TrimSpace(resp.Content)
-	log.Printf("[summarizer] ✓ produced summary len=%d tokens=%d", len(summary), resp.Usage.TotalTokens)
+	slog.Info("summarizer: produced summary",
+		"length", len(summary), "total_tokens", resp.Usage.TotalTokens)
 	return summary, resp.Usage, nil
 }
 

@@ -59,6 +59,51 @@ func ReadFileLimited(path string, maxBytes int) ([]byte, error) {
 	return data, nil
 }
 
+// fileEntry pairs a markdown file path with the size already known from the
+// directory walk. Callers use this to avoid a second os.Stat per file.
+type fileEntry struct {
+	Path string
+	Size int64
+}
+
+// listMarkdownFileEntries is the internal variant of ListMarkdownFiles that
+// returns each file's size from the DirEntry (cached from the walk), so
+// callers do not need to call os.Stat separately.
+func listMarkdownFileEntries(root string) ([]fileEntry, error) {
+	info, err := os.Stat(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("memory: stat root: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("memory: root is not a directory: %s", root)
+	}
+
+	var entries []fileEntry
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.EqualFold(filepath.Ext(d.Name()), ".md") {
+			fi, err := d.Info()
+			if err != nil {
+				return err
+			}
+			entries = append(entries, fileEntry{Path: path, Size: fi.Size()})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("memory: walk dir: %w", err)
+	}
+	return entries, nil
+}
+
 func ListMarkdownFiles(root string) ([]string, error) {
 	info, err := os.Stat(root)
 	if err != nil {

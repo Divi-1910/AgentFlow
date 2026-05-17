@@ -42,9 +42,10 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		start := time.Now()
-		slog.Info("request", "method", r.Method, "path", r.URL.Path)
+		logger := middleware.LoggerFromContext(r.Context())
+		logger.Info("request", "method", r.Method, "path", r.URL.Path)
 		next.ServeHTTP(w, r)
-		slog.Info("request completed", "method", r.Method, "path", r.URL.Path,
+		logger.Info("request completed", "method", r.Method, "path", r.URL.Path,
 			"duration_ms", time.Since(start).Milliseconds())
 	})
 }
@@ -171,9 +172,17 @@ func main() {
 		port = "9090"
 	}
 
+	const maxRequestBodyBytes = 1 << 20 // 1 MiB — sufficient for all current endpoints
+
 	server := &http.Server{
-		Addr:              ":" + port,
-		Handler:           loggingMiddleware(corsMiddleware(mux)),
+		Addr: ":" + port,
+		Handler: middleware.RequestID(
+			loggingMiddleware(
+				corsMiddleware(
+					middleware.BodyLimit(maxRequestBodyBytes)(mux),
+				),
+			),
+		),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
