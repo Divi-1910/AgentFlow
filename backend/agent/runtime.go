@@ -22,6 +22,7 @@ type AgentRuntime struct {
 	toolRegistry    *tools.ToolRegistry
 	contextBuilder  *ContextBuilder
 	checkpointStore CheckpointStore
+	delegateInvoker DelegateInvoker
 }
 
 func NewAgentRuntime(
@@ -42,7 +43,16 @@ func (r *AgentRuntime) WithCheckpointStore(store CheckpointStore) *AgentRuntime 
 		toolRegistry:    r.toolRegistry,
 		contextBuilder:  r.contextBuilder,
 		checkpointStore: store,
+		delegateInvoker: r.delegateInvoker,
 	}
+}
+
+// SetDelegateInvoker wires the delegate invoker after construction (the
+// invoker depends on the pool manager, which depends on the runtime — so it
+// can't be a constructor arg). Required before running any agent that has
+// Delegates configured; BuildToolSet fails fast otherwise.
+func (r *AgentRuntime) SetDelegateInvoker(inv DelegateInvoker) {
+	r.delegateInvoker = inv
 }
 
 func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext) (*RunResult, error) {
@@ -58,7 +68,11 @@ func (r *AgentRuntime) EstimateSystemPromptTokens(ctx context.Context, agent *Ag
 	if r.contextBuilder == nil {
 		return 0
 	}
-	return r.contextBuilder.EstimateSystemPromptTokens(ctx, agent, runCtx)
+	toolSet, err := BuildToolSetForValidation(r.toolRegistry, agent)
+	if err != nil {
+		return 0
+	}
+	return r.contextBuilder.EstimateSystemPromptTokens(ctx, agent, runCtx, toolSet.Definitions())
 }
 
 func (r *AgentRuntime) RunStream(ctx context.Context, ag *Agent, runCtx RunContext, events chan<- StreamEvent) (*RunResult, error) {
@@ -167,10 +181,11 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		return nil, err
 	}
 
-	toolDefs, err := r.loadTools(agent)
+	toolSet, err := BuildToolSet(r.toolRegistry, r.delegateInvoker, agent)
 	if err != nil {
 		return nil, err
 	}
+	toolDefs := toolSet.Definitions()
 
 	var (
 		messages           []llm.ChatMessage
@@ -205,6 +220,20 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		if runCtx.LastAction == "" {
 			runCtx.LastAction = deriveLastActionFromMessages(s.Messages)
 		}
+		// Restore delegation lineage so a resumed delegated run can itself
+		// delegate with the correct chain/depth.
+		if runCtx.OriginatorRunID == "" {
+			runCtx.OriginatorRunID = runCtx.Checkpoint.Meta.OriginatorRunID
+		}
+		if runCtx.ParentRunID == "" {
+			runCtx.ParentRunID = runCtx.Checkpoint.Meta.ParentRunID
+		}
+		if len(runCtx.DelegationChain) == 0 {
+			runCtx.DelegationChain = runCtx.Checkpoint.Meta.DelegationChain
+		}
+		if runCtx.DelegationDepth == 0 {
+			runCtx.DelegationDepth = runCtx.Checkpoint.Meta.DelegationDepth
+		}
 
 		sink.Emit(StreamEvent{
 			Type:    EventRunResumed,
@@ -219,10 +248,20 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		toolFailures = make(map[string]int)
 	}
 
+	// Default delegation lineage for top-level runs (and legacy snapshots
+	// with no tree fields): originator is the run itself, chain starts at
+	// this agent, depth 0.
+	if runCtx.OriginatorRunID == "" {
+		runCtx.OriginatorRunID = runCtx.RunID
+	}
+	if len(runCtx.DelegationChain) == 0 {
+		runCtx.DelegationChain = []string{agent.ID}
+	}
+
 	if r.contextBuilder == nil {
 		return nil, fmt.Errorf("runtime: context builder is not configured")
 	}
-	messages, err = r.contextBuilder.Build(ctx, agent, runCtx)
+	messages, err = r.contextBuilder.Build(ctx, agent, runCtx, toolDefs)
 	if err != nil {
 		return nil, fmt.Errorf("runtime: context build: %w", err)
 	}
@@ -256,7 +295,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			if r.checkpointStore != nil {
 				snapshot := buildSnapshot(
 					runCtx, agent, messages, runCtx.Summary, steps, maxSteps,
-					totalUsage, toolFailures, checkpointFailures, PhasePreModel, r.toolRegistry,
+					totalUsage, toolFailures, checkpointFailures, PhasePreModel, toolSet,
 				)
 				var saveErr error
 				if checkpointFailures, saveErr = r.trySaveCheckpoint(snapshot, sink, steps, checkpointFailures, hasSnapshot, logger); saveErr != nil {
@@ -288,7 +327,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			// iterations. The static prefix stays byte-identical for caching.
 			runCtx.Phase = PhasePreModel
 			runCtx.StepsCompleted = steps
-			sysContent, sysErr := r.contextBuilder.BuildSystemContent(ctx, agent, runCtx)
+			sysContent, sysErr := r.contextBuilder.BuildSystemContent(ctx, agent, runCtx, toolDefs)
 			if sysErr != nil {
 				return nil, fmt.Errorf("runtime: refresh system message: %w", sysErr)
 			}
@@ -343,7 +382,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 				if r.checkpointStore != nil {
 					snapshot := buildSnapshot(
 						runCtx, agent, messages, runCtx.Summary, steps, maxSteps,
-						totalUsage, toolFailures, checkpointFailures, PhaseStepCompleted, r.toolRegistry,
+						totalUsage, toolFailures, checkpointFailures, PhaseStepCompleted, toolSet,
 					)
 					var saveErr error
 					if checkpointFailures, saveErr = r.trySaveCheckpoint(snapshot, sink, steps, checkpointFailures, hasSnapshot, logger); saveErr != nil {
@@ -377,7 +416,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			if r.checkpointStore != nil {
 				snapshot := buildSnapshot(
 					runCtx, agent, messages, runCtx.Summary, steps, maxSteps,
-					totalUsage, toolFailures, checkpointFailures, PhasePostModel, r.toolRegistry,
+					totalUsage, toolFailures, checkpointFailures, PhasePostModel, toolSet,
 				)
 				var saveErr error
 				if checkpointFailures, saveErr = r.trySaveCheckpoint(snapshot, sink, steps, checkpointFailures, hasSnapshot, logger); saveErr != nil {
@@ -407,13 +446,13 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			})
 			sink.Emit(StreamEvent{Type: EventStatusUpdated, Status: fmt.Sprintf("Using %s", call.Name), Step: steps})
 
-			tool, err := r.toolRegistry.Get(call.Name)
-			if err != nil {
+			tool, ok := toolSet.Get(call.Name)
+			if !ok {
 				logger.Error("tool not found, aborting", "tool", call.Name)
 				sink.Emit(StreamEvent{
 					Type:  EventToolFailed,
 					Tool:  &ToolMeta{ID: call.ID, Name: call.Name, Args: rawArgs},
-					Error: &ErrMeta{Code: "tool.not_found", Message: err.Error()},
+					Error: &ErrMeta{Code: "tool.not_found", Message: "tool not available"},
 					Step:  steps,
 				})
 				return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, call.Name)
@@ -426,8 +465,30 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 				return nil, ctx.Err()
 			}
 
-			toolCtx, toolCancel := context.WithTimeout(ctx, 30*time.Second)
+			toolTimeout := 30 * time.Second
+			inheritCtx := false
+			if tt, ok := tool.(tools.TimeoutTool); ok {
+				if d := tt.Timeout(); d > 0 {
+					toolTimeout = d
+				} else {
+					inheritCtx = true // 0 → no extra wall-clock cap, inherit parent ctx
+				}
+			}
+			var toolCtx context.Context
+			var toolCancel context.CancelFunc
+			if inheritCtx {
+				toolCtx, toolCancel = context.WithCancel(ctx)
+			} else {
+				toolCtx, toolCancel = context.WithTimeout(ctx, toolTimeout)
+			}
 			toolCtx = runtimectx.WithMemoryScope(toolCtx, runCtx.Memory)
+			toolCtx = runtimectx.WithDelegation(toolCtx, runtimectx.DelegationInfo{
+				OriginatorRunID: runCtx.OriginatorRunID,
+				RunID:           runCtx.RunID,
+				Chain:           runCtx.DelegationChain,
+				Depth:           runCtx.DelegationDepth,
+				UserID:          runCtx.Memory.UserID,
+			})
 			toolResult, err := tool.Execute(toolCtx, tools.ToolCall{
 				ID:   call.ID,
 				Args: call.Arguments,
@@ -577,32 +638,11 @@ func deriveLastActionFromMessages(messages []llm.ChatMessage) string {
 	return ""
 }
 
-func (r *AgentRuntime) loadTools(agent *Agent) ([]llm.ToolDefinition, error) {
-	if len(agent.Tools) == 0 {
-		return []llm.ToolDefinition{}, nil
-	}
-
-	defs := make([]llm.ToolDefinition, 0, len(agent.Tools))
-	for _, name := range agent.Tools {
-		tool, err := r.toolRegistry.Get(name)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, name)
-		}
-		defs = append(defs, tool.Definition())
-	}
-	return defs, nil
-}
-
 func buildSnapshot(
 	runCtx RunContext, ag *Agent, messages []llm.ChatMessage, summary string,
 	steps, maxSteps int, usage llm.TokenUsage, toolFailures map[string]int,
-	checkpointFailures int, phase string, registry *tools.ToolRegistry,
+	checkpointFailures int, phase string, toolSet *ToolSet,
 ) RunSnapshot {
-
-	toolsUsed := ag.Tools
-	if toolsUsed == nil {
-		toolsUsed = []string{}
-	}
 
 	return RunSnapshot{
 		Version: 1,
@@ -621,13 +661,17 @@ func buildSnapshot(
 			Provider:           ag.Provider,
 			Model:              ag.Model,
 			Temperature:        ag.Temperature,
-			ToolsetVersion:     ComputeToolsetVersion(registry),
-			ToolsUsed:          toolsUsed,
+			ToolsetVersion:     toolSet.Version(),
+			EffectiveTools:     toolSet.Refs(),
 			Attempt:            runCtx.Attempt,
 			Phase:              phase,
 			CheckpointFailures: checkpointFailures,
 			LastCheckpointAt:   time.Now(),
 			CreatedAt:          time.Now(),
+			OriginatorRunID:    runCtx.OriginatorRunID,
+			ParentRunID:        runCtx.ParentRunID,
+			DelegationChain:    runCtx.DelegationChain,
+			DelegationDepth:    runCtx.DelegationDepth,
 		},
 	}
 }

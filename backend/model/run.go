@@ -27,8 +27,13 @@ type RunDocument struct {
 	Attempt        int           `bson:"attempt"         json:"attempt"`
 	StepsCompleted int           `bson:"steps_completed" json:"steps_completed"`
 	LastError      string        `bson:"last_error,omitempty" json:"last_error,omitempty"`
-	CreatedAt      time.Time     `bson:"created_at" json:"created_at"`
-	UpdatedAt      time.Time     `bson:"updated_at" json:"updated_at"`
+	// Delegation lineage. OriginatorRunID is the root of the call tree (==
+	// RunID for top-level runs); ParentRunID is the calling run ("" for
+	// top-level). Set on child runs created via the delegate invoker.
+	OriginatorRunID string    `bson:"originator_run_id,omitempty" json:"originator_run_id,omitempty"`
+	ParentRunID     string    `bson:"parent_run_id,omitempty"     json:"parent_run_id,omitempty"`
+	CreatedAt       time.Time `bson:"created_at" json:"created_at"`
+	UpdatedAt       time.Time `bson:"updated_at" json:"updated_at"`
 }
 
 type RunCheckpointDocument struct {

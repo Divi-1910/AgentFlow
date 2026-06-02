@@ -16,8 +16,9 @@ type AgentDocument struct {
 	Provider string `bson:"provider" json:"provider"`
 	Model    string `bson:"model"    json:"model"`
 
-	SystemPrompt string   `bson:"system_prompt" json:"system_prompt"`
-	Tools        []string `bson:"tools"         json:"tools"`
+	SystemPrompt string              `bson:"system_prompt" json:"system_prompt"`
+	Tools        []string            `bson:"tools"         json:"tools"`
+	Delegates    []DelegateConfigDoc `bson:"delegates,omitempty" json:"delegates,omitempty"`
 
 	ContextWindow      int     `bson:"context_window,omitempty"      json:"context_window,omitempty"`
 	ContextKeepRatio   float64 `bson:"context_keep_ratio,omitempty"  json:"context_keep_ratio,omitempty"`
@@ -29,4 +30,12 @@ type AgentDocument struct {
 
 	CreatedAt time.Time `bson:"created_at" json:"created_at"`
 	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`
+}
+
+// DelegateConfigDoc is the persisted form of agent.DelegateConfig.
+type DelegateConfigDoc struct {
+	AgentID      string `bson:"agent_id"      json:"agent_id"`
+	ToolName     string `bson:"tool_name"     json:"tool_name"`
+	Description  string `bson:"description"   json:"description"`
+	Instructions string `bson:"instructions,omitempty" json:"instructions,omitempty"`
 }

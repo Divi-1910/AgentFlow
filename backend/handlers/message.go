@@ -6,13 +6,12 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"backend/agent"
+	"backend/dispatcher"
 	"backend/llm"
 	"backend/model"
-	"backend/runtimectx"
 
 	"github.com/google/uuid"
 )
@@ -24,48 +23,27 @@ type messageStore interface {
 	ListDocsByThread(ctx context.Context, threadID string, limit int) ([]model.MessageDocument, error)
 }
 
-// runtimeExecutor is the subset of agent.AgentRuntime used by MessageHandler.
-type runtimeExecutor interface {
-	RunStream(ctx context.Context, ag *agent.Agent, runCtx agent.RunContext, events chan<- agent.StreamEvent) (*agent.RunResult, error)
-	EstimateSystemPromptTokens(ctx context.Context, ag *agent.Agent, runCtx agent.RunContext) int
-}
-
-// summarizeExecutor is the subset of agent.Summarizer used by MessageHandler.
-type summarizeExecutor interface {
-	Summarize(ctx context.Context, ag *agent.Agent, existingSummary string, turns []agent.Turn) (string, llm.TokenUsage, error)
-}
-
 type MessageHandler struct {
 	agentRepo   agentStore
 	threadRepo  threadStore
 	messageRepo messageStore
-	runtime     runtimeExecutor
-	summarizer  summarizeExecutor
+	dispatcher  dispatcher.Dispatcher
 	runRepo     agent.CheckpointStore
-	background  context.Context
-	summarizing sync.Map
 }
 
 func NewMessageHandler(
 	agentRepo agentStore,
 	threadRepo threadStore,
 	messageRepo messageStore,
-	runtime runtimeExecutor,
-	summarizer summarizeExecutor,
+	disp dispatcher.Dispatcher,
 	runRepo agent.CheckpointStore,
-	background context.Context,
 ) *MessageHandler {
-	if background == nil {
-		background = context.Background()
-	}
 	return &MessageHandler{
 		agentRepo:   agentRepo,
 		threadRepo:  threadRepo,
 		messageRepo: messageRepo,
-		runtime:     runtime,
-		summarizer:  summarizer,
+		dispatcher:  disp,
 		runRepo:     runRepo,
-		background:  background,
 	}
 }
 
@@ -132,96 +110,13 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rawMessages, err := h.messageRepo.ListRecentByThread(ctx, threadID, 500)
-	if err != nil {
+	if _, err := h.messageRepo.ListRecentByThread(ctx, threadID, 500); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load history")
 		return
 	}
 
-	turns := agent.GroupIntoTurns(rawMessages)
-
-	currentSummary := thread.Summary
-
-	// Use the runtime's ContextBuilder to size the system message accurately
-	// (it accounts for platform XML, tool instructions, user_preferences
-	// caps, and the context wrapper). Fall back to the static-overhead
-	// heuristic in ShouldSummarize when the runtime can't produce an
-	// estimate (e.g. in tests where the builder isn't wired).
-	estimateRunCtx := agent.RunContext{
-		ThreadID: threadID,
-		Summary:  currentSummary,
-		Memory:   runtimectx.MemoryScope{UserID: userID, AgentID: ag.ID, ThreadID: threadID},
-	}
-	sysTokens := h.runtime.EstimateSystemPromptTokens(ctx, ag, estimateRunCtx)
-	var (
-		shouldCompact bool
-		drop, keep    []agent.Turn
-	)
-	if sysTokens > 0 {
-		shouldCompact = agent.ShouldSummarizeWithSysTokens(ag, sysTokens, turns)
-	} else {
-		shouldCompact = agent.ShouldSummarize(ag, currentSummary, turns)
-	}
-
-	if shouldCompact {
-		if sysTokens > 0 {
-			// Use the builder-derived estimate so the keep budget reflects
-			// the full system message — not just summary length.
-			drop, keep = agent.SplitTurnsForCompactionWithSysTokens(ag, sysTokens, turns)
-		} else {
-			drop, keep = agent.SplitTurnsForCompaction(ag, currentSummary, turns)
-		}
-
-		if len(drop) > 0 {
-			turns = keep
-
-			bgLogger := slog.With("thread_id", threadID)
-			if _, alreadyRunning := h.summarizing.LoadOrStore(threadID, struct{}{}); !alreadyRunning {
-				go func(ctx context.Context, ag *agent.Agent, summary string, drop []agent.Turn) {
-					defer h.summarizing.Delete(threadID)
-					defer func() {
-						if rec := recover(); rec != nil {
-							bgLogger.Error("bg summarization panic", "error", rec)
-						}
-					}()
-
-					compactCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-					defer cancel()
-
-					newSummary, _, err := h.summarizer.Summarize(compactCtx, ag, summary, drop)
-					if err != nil {
-						bgLogger.Error("bg summarization failed", "error", err)
-					} else {
-						if updateErr := h.threadRepo.UpdateSummary(compactCtx, threadID, userID, newSummary); updateErr != nil {
-							bgLogger.Error("bg summarization persist failed", "error", updateErr)
-						}
-					}
-				}(h.background, ag, currentSummary, drop)
-			} else {
-				bgLogger.Info("bg summarization skipped, already in flight")
-			}
-		}
-	}
-
-	history := agent.FlattenTurns(turns)
-
 	runID := uuid.NewString()
 	runLogger := slog.With("run_id", runID, "thread_id", threadID, "user_id", userID)
-
-	runCtx := agent.RunContext{
-		RunID:    runID,
-		ThreadID: threadID,
-		Attempt:  1,
-		Summary:  currentSummary,
-		History:  history,
-		Input:    req.Content,
-		Memory: runtimectx.MemoryScope{
-			UserID:   userID,
-			AgentID:  ag.ID,
-			ThreadID: threadID,
-		},
-		Logger: runLogger,
-	}
 
 	if h.runRepo != nil {
 		if err := h.runRepo.CreateRun(r.Context(), runID, threadID, ag.ID, userID); err != nil {
@@ -247,6 +142,15 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 
 	events := make(chan agent.StreamEvent, 128)
 	done := make(chan runOutcome, 1)
+	dispatchReq := dispatcher.DispatchRequest{
+		RunID:    runID,
+		AgentID:  ag.ID,
+		UserID:   userID,
+		ThreadID: threadID,
+		Input:    req.Content,
+		Attempt:  1,
+		Logger:   runLogger,
+	}
 
 	go func() {
 		var (
@@ -260,7 +164,7 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 			}
 			done <- runOutcome{res, runErr}
 		}()
-		res, runErr = h.runtime.RunStream(runCtxStream, ag, runCtx, events)
+		res, runErr = h.dispatcher.Dispatch(runCtxStream, dispatchReq, events)
 	}()
 
 	sr := streamLoop(runCtxStream, cancelStream, w, flusher, events, done, runLogger)

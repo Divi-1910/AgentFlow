@@ -2,7 +2,9 @@ package main
 
 import (
 	"backend/agent"
+	"backend/bus"
 	"backend/db"
+	"backend/dispatcher"
 	"backend/handlers"
 	"backend/llm"
 	"backend/memory"
@@ -131,6 +133,10 @@ func main() {
 		slog.Error("failed to create run indexes", "error", err)
 		os.Exit(1)
 	}
+	if err := threadRepo.EnsureIndexes(context.Background()); err != nil {
+		slog.Error("failed to create thread indexes", "error", err)
+		os.Exit(1)
+	}
 
 	platformPath := strings.TrimSpace(os.Getenv("PLATFORM_XML_PATH"))
 	if platformPath == "" {
@@ -141,9 +147,67 @@ func main() {
 		slog.Error("failed to load platform config", "error", err, "path", platformPath)
 		os.Exit(1)
 	}
-	contextBuilder := agent.NewContextBuilder(platformCfg, memorySvc, memoryMetaRepo, toolRegistry)
+	contextBuilder := agent.NewContextBuilder(platformCfg, memorySvc, memoryMetaRepo)
 	agentRuntime := agent.NewAgentRuntime(llmRegistry, toolRegistry, contextBuilder).WithCheckpointStore(runRepo)
 	summarizer := agent.NewSummarizer(llmRegistry)
+
+	// Bus, pools, and the delegate invoker are wired UNCONDITIONALLY: delegate
+	// calls always traverse the bus, even when the top-level dispatch is direct.
+	// MESSAGEBUS_DISPATCH only selects the top-level path (Bus vs Direct).
+	theBus := bus.NewInProc()
+	preparer := dispatcher.NewRunPreparer(dispatcher.RunPreparerConfig{
+		Agents:       agentRepo,
+		Threads:      threadRepo,
+		Messages:     messageRepo,
+		Runs:         runRepo,
+		Summarizer:   summarizer,
+		Runtime:      agentRuntime,
+		ToolRegistry: toolRegistry,
+		Background:   appCtx,
+	})
+	pools := dispatcher.NewPoolManager(dispatcher.PoolManagerConfig{
+		RootCtx:  appCtx,
+		Bus:      theBus,
+		Preparer: preparer,
+		Runtime:  agentRuntime,
+		Status:   runRepo,
+		Workers:  4,
+	})
+	invoker := dispatcher.NewBusDelegateInvoker(dispatcher.BusDelegateInvokerConfig{
+		Bus:      theBus,
+		Pools:    pools,
+		Agents:   agentRepo,
+		Threads:  threadRepo,
+		Runs:     runRepo,
+		Messages: messageRepo,
+	})
+	agentRuntime.SetDelegateInvoker(invoker)
+	defer theBus.Close()
+
+	var disp dispatcher.Dispatcher
+	if os.Getenv("MESSAGEBUS_DISPATCH") == "true" {
+		disp = &dispatcher.BusDispatcher{
+			Bus:      theBus,
+			Pools:    pools,
+			Preparer: preparer,
+			// Defense-in-depth ceiling for a wedged worker that never replies.
+			// The real run-length governor is the runtime (MaxSteps + per-step
+			// LLM/tool timeouts); this is intentionally generous so it never
+			// cuts off a run that is still making progress. On expiry the bus
+			// dispatcher cancels the task (registry + cancel topic), so the
+			// worker is freed rather than orphaned.
+			RequestTimeout: 30 * time.Minute,
+		}
+		slog.Info("dispatcher: using BusDispatcher")
+	} else {
+		disp = &dispatcher.DirectDispatcher{
+			Preparer: preparer,
+			Runtime:  agentRuntime,
+			Bus:      theBus,
+			Pools:    pools,
+		}
+		slog.Info("dispatcher: using DirectDispatcher")
+	}
 
 	agentHandler := handlers.NewAgentHandler(agentRepo, toolRegistry)
 	threadHandler := handlers.NewThreadHandler(threadRepo, agentRepo)
@@ -151,16 +215,14 @@ func main() {
 		agentRepo,
 		threadRepo,
 		messageRepo,
-		agentRuntime,
-		summarizer,
+		disp,
 		runRepo,
-		appCtx,
 	)
 	runHandler := handlers.NewRunHandler(
 		agentRepo,
 		messageRepo,
 		runRepo,
-		agentRuntime,
+		disp,
 		toolRegistry,
 	)
 
@@ -223,6 +285,8 @@ func main() {
 		slog.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
+	pools.StopAll()
+	_ = theBus.Close()
 }
 
 func methodNotAllowed(w http.ResponseWriter, allowedMethod string) {

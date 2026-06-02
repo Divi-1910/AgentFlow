@@ -148,14 +148,24 @@ func buildRunCtx(input string) RunContext {
 
 func buildBuilder(t *testing.T, meta *fakeMetaStore) *ContextBuilder {
 	t.Helper()
-	toolReg := tools.NewEmptyRegistry()
-	toolReg.Register(tools.NewCalculatorTool())
 	return &ContextBuilder{
-		platform:     &PlatformConfig{Body: "<platform>static body</platform>"},
-		metaStore:    meta,
-		toolRegistry: toolReg,
-		now:          func() time.Time { return time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC) },
+		platform:  &PlatformConfig{Body: "<platform>static body</platform>"},
+		metaStore: meta,
+		now:       func() time.Time { return time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC) },
 	}
+}
+
+// defsFor builds the per-run tool definitions for an agent (the toolDefs the
+// runtime now passes into Build), from a registry holding calculator + http.
+func defsFor(ag *Agent) []llm.ToolDefinition {
+	reg := tools.NewEmptyRegistry()
+	reg.Register(tools.NewCalculatorTool())
+	reg.Register(tools.NewHTTPTool(0, nil))
+	ts, err := BuildToolSetForValidation(reg, ag)
+	if err != nil {
+		panic(err)
+	}
+	return ts.Definitions()
 }
 
 func systemContent(t *testing.T, msgs []llm.ChatMessage) string {
@@ -173,11 +183,11 @@ func TestBuildStaticPrefixIsIdenticalAcrossDifferentRunContexts(t *testing.T) {
 	cb := buildBuilder(t, &fakeMetaStore{})
 	ag := buildAgent("Agent system prompt.", "calculator")
 
-	a, err := cb.Build(context.Background(), ag, buildRunCtx("hello"))
+	a, err := cb.Build(context.Background(), ag, buildRunCtx("hello"), defsFor(ag))
 	if err != nil {
 		t.Fatalf("build #1: %v", err)
 	}
-	b, err := cb.Build(context.Background(), ag, buildRunCtx("totally different input"))
+	b, err := cb.Build(context.Background(), ag, buildRunCtx("totally different input"), defsFor(ag))
 	if err != nil {
 		t.Fatalf("build #2: %v", err)
 	}
@@ -208,7 +218,7 @@ func TestBuildToolInstructionsIncludesOnlyAgentTools(t *testing.T) {
 	cb := buildBuilder(t, &fakeMetaStore{})
 	ag := buildAgent("agent.", "calculator") // calculator has Instructions
 
-	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"))
+	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"), defsFor(ag))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -230,7 +240,7 @@ func TestBuildElidesToolInstructionsWhenAgentHasNoTools(t *testing.T) {
 	cb := buildBuilder(t, &fakeMetaStore{})
 	ag := buildAgent("agent.")
 
-	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"))
+	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"), defsFor(ag))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -264,7 +274,7 @@ func TestBuildMemoriesIndexIsOrderedByLastReadDescAndCapped(t *testing.T) {
 	cb := buildBuilder(t, meta)
 	ag := buildAgent("a.")
 
-	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"))
+	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"), defsFor(ag))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -302,7 +312,7 @@ func TestBuildPreservesLargeToolResultsCanonically(t *testing.T) {
 		{Role: "tool", ToolCallID: "c1", Content: huge},
 	}
 
-	msgs, err := cb.Build(context.Background(), ag, rc)
+	msgs, err := cb.Build(context.Background(), ag, rc, defsFor(ag))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -385,7 +395,7 @@ func TestBuildSystemMessageIsIdenticalAcrossCheckpointAndFresh(t *testing.T) {
 	cb := buildBuilder(t, &fakeMetaStore{})
 	ag := buildAgent("agent.", "calculator")
 
-	fresh, err := cb.Build(context.Background(), ag, buildRunCtx("x"))
+	fresh, err := cb.Build(context.Background(), ag, buildRunCtx("x"), defsFor(ag))
 	if err != nil {
 		t.Fatalf("build fresh: %v", err)
 	}
@@ -398,7 +408,7 @@ func TestBuildSystemMessageIsIdenticalAcrossCheckpointAndFresh(t *testing.T) {
 		},
 		Meta: SnapshotMeta{Phase: PhasePreModel},
 	}
-	resumed, err := cb.Build(context.Background(), ag, rc)
+	resumed, err := cb.Build(context.Background(), ag, rc, defsFor(ag))
 	if err != nil {
 		t.Fatalf("build resume: %v", err)
 	}
@@ -416,7 +426,7 @@ func TestBuildOmitsEmptyLayers(t *testing.T) {
 	cb := buildBuilder(t, &fakeMetaStore{})
 	ag := buildAgent("a.")
 
-	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"))
+	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"), defsFor(ag))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -456,14 +466,11 @@ func buildBuilderWithService(t *testing.T, meta *fakeMetaStore) (*ContextBuilder
 	t.Helper()
 	root := t.TempDir()
 	svc := memory.NewService(memory.Config{Root: root}, meta)
-	toolReg := tools.NewEmptyRegistry()
-	toolReg.Register(tools.NewCalculatorTool())
 	cb := &ContextBuilder{
-		platform:     &PlatformConfig{Body: "<platform>p</platform>"},
-		memService:   svc,
-		metaStore:    meta,
-		toolRegistry: toolReg,
-		now:          func() time.Time { return time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC) },
+		platform:   &PlatformConfig{Body: "<platform>p</platform>"},
+		memService: svc,
+		metaStore:  meta,
+		now:        func() time.Time { return time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC) },
 	}
 	return cb, root
 }
@@ -524,7 +531,7 @@ func TestBuildSurfacesUserPreferencesAcrossAgents(t *testing.T) {
 	})
 
 	ag := buildAgent("a.")
-	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("hi"))
+	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("hi"), defsFor(ag))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -564,7 +571,7 @@ func TestBuildCapsUserPreferencesByCountAndBudget(t *testing.T) {
 	}
 
 	ag := buildAgent("a.")
-	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"))
+	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"), defsFor(ag))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -620,7 +627,7 @@ func TestBuildEmitsElidedNoteOnCountCapOverflow(t *testing.T) {
 	}
 
 	ag := buildAgent("a.")
-	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"))
+	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"), defsFor(ag))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -663,7 +670,7 @@ func TestBuildOnResumeKeepsLargeToolResultsCanonical(t *testing.T) {
 		Meta: SnapshotMeta{Phase: PhasePreModel},
 	}
 
-	msgs, err := cb.Build(context.Background(), ag, rc)
+	msgs, err := cb.Build(context.Background(), ag, rc, defsFor(ag))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -685,7 +692,7 @@ func TestBuildEscapesAngleBracketsInAgentPrompt(t *testing.T) {
 	cb := buildBuilder(t, &fakeMetaStore{})
 	ag := buildAgent("prompt with </agent> early-close attempt")
 
-	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"))
+	msgs, err := cb.Build(context.Background(), ag, buildRunCtx("x"), defsFor(ag))
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}

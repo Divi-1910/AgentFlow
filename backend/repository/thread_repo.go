@@ -84,7 +84,12 @@ func (r *ThreadRepo) ListByAgent(ctx context.Context, agentID, userID string) ([
 	}
 
 	opts := options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}})
-	cursor, err := r.col.Find(ctx, bson.M{"agent_id": aid, "user_id": uid}, opts)
+	// Exclude delegation sub-threads (kind == "sub") from user-facing lists.
+	cursor, err := r.col.Find(ctx, bson.M{
+		"agent_id": aid,
+		"user_id":  uid,
+		"kind":     bson.M{"$ne": "sub"},
+	}, opts)
 	if err != nil {
 		return nil, fmt.Errorf("thread_repo: find failed: %w", err)
 	}
@@ -96,6 +101,73 @@ func (r *ThreadRepo) ListByAgent(ctx context.Context, agentID, userID string) ([
 	}
 
 	return docs, nil
+}
+
+// FindOrCreateSubThread returns the sub-thread for (userID, originatorRunID,
+// agentID), creating it atomically on first call. The partial unique index
+// (see EnsureIndexes) guarantees concurrent delegate calls to the same agent
+// within one originator run converge on a single sub-thread. Returns the
+// thread ID hex.
+func (r *ThreadRepo) FindOrCreateSubThread(ctx context.Context, userID, originatorRunID, agentID string) (string, error) {
+	uid, err := bson.ObjectIDFromHex(userID)
+	if err != nil {
+		return "", fmt.Errorf("invalid user_id: %w", err)
+	}
+	aid, err := bson.ObjectIDFromHex(agentID)
+	if err != nil {
+		return "", fmt.Errorf("invalid agent_id: %w", err)
+	}
+	if originatorRunID == "" {
+		return "", fmt.Errorf("thread_repo: originator_run_id is required for a sub-thread")
+	}
+
+	now := time.Now()
+	filter := bson.M{
+		"user_id":           uid,
+		"agent_id":          aid,
+		"originator_run_id": originatorRunID,
+		"kind":              "sub",
+	}
+	update := bson.M{
+		"$setOnInsert": bson.M{
+			"user_id":           uid,
+			"agent_id":          aid,
+			"originator_run_id": originatorRunID,
+			"kind":              "sub",
+			"title":             "delegation",
+			"created_at":        now,
+			"updated_at":        now,
+		},
+	}
+	opts := options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)
+
+	var doc model.ThreadDocument
+	if err := r.col.FindOneAndUpdate(ctx, filter, update, opts).Decode(&doc); err != nil {
+		return "", fmt.Errorf("thread_repo: find-or-create sub-thread: %w", err)
+	}
+	return doc.ID.Hex(), nil
+}
+
+// EnsureIndexes creates the partial unique index that enforces one sub-thread
+// per (user_id, originator_run_id, agent_id). The partial filter scopes
+// uniqueness to kind == "sub", so user-facing threads (empty kind) are
+// unaffected.
+func (r *ThreadRepo) EnsureIndexes(ctx context.Context) error {
+	_, err := r.col.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{
+			{Key: "user_id", Value: 1},
+			{Key: "originator_run_id", Value: 1},
+			{Key: "agent_id", Value: 1},
+		},
+		Options: options.Index().
+			SetUnique(true).
+			SetName("sub_thread_unique").
+			SetPartialFilterExpression(bson.M{"kind": "sub"}),
+	})
+	if err != nil {
+		return fmt.Errorf("thread_repo: sub-thread index: %w", err)
+	}
+	return nil
 }
 
 func (r *ThreadRepo) UpdateSummary(ctx context.Context, threadID, userID, summary string) error {

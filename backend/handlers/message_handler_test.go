@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"backend/agent"
+	"backend/dispatcher"
 	"backend/handlers"
 	"backend/llm"
 	"backend/model"
@@ -37,9 +38,9 @@ func newFlushable() *flushableRecorder {
 // ── fakeMessageStore ──────────────────────────────────────────────────────────
 
 type fakeMessageStore struct {
-	listRecentFn   func(context.Context, string, int) ([]llm.ChatMessage, error)
-	insertManyFn   func(context.Context, string, string, string, []llm.ChatMessage) ([]model.MessageDocument, error)
-	listDocsFn     func(context.Context, string, int) ([]model.MessageDocument, error)
+	listRecentFn func(context.Context, string, int) ([]llm.ChatMessage, error)
+	insertManyFn func(context.Context, string, string, string, []llm.ChatMessage) ([]model.MessageDocument, error)
+	listDocsFn   func(context.Context, string, int) ([]model.MessageDocument, error)
 }
 
 func (f *fakeMessageStore) ListRecentByThread(ctx context.Context, threadID string, limit int) ([]llm.ChatMessage, error) {
@@ -63,34 +64,23 @@ func (f *fakeMessageStore) ListDocsByThread(ctx context.Context, threadID string
 	return []model.MessageDocument{}, nil
 }
 
-// ── fakeRuntime ───────────────────────────────────────────────────────────────
+// ── fakeDispatcher ────────────────────────────────────────────────────────────
 
-type fakeRuntime struct {
-	runStreamFn func(context.Context, *agent.Agent, agent.RunContext, chan<- agent.StreamEvent) (*agent.RunResult, error)
+type fakeDispatcher struct {
+	dispatchFn func(context.Context, dispatcher.DispatchRequest, chan<- agent.StreamEvent) (*agent.RunResult, error)
 }
 
-func (f *fakeRuntime) RunStream(ctx context.Context, ag *agent.Agent, runCtx agent.RunContext, events chan<- agent.StreamEvent) (*agent.RunResult, error) {
-	if f.runStreamFn != nil {
-		return f.runStreamFn(ctx, ag, runCtx, events)
+func (f *fakeDispatcher) Dispatch(ctx context.Context, req dispatcher.DispatchRequest, events chan<- agent.StreamEvent) (*agent.RunResult, error) {
+	if f.dispatchFn != nil {
+		return f.dispatchFn(ctx, req, events)
 	}
-	// Emit terminal event so streamLoop exits cleanly, then close.
 	events <- agent.StreamEvent{Type: agent.EventRunCompleted, Time: time.Now()}
 	close(events)
 	return &agent.RunResult{Output: "ok", Steps: 1}, nil
 }
 
-// EstimateSystemPromptTokens returns 0 so the message handler falls back to
-// the conservative agent.ShouldSummarize heuristic in tests.
-func (f *fakeRuntime) EstimateSystemPromptTokens(_ context.Context, _ *agent.Agent, _ agent.RunContext) int {
+func (f *fakeDispatcher) EstimateSystemPromptTokens(_ context.Context, _ dispatcher.EstimateRequest) int {
 	return 0
-}
-
-// ── fakeSummarizer ────────────────────────────────────────────────────────────
-
-type fakeSummarizer struct{}
-
-func (f *fakeSummarizer) Summarize(_ context.Context, _ *agent.Agent, _ string, _ []agent.Turn) (string, llm.TokenUsage, error) {
-	return "summary", llm.TokenUsage{}, nil
 }
 
 // ── fakeRunRepo ───────────────────────────────────────────────────────────────
@@ -117,7 +107,7 @@ func (f *fakeRunRepo) GetRunForUser(ctx context.Context, runID, userID string) (
 	return &agent.RunInfo{RunID: runID, Status: "completed"}, nil
 }
 
-func (f *fakeRunRepo) Save(_ context.Context, _ agent.RunSnapshot) error              { return nil }
+func (f *fakeRunRepo) Save(_ context.Context, _ agent.RunSnapshot) error { return nil }
 func (f *fakeRunRepo) LoadLatest(ctx context.Context, runID string) (*agent.RunSnapshot, error) {
 	if f.loadLatestFn != nil {
 		return f.loadLatestFn(ctx, runID)
@@ -172,10 +162,10 @@ func newMessageHandler(
 	as *fakeAgentStore,
 	ts *fakeThreadStore,
 	ms *fakeMessageStore,
-	rt *fakeRuntime,
+	disp *fakeDispatcher,
 	runRepo agent.CheckpointStore,
 ) *handlers.MessageHandler {
-	return handlers.NewMessageHandler(as, ts, ms, rt, &fakeSummarizer{}, runRepo, context.Background())
+	return handlers.NewMessageHandler(as, ts, ms, disp, runRepo)
 }
 
 // defaultStores returns stores where all lookups succeed with minimal data.
@@ -198,7 +188,7 @@ func defaultStores() (*fakeAgentStore, *fakeThreadStore, *fakeMessageStore) {
 func TestMessageHandlerListRejectsUnauthorized(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/messages", nil)
 	r.SetPathValue("id", testThreadID)
 	w := httptest.NewRecorder()
@@ -214,7 +204,7 @@ func TestMessageHandlerListReturns404WhenThreadNotFound(t *testing.T) {
 	ts.getByIDFn = func(_ context.Context, _, _ string) (*model.ThreadDocument, error) {
 		return nil, errors.New("thread not found")
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/messages", nil)
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -231,7 +221,7 @@ func TestMessageHandlerListForwardsThreadRepoError(t *testing.T) {
 	ts.getByIDFn = func(_ context.Context, _, _ string) (*model.ThreadDocument, error) {
 		return nil, errors.New("db timeout") // not "thread not found"
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/messages", nil)
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -248,7 +238,7 @@ func TestMessageHandlerListForwardsMessageRepoError(t *testing.T) {
 	ms.listDocsFn = func(_ context.Context, _ string, _ int) ([]model.MessageDocument, error) {
 		return nil, errors.New("db down")
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/messages", nil)
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -262,7 +252,7 @@ func TestMessageHandlerListForwardsMessageRepoError(t *testing.T) {
 func TestMessageHandlerListReturnsEmptyArray(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/messages", nil)
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -288,7 +278,7 @@ func TestMessageHandlerListReturnsMessages(t *testing.T) {
 			{ID: bson.NewObjectID(), Role: "assistant", Content: "hi", CreatedAt: time.Now()},
 		}, nil
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/messages", nil)
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -315,7 +305,7 @@ func TestMessageHandlerListParseLimitDefault(t *testing.T) {
 		capturedLimit = limit
 		return []model.MessageDocument{}, nil
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/messages", nil)
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -335,7 +325,7 @@ func TestMessageHandlerListParseLimitCustom(t *testing.T) {
 		capturedLimit = limit
 		return []model.MessageDocument{}, nil
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/messages?limit=10", nil)
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -354,7 +344,7 @@ func TestMessageHandlerListParseLimitCappedAtMax(t *testing.T) {
 		capturedLimit = limit
 		return []model.MessageDocument{}, nil
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/messages?limit=9999", nil)
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -376,7 +366,7 @@ func validSendBody(t *testing.T) *bytes.Buffer {
 func TestMessageHandlerSendRejectsUnauthorized(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodPost, "/api/threads/"+testThreadID+"/messages", validSendBody(t))
 	r.SetPathValue("id", testThreadID)
 	w := httptest.NewRecorder()
@@ -389,7 +379,7 @@ func TestMessageHandlerSendRejectsUnauthorized(t *testing.T) {
 func TestMessageHandlerSendRejectsBadJSON(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodPost, "/api/threads/"+testThreadID+"/messages", bytes.NewBufferString("{bad"))
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -405,7 +395,7 @@ func TestMessageHandlerSendRejectsEmptyContent(t *testing.T) {
 	cases := []string{"", "   ", "\t\n"}
 	for _, content := range cases {
 		as, ts, ms := defaultStores()
-		h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+		h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 		b, _ := json.Marshal(map[string]any{"content": content})
 		r := httptest.NewRequest(http.MethodPost, "/api/threads/"+testThreadID+"/messages", bytes.NewBuffer(b))
 		r.SetPathValue("id", testThreadID)
@@ -424,7 +414,7 @@ func TestMessageHandlerSendReturns404WhenThreadNotFound(t *testing.T) {
 	ts.getByIDFn = func(_ context.Context, _, _ string) (*model.ThreadDocument, error) {
 		return nil, errors.New("thread not found")
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodPost, "/api/threads/"+testThreadID+"/messages", validSendBody(t))
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -441,7 +431,7 @@ func TestMessageHandlerSendForwardsThreadRepoError(t *testing.T) {
 	ts.getByIDFn = func(_ context.Context, _, _ string) (*model.ThreadDocument, error) {
 		return nil, errors.New("db timeout")
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodPost, "/api/threads/"+testThreadID+"/messages", validSendBody(t))
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -458,7 +448,7 @@ func TestMessageHandlerSendReturns404WhenAgentNotFound(t *testing.T) {
 	as.getByIDFn = func(_ context.Context, _, _ string) (*agent.Agent, error) {
 		return nil, errors.New("agent not found")
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodPost, "/api/threads/"+testThreadID+"/messages", validSendBody(t))
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -475,7 +465,7 @@ func TestMessageHandlerSendForwardsAgentRepoError(t *testing.T) {
 	as.getByIDFn = func(_ context.Context, _, _ string) (*agent.Agent, error) {
 		return nil, errors.New("db timeout")
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodPost, "/api/threads/"+testThreadID+"/messages", validSendBody(t))
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -492,7 +482,7 @@ func TestMessageHandlerSendForwardsMessageHistoryError(t *testing.T) {
 	ms.listRecentFn = func(_ context.Context, _ string, _ int) ([]llm.ChatMessage, error) {
 		return nil, errors.New("db down")
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodPost, "/api/threads/"+testThreadID+"/messages", validSendBody(t))
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -511,7 +501,7 @@ func TestMessageHandlerSendReturns500WhenRunCreateFails(t *testing.T) {
 			return errors.New("mongo write failed")
 		},
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, runRepo)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, runRepo)
 	r := httptest.NewRequest(http.MethodPost, "/api/threads/"+testThreadID+"/messages", validSendBody(t))
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -525,7 +515,7 @@ func TestMessageHandlerSendReturns500WhenRunCreateFails(t *testing.T) {
 func TestMessageHandlerSendStreamsRunCompletedEvent(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodPost, "/api/threads/"+testThreadID+"/messages", validSendBody(t))
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)
@@ -553,7 +543,7 @@ func TestMessageHandlerSendEmitsPersistFailEventOnInsertError(t *testing.T) {
 	ms.insertManyFn = func(_ context.Context, _, _, _ string, _ []llm.ChatMessage) ([]model.MessageDocument, error) {
 		return nil, errors.New("insert failed")
 	}
-	h := newMessageHandler(as, ts, ms, &fakeRuntime{}, nil)
+	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodPost, "/api/threads/"+testThreadID+"/messages", validSendBody(t))
 	r.SetPathValue("id", testThreadID)
 	r = withUser(r)

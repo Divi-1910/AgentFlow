@@ -180,6 +180,25 @@ func TestAgentHandlerCreateRejectsUnknownTool(t *testing.T) {
 	}
 }
 
+func TestAgentHandlerCreateRejectsDuplicateTool(t *testing.T) {
+	t.Parallel()
+	b, _ := json.Marshal(map[string]any{
+		"name":          "a",
+		"provider":      "openai",
+		"model":         "gpt-4",
+		"system_prompt": "x",
+		"tools":         []string{"calculator", "calculator"},
+	})
+	h := newAgentHandler(&fakeAgentStore{})
+	r := httptest.NewRequest(http.MethodPost, "/api/agents", bytes.NewBuffer(b))
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.Create(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("got %d, want 400", w.Code)
+	}
+}
+
 func TestAgentHandlerCreateReturns201WithDefaults(t *testing.T) {
 	t.Parallel()
 	h := newAgentHandler(&fakeAgentStore{})

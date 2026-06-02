@@ -24,7 +24,7 @@ func newRunHandler(runRepo agent.CheckpointStore) *handlers.RunHandler {
 		&fakeAgentStore{},
 		&fakeMessageStore{},
 		runRepo,
-		&fakeRuntime{},
+		&fakeDispatcher{},
 		tools.NewEmptyRegistry(),
 	)
 }
@@ -34,7 +34,7 @@ func newResumeRunHandler(
 	repo agent.CheckpointStore,
 	as *fakeAgentStore,
 	ms *fakeMessageStore,
-	rt *fakeRuntime,
+	rt *fakeDispatcher,
 ) *handlers.RunHandler {
 	return handlers.NewRunHandler(
 		as,
@@ -150,7 +150,7 @@ func resumeRequest(t *testing.T) *http.Request {
 
 func TestResumeRunRejectsUnauthorized(t *testing.T) {
 	t.Parallel()
-	h := newResumeRunHandler(resumableRepo(), &fakeAgentStore{}, &fakeMessageStore{}, &fakeRuntime{})
+	h := newResumeRunHandler(resumableRepo(), &fakeAgentStore{}, &fakeMessageStore{}, &fakeDispatcher{})
 	r := resumeRequest(t) // no user in context
 	w := httptest.NewRecorder()
 	h.ResumeRun(w, r)
@@ -161,7 +161,7 @@ func TestResumeRunRejectsUnauthorized(t *testing.T) {
 
 func TestResumeRunReturns400ForEmptyRunID(t *testing.T) {
 	t.Parallel()
-	h := newResumeRunHandler(resumableRepo(), &fakeAgentStore{}, &fakeMessageStore{}, &fakeRuntime{})
+	h := newResumeRunHandler(resumableRepo(), &fakeAgentStore{}, &fakeMessageStore{}, &fakeDispatcher{})
 	r := httptest.NewRequest(http.MethodPost, "/api/runs//resume", nil)
 	// no SetPathValue → PathValue("id") == ""
 	r = withUser(r)
@@ -179,7 +179,7 @@ func TestResumeRunReturns404WhenRunNotFound(t *testing.T) {
 			return nil, errors.New("not found")
 		},
 	}
-	h := newResumeRunHandler(repo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeRuntime{})
+	h := newResumeRunHandler(repo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeDispatcher{})
 	r := withUser(resumeRequest(t))
 	w := httptest.NewRecorder()
 	h.ResumeRun(w, r)
@@ -196,7 +196,7 @@ func TestResumeRunReturns409WhenRunNotResumable(t *testing.T) {
 			return &agent.RunInfo{RunID: runID, Status: string(model.RunStatusCompleted)}, nil
 		},
 	}
-	h := newResumeRunHandler(repo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeRuntime{})
+	h := newResumeRunHandler(repo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeDispatcher{})
 	r := withUser(resumeRequest(t))
 	w := httptest.NewRecorder()
 	h.ResumeRun(w, r)
@@ -211,7 +211,7 @@ func TestResumeRunReturns500WhenTransitionFails(t *testing.T) {
 	repo.transitionForUserFn = func(_ context.Context, _, _, _, _ string) (bool, error) {
 		return false, errors.New("db write failed")
 	}
-	h := newResumeRunHandler(repo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeRuntime{})
+	h := newResumeRunHandler(repo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeDispatcher{})
 	r := withUser(resumeRequest(t))
 	w := httptest.NewRecorder()
 	h.ResumeRun(w, r)
@@ -226,7 +226,7 @@ func TestResumeRunReturns409WhenClaimFails(t *testing.T) {
 	repo.transitionForUserFn = func(_ context.Context, _, _, _, _ string) (bool, error) {
 		return false, nil // claimed=false, no error → concurrent resume
 	}
-	h := newResumeRunHandler(repo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeRuntime{})
+	h := newResumeRunHandler(repo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeDispatcher{})
 	r := withUser(resumeRequest(t))
 	w := httptest.NewRecorder()
 	h.ResumeRun(w, r)
@@ -241,7 +241,7 @@ func TestResumeRunReturns500WhenLoadLatestFails(t *testing.T) {
 	repo.loadLatestFn = func(_ context.Context, _ string) (*agent.RunSnapshot, error) {
 		return nil, errors.New("storage unavailable")
 	}
-	h := newResumeRunHandler(repo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeRuntime{})
+	h := newResumeRunHandler(repo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeDispatcher{})
 	r := withUser(resumeRequest(t))
 	w := httptest.NewRecorder()
 	h.ResumeRun(w, r)
@@ -256,7 +256,7 @@ func TestResumeRunReturns422WhenSnapshotInvalid(t *testing.T) {
 	repo.loadLatestFn = func(_ context.Context, _ string) (*agent.RunSnapshot, error) {
 		return nil, nil // nil snapshot → ValidateSnapshot returns error
 	}
-	h := newResumeRunHandler(repo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeRuntime{})
+	h := newResumeRunHandler(repo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeDispatcher{})
 	r := withUser(resumeRequest(t))
 	w := httptest.NewRecorder()
 	h.ResumeRun(w, r)
@@ -272,7 +272,7 @@ func TestResumeRunReturns500WhenAgentNotFound(t *testing.T) {
 			return nil, errors.New("agent not found")
 		},
 	}
-	h := newResumeRunHandler(resumableRepo(), as, &fakeMessageStore{}, &fakeRuntime{})
+	h := newResumeRunHandler(resumableRepo(), as, &fakeMessageStore{}, &fakeDispatcher{})
 	r := withUser(resumeRequest(t))
 	w := httptest.NewRecorder()
 	h.ResumeRun(w, r)
@@ -283,7 +283,7 @@ func TestResumeRunReturns500WhenAgentNotFound(t *testing.T) {
 
 func TestResumeRunStreamsRunCompletedEvent(t *testing.T) {
 	t.Parallel()
-	h := newResumeRunHandler(resumableRepo(), &fakeAgentStore{}, &fakeMessageStore{}, &fakeRuntime{})
+	h := newResumeRunHandler(resumableRepo(), &fakeAgentStore{}, &fakeMessageStore{}, &fakeDispatcher{})
 	r := withUser(resumeRequest(t))
 	w := newFlushable()
 	h.ResumeRun(w, r)
@@ -317,7 +317,7 @@ func TestResumeRunIncrementAttemptFailureIsNonFatal(t *testing.T) {
 	_ = repo2
 	// Use an inline fakeRunRepo that overrides only IncrementAttempt.
 	customRepo := &incrementFailRepo{fakeRunRepo: resumableRepo()}
-	h := newResumeRunHandler(customRepo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeRuntime{})
+	h := newResumeRunHandler(customRepo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeDispatcher{})
 	r := withUser(resumeRequest(t))
 	w := newFlushable()
 	h.ResumeRun(w, r)

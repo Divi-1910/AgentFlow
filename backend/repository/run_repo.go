@@ -58,17 +58,29 @@ func (r *RunRepo) EnsureIndexes(ctx context.Context) error {
 }
 
 func (r *RunRepo) CreateRun(ctx context.Context, runID, threadID, agentID, userID string) error {
+	// Top-level run: it is its own originator, no parent.
+	return r.createRun(ctx, runID, threadID, agentID, userID, runID, "")
+}
+
+// CreateChildRun records a delegated (child) run with its delegation lineage.
+func (r *RunRepo) CreateChildRun(ctx context.Context, runID, threadID, agentID, userID, originatorRunID, parentRunID string) error {
+	return r.createRun(ctx, runID, threadID, agentID, userID, originatorRunID, parentRunID)
+}
+
+func (r *RunRepo) createRun(ctx context.Context, runID, threadID, agentID, userID, originatorRunID, parentRunID string) error {
 	now := time.Now()
 	doc := model.RunDocument{
-		ID:        bson.NewObjectID(),
-		RunID:     runID,
-		ThreadID:  threadID,
-		AgentID:   agentID,
-		UserID:    userID,
-		Status:    model.RunStatusRunning,
-		Attempt:   1,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:              bson.NewObjectID(),
+		RunID:           runID,
+		ThreadID:        threadID,
+		AgentID:         agentID,
+		UserID:          userID,
+		Status:          model.RunStatusRunning,
+		Attempt:         1,
+		OriginatorRunID: originatorRunID,
+		ParentRunID:     parentRunID,
+		CreatedAt:       now,
+		UpdatedAt:       now,
 	}
 	if _, err := r.runs.InsertOne(ctx, doc); err != nil {
 		return fmt.Errorf("run_repo: create run: %w", err)
@@ -204,14 +216,16 @@ func (r *RunRepo) GetRun(ctx context.Context, runID string) (*agent.RunInfo, err
 		return nil, fmt.Errorf("run_repo: get run: %w", err)
 	}
 	return &agent.RunInfo{
-		RunID:          doc.RunID,
-		ThreadID:       doc.ThreadID,
-		AgentID:        doc.AgentID,
-		UserID:         doc.UserID,
-		Status:         string(doc.Status),
-		Attempt:        doc.Attempt,
-		StepsCompleted: doc.StepsCompleted,
-		LastError:      doc.LastError,
+		RunID:           doc.RunID,
+		ThreadID:        doc.ThreadID,
+		AgentID:         doc.AgentID,
+		UserID:          doc.UserID,
+		Status:          string(doc.Status),
+		Attempt:         doc.Attempt,
+		StepsCompleted:  doc.StepsCompleted,
+		LastError:       doc.LastError,
+		OriginatorRunID: doc.OriginatorRunID,
+		ParentRunID:     doc.ParentRunID,
 	}, nil
 }
 
@@ -225,13 +239,15 @@ func (r *RunRepo) GetRunForUser(ctx context.Context, runID, userID string) (*age
 		return nil, fmt.Errorf("run_repo: get run for user: %w", err)
 	}
 	return &agent.RunInfo{
-		RunID:          doc.RunID,
-		ThreadID:       doc.ThreadID,
-		AgentID:        doc.AgentID,
-		UserID:         doc.UserID,
-		Status:         string(doc.Status),
-		Attempt:        doc.Attempt,
-		StepsCompleted: doc.StepsCompleted,
-		LastError:      doc.LastError,
+		RunID:           doc.RunID,
+		ThreadID:        doc.ThreadID,
+		AgentID:         doc.AgentID,
+		UserID:          doc.UserID,
+		Status:          string(doc.Status),
+		Attempt:         doc.Attempt,
+		StepsCompleted:  doc.StepsCompleted,
+		LastError:       doc.LastError,
+		OriginatorRunID: doc.OriginatorRunID,
+		ParentRunID:     doc.ParentRunID,
 	}, nil
 }

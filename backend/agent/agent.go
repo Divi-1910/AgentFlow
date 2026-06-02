@@ -33,6 +33,7 @@ type Agent struct {
 	Model              string
 	SystemPrompt       string
 	Tools              []string
+	Delegates          []DelegateConfig
 	ModelContextLimit  int
 	ContextWindow      int
 	ContextKeepRatio   float64
@@ -41,6 +42,17 @@ type Agent struct {
 	Temperature        float64
 	MaxTokens          int
 	CreatedAt          time.Time
+}
+
+// DelegateConfig declares another agent this agent may call as a tool. The
+// runtime synthesizes a DelegateTool per entry; AgentID is the callee (owned
+// by the same user), ToolName is what the LLM sees, Description/Instructions
+// guide when and how to call it.
+type DelegateConfig struct {
+	AgentID      string
+	ToolName     string
+	Description  string
+	Instructions string
 }
 
 type RunContext struct {
@@ -68,6 +80,16 @@ type RunContext struct {
 	// invocation. Zero for fresh runs; copied from the checkpoint snapshot
 	// for resumes. Surfaced to the model inside <context><state>.
 	StepsCompleted int
+
+	// Delegation tree fields. For a top-level run, OriginatorRunID == RunID,
+	// ParentRunID == "", DelegationChain == [agentID], DelegationDepth == 0.
+	// For a delegated (child) run these are carried in from the dispatch
+	// payload. OriginatorRunID keys the cancel topic/registry for the whole
+	// tree; RunID keys the per-run event topic.
+	OriginatorRunID string
+	ParentRunID     string
+	DelegationChain []string
+	DelegationDepth int
 }
 
 type RunResult struct {

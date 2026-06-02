@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"backend/agent"
+	"backend/dispatcher"
 	"backend/handlers"
 	"backend/llm"
 	"backend/middleware"
@@ -64,11 +65,11 @@ type testEnv struct {
 	llmModelCol *mongo.Collection   // exposed for LLM model seeding
 }
 
-// runtimeFn mirrors the unexported handlers.runtimeExecutor interface.
+// runtimeFn mirrors the dispatcher.Dispatcher interface.
 // Both stubRuntime and scriptedRuntime satisfy this.
 type runtimeFn interface {
-	RunStream(ctx context.Context, ag *agent.Agent, runCtx agent.RunContext, events chan<- agent.StreamEvent) (*agent.RunResult, error)
-	EstimateSystemPromptTokens(ctx context.Context, ag *agent.Agent, runCtx agent.RunContext) int
+	Dispatch(ctx context.Context, req dispatcher.DispatchRequest, events chan<- agent.StreamEvent) (*agent.RunResult, error)
+	EstimateSystemPromptTokens(ctx context.Context, req dispatcher.EstimateRequest) int
 }
 
 // newTestEnv creates a fresh HTTP test server backed by a stubRuntime.
@@ -90,28 +91,27 @@ func newTestEnvWithRuntime(t *testing.T, rt runtimeFn) *testEnv {
 	}
 
 	// Real repos ──────────────────────────────────────────────────────────────
-	userRepo     := repository.NewUserRepo(col("users"))
-	agentRepo    := repository.NewAgentRepo(col("agents"), col("models"))
-	threadRepo   := repository.NewThreadRepo(col("threads"))
-	messageRepo  := repository.NewMessageRepo(col("messages"))
-	llmModelCol  := col("llm_models")
+	userRepo := repository.NewUserRepo(col("users"))
+	agentRepo := repository.NewAgentRepo(col("agents"), col("models"))
+	threadRepo := repository.NewThreadRepo(col("threads"))
+	messageRepo := repository.NewMessageRepo(col("messages"))
+	llmModelCol := col("llm_models")
 	llmModelRepo := repository.NewLLMModelRepo(llmModelCol)
-	runRepo      := repository.NewRunRepo(col("runs"), col("checkpoints"))
+	runRepo := repository.NewRunRepo(col("runs"), col("checkpoints"))
 	if err := runRepo.EnsureIndexes(context.Background()); err != nil {
 		t.Fatalf("EnsureIndexes: %v", err)
 	}
 
 	// Stubs ───────────────────────────────────────────────────────────────────
-	summ    := &stubSummarizer{}
-	llmReg  := llm.NewEmptyLLMRegistry()
+	llmReg := llm.NewEmptyLLMRegistry()
 	toolReg := tools.NewEmptyRegistry()
 
 	// Handlers ────────────────────────────────────────────────────────────────
-	authHandler   := handlers.NewAuthHandler(userRepo, nil) // nil → real auth.GenerateToken
-	agentHandler  := handlers.NewAgentHandler(agentRepo, toolReg)
+	authHandler := handlers.NewAuthHandler(userRepo, nil) // nil → real auth.GenerateToken
+	agentHandler := handlers.NewAgentHandler(agentRepo, toolReg)
 	threadHandler := handlers.NewThreadHandler(threadRepo, agentRepo)
-	msgHandler    := handlers.NewMessageHandler(
-		agentRepo, threadRepo, messageRepo, rt, summ, runRepo, context.Background(),
+	msgHandler := handlers.NewMessageHandler(
+		agentRepo, threadRepo, messageRepo, rt, runRepo,
 	)
 	llmHandler := handlers.NewLLMHandler(llmModelRepo, llmReg)
 	runHandler := handlers.NewRunHandler(agentRepo, messageRepo, runRepo, rt, toolReg)
@@ -119,25 +119,25 @@ func newTestEnvWithRuntime(t *testing.T, rt runtimeFn) *testEnv {
 	// Routing — mirrors main.go ────────────────────────────────────────────────
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/auth/signup", authHandler.SignUp)
-	mux.HandleFunc("POST /api/auth/login",  authHandler.Login)
-	mux.HandleFunc("GET /api/auth/me",      middleware.RequireAuth(authHandler.Me))
+	mux.HandleFunc("POST /api/auth/login", authHandler.Login)
+	mux.HandleFunc("GET /api/auth/me", middleware.RequireAuth(authHandler.Me))
 
-	mux.HandleFunc("GET /api/llms",      middleware.RequireAuth(llmHandler.GetLLMs))
+	mux.HandleFunc("GET /api/llms", middleware.RequireAuth(llmHandler.GetLLMs))
 	mux.HandleFunc("POST /api/llm/chat", middleware.RequireAuth(llmHandler.Chat))
 
-	mux.HandleFunc("POST /api/agents",        middleware.RequireAuth(agentHandler.Create))
-	mux.HandleFunc("GET /api/agents",         middleware.RequireAuth(agentHandler.List))
-	mux.HandleFunc("GET /api/agents/{id}",    middleware.RequireAuth(agentHandler.Get))
-	mux.HandleFunc("PUT /api/agents/{id}",    middleware.RequireAuth(agentHandler.Update))
+	mux.HandleFunc("POST /api/agents", middleware.RequireAuth(agentHandler.Create))
+	mux.HandleFunc("GET /api/agents", middleware.RequireAuth(agentHandler.List))
+	mux.HandleFunc("GET /api/agents/{id}", middleware.RequireAuth(agentHandler.Get))
+	mux.HandleFunc("PUT /api/agents/{id}", middleware.RequireAuth(agentHandler.Update))
 	mux.HandleFunc("DELETE /api/agents/{id}", middleware.RequireAuth(agentHandler.Delete))
 
 	mux.HandleFunc("POST /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.Create))
-	mux.HandleFunc("GET /api/agents/{id}/threads",  middleware.RequireAuth(threadHandler.ListByAgent))
+	mux.HandleFunc("GET /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.ListByAgent))
 
 	mux.HandleFunc("POST /api/threads/{id}/messages", middleware.RequireAuth(msgHandler.Send))
-	mux.HandleFunc("GET /api/threads/{id}/messages",  middleware.RequireAuth(msgHandler.List))
+	mux.HandleFunc("GET /api/threads/{id}/messages", middleware.RequireAuth(msgHandler.List))
 
-	mux.HandleFunc("GET /api/runs/{id}",         middleware.RequireAuth(runHandler.GetRun))
+	mux.HandleFunc("GET /api/runs/{id}", middleware.RequireAuth(runHandler.GetRun))
 	mux.HandleFunc("POST /api/runs/{id}/resume", middleware.RequireAuth(runHandler.ResumeRun))
 
 	srv := httptest.NewServer(mux)
@@ -252,14 +252,13 @@ func sanitize(s string) string {
 // the events channel so streamLoop exits cleanly.
 type stubRuntime struct{}
 
-func (s *stubRuntime) RunStream(
-	ctx context.Context,
-	ag *agent.Agent,
-	runCtx agent.RunContext,
+func (s *stubRuntime) Dispatch(
+	_ context.Context,
+	req dispatcher.DispatchRequest,
 	events chan<- agent.StreamEvent,
 ) (*agent.RunResult, error) {
-	events <- agent.StreamEvent{Type: agent.EventRunStarted, RunID: runCtx.RunID, Time: time.Now()}
-	events <- agent.StreamEvent{Type: agent.EventRunCompleted, RunID: runCtx.RunID, Time: time.Now()}
+	events <- agent.StreamEvent{Type: agent.EventRunStarted, RunID: req.RunID, Time: time.Now()}
+	events <- agent.StreamEvent{Type: agent.EventRunCompleted, RunID: req.RunID, Time: time.Now()}
 	close(events)
 	return &agent.RunResult{
 		NewMessages: []llm.ChatMessage{{Role: "assistant", Content: "stub response"}},
@@ -269,7 +268,7 @@ func (s *stubRuntime) RunStream(
 
 // EstimateSystemPromptTokens returns 0 so the message handler falls back to
 // the conservative agent.ShouldSummarize heuristic in tests.
-func (s *stubRuntime) EstimateSystemPromptTokens(_ context.Context, _ *agent.Agent, _ agent.RunContext) int {
+func (s *stubRuntime) EstimateSystemPromptTokens(_ context.Context, _ dispatcher.EstimateRequest) int {
 	return 0
 }
 
@@ -305,10 +304,9 @@ type scriptedRuntime struct {
 	callIdx int
 }
 
-func (s *scriptedRuntime) RunStream(
-	ctx context.Context,
-	ag *agent.Agent,
-	runCtx agent.RunContext,
+func (s *scriptedRuntime) Dispatch(
+	_ context.Context,
+	req dispatcher.DispatchRequest,
 	events chan<- agent.StreamEvent,
 ) (*agent.RunResult, error) {
 	s.mu.Lock()
@@ -323,7 +321,7 @@ func (s *scriptedRuntime) RunStream(
 	s.mu.Unlock()
 
 	for _, e := range call.events {
-		e.RunID = runCtx.RunID
+		e.RunID = req.RunID
 		events <- e
 	}
 	close(events)
@@ -332,6 +330,6 @@ func (s *scriptedRuntime) RunStream(
 
 // EstimateSystemPromptTokens returns 0 so the message handler falls back to
 // the conservative agent.ShouldSummarize heuristic in tests.
-func (s *scriptedRuntime) EstimateSystemPromptTokens(_ context.Context, _ *agent.Agent, _ agent.RunContext) int {
+func (s *scriptedRuntime) EstimateSystemPromptTokens(_ context.Context, _ dispatcher.EstimateRequest) int {
 	return 0
 }

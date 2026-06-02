@@ -168,7 +168,7 @@ func newTestRuntime(lm llm.LLMClient, store CheckpointStore) (*AgentRuntime, *Ag
 	rt := &AgentRuntime{
 		llmRegistry:     llmReg,
 		toolRegistry:    toolReg,
-		contextBuilder:  newTestContextBuilder(toolReg),
+		contextBuilder:  newTestContextBuilder(),
 		checkpointStore: store,
 	}
 	ag := &Agent{
@@ -182,14 +182,14 @@ func newTestRuntime(lm llm.LLMClient, store CheckpointStore) (*AgentRuntime, *Ag
 }
 
 // newTestContextBuilder constructs a ContextBuilder that is safe for unit
-// tests: no platform XML, no memory backend. The builder skips memory and
-// preference layers when those backends are nil, so it produces a minimal but
-// well-formed system message.
-func newTestContextBuilder(toolReg *tools.ToolRegistry) *ContextBuilder {
+// tests: no platform XML beyond a stub, no memory backend. The builder skips
+// memory and preference layers when those backends are nil, so it produces a
+// minimal but well-formed system message. Tool instructions now come from the
+// per-run tool definitions passed into Build, not from the builder.
+func newTestContextBuilder() *ContextBuilder {
 	return &ContextBuilder{
-		platform:     &PlatformConfig{Body: "<platform>test platform</platform>"},
-		toolRegistry: toolReg,
-		now:          func() time.Time { return time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC) },
+		platform: &PlatformConfig{Body: "<platform>test platform</platform>"},
+		now:      func() time.Time { return time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC) },
 	}
 }
 
@@ -593,7 +593,7 @@ func TestResumeFromPostModelPhaseSkipsInitialLLMCall(t *testing.T) {
 		},
 		Meta: SnapshotMeta{
 			Phase:     PhasePostModel,
-			ToolsUsed: []string{"calculator"},
+			EffectiveTools: ToolRefList{{Name: "calculator"}},
 		},
 	}
 
@@ -641,7 +641,7 @@ func TestResumeFromPreModelPhaseCallsLLMNormally(t *testing.T) {
 		},
 		Meta: SnapshotMeta{
 			Phase:     PhasePreModel,
-			ToolsUsed: []string{"calculator"},
+			EffectiveTools: ToolRefList{{Name: "calculator"}},
 		},
 	}
 
@@ -709,7 +709,7 @@ func TestRuntimeOnResumeStateAdvancesPastSnapshotStep(t *testing.T) {
 			MaxSteps:       10,
 			ToolFailures:   map[string]int{},
 		},
-		Meta: SnapshotMeta{Phase: PhasePreModel, ToolsUsed: []string{"calculator"}},
+		Meta: SnapshotMeta{Phase: PhasePreModel, EffectiveTools: ToolRefList{{Name: "calculator"}}},
 	}
 
 	lm := &fakeLLM{

@@ -2,17 +2,13 @@ package agent
 
 import (
 	"backend/llm"
-	"backend/tools"
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 	"time"
 )
 
@@ -43,18 +39,29 @@ type RuntimeState struct {
 }
 
 type SnapshotMeta struct {
-	AgentID            string    `json:"agent_id"`
-	ThreadID           string    `json:"thread_id"`
-	Provider           string    `json:"provider"`
-	Model              string    `json:"model"`
-	Temperature        float64   `json:"temperature"`
-	ToolsetVersion     string    `json:"toolset_version"` // sha256[:8] of sorted tool names
-	ToolsUsed          []string  `json:"tools_used"`      // tool names present at snapshot time
-	Attempt            int       `json:"attempt"`
-	Phase              string    `json:"phase"`
-	CheckpointFailures int       `json:"checkpoint_failures"`
-	LastCheckpointAt   time.Time `json:"last_checkpoint_at"`
-	CreatedAt          time.Time `json:"created_at"`
+	AgentID        string  `json:"agent_id"`
+	ThreadID       string  `json:"thread_id"`
+	Provider       string  `json:"provider"`
+	Model          string  `json:"model"`
+	Temperature    float64 `json:"temperature"`
+	ToolsetVersion string  `json:"toolset_version"` // sha256[:8] of the effective toolset
+	// EffectiveTools is the full effective tool set at snapshot time (every
+	// tool available to the run, not only those already invoked), with
+	// per-tool structural + cosmetic identity for resume validation. The
+	// json tag stays "tools_used" for back-compat; ToolRefList decodes both
+	// the legacy []string shape and the new object shape.
+	EffectiveTools     ToolRefList `json:"tools_used"`
+	Attempt            int         `json:"attempt"`
+	Phase              string      `json:"phase"`
+	CheckpointFailures int         `json:"checkpoint_failures"`
+	LastCheckpointAt   time.Time   `json:"last_checkpoint_at"`
+	CreatedAt          time.Time   `json:"created_at"`
+
+	// Delegation lineage (restored into RunContext on resume).
+	OriginatorRunID string   `json:"originator_run_id,omitempty"`
+	ParentRunID     string   `json:"parent_run_id,omitempty"`
+	DelegationChain []string `json:"delegation_chain,omitempty"`
+	DelegationDepth int      `json:"delegation_depth,omitempty"`
 }
 
 type CheckpointStore interface {
@@ -70,17 +77,19 @@ type CheckpointStore interface {
 }
 
 type RunInfo struct {
-	RunID          string `json:"run_id"`
-	ThreadID       string `json:"thread_id"`
-	AgentID        string `json:"agent_id,omitempty"`
-	UserID         string `json:"user_id,omitempty"`
-	Status         string `json:"status"`
-	Attempt        int    `json:"attempt"`
-	StepsCompleted int    `json:"steps_completed"`
-	LastError      string `json:"last_error,omitempty"`
+	RunID           string `json:"run_id"`
+	ThreadID        string `json:"thread_id"`
+	AgentID         string `json:"agent_id,omitempty"`
+	UserID          string `json:"user_id,omitempty"`
+	Status          string `json:"status"`
+	Attempt         int    `json:"attempt"`
+	StepsCompleted  int    `json:"steps_completed"`
+	LastError       string `json:"last_error,omitempty"`
+	OriginatorRunID string `json:"originator_run_id,omitempty"`
+	ParentRunID     string `json:"parent_run_id,omitempty"`
 }
 
-func ValidateSnapshot(s *RunSnapshot, registry *tools.ToolRegistry) error {
+func ValidateSnapshot(s *RunSnapshot, ts *ToolSet) error {
 	if s == nil {
 		return errors.New("snapshot is nil")
 	}
@@ -102,43 +111,56 @@ func ValidateSnapshot(s *RunSnapshot, registry *tools.ToolRegistry) error {
 	if s.State.ToolFailures == nil {
 		s.State.ToolFailures = make(map[string]int)
 	}
-	return CanResume(s.Meta, registry)
+	return CanResume(s.Meta, ts)
 }
 
-func CanResume(meta SnapshotMeta, registry *tools.ToolRegistry) error {
-	for _, toolName := range meta.ToolsUsed {
-		if !registry.Has(toolName) {
-			return fmt.Errorf("tool %q is no longer registered — cannot resume safely", toolName)
+// CanResume is fatal when a recorded effective tool is missing from the current
+// set or has changed structurally (name+params, or a delegate's target).
+// Legacy snapshots (decoded from the old []string shape) carry no StructHash,
+// so they fall back to a presence-only check.
+func CanResume(meta SnapshotMeta, ts *ToolSet) error {
+	current := make(map[string]ToolRef, len(ts.order))
+	for _, r := range ts.Refs() {
+		current[r.Name] = r
+	}
+	for _, used := range meta.EffectiveTools {
+		cur, ok := current[used.Name]
+		if !ok {
+			return fmt.Errorf("tool %q is no longer available — cannot resume safely", used.Name)
+		}
+		if used.StructHash != "" && used.StructHash != cur.StructHash {
+			return fmt.Errorf("tool %q changed structurally since checkpoint — cannot resume safely", used.Name)
 		}
 	}
 	return nil
 }
 
-func ToolsetVersionWarning(meta SnapshotMeta, registry *tools.ToolRegistry) string {
-	if meta.ToolsetVersion == "" {
-		return "" // pre-versioning snapshot; no baseline to compare against
+// ToolsetCosmeticWarning warns (never blocks) when a used tool's description or
+// instructions drifted since the checkpoint — behaviour may differ but resume
+// is safe.
+func ToolsetCosmeticWarning(meta SnapshotMeta, ts *ToolSet) string {
+	current := make(map[string]ToolRef, len(ts.order))
+	for _, r := range ts.Refs() {
+		current[r.Name] = r
 	}
-	current := ComputeToolsetVersion(registry)
-	if current == meta.ToolsetVersion {
+	var changed []string
+	for _, used := range meta.EffectiveTools {
+		cur, ok := current[used.Name]
+		if !ok || used.CosmeticHash == "" {
+			continue
+		}
+		if used.CosmeticHash != cur.CosmeticHash {
+			changed = append(changed, used.Name)
+		}
+	}
+	if len(changed) == 0 {
 		return ""
 	}
-	return fmt.Sprintf(
-		"toolset version changed since checkpoint (snapshot=%s current=%s tools_used=%v) — resume proceeds but tool behaviour may differ",
-		meta.ToolsetVersion, current, meta.ToolsUsed,
-	)
+	return fmt.Sprintf("tool description/instructions changed since checkpoint for %v — resume proceeds, behaviour may differ", changed)
 }
 
-func ComputeToolsetVersion(registry *tools.ToolRegistry) string {
-	defs := registry.Definitions()
-	var sb strings.Builder
-	for _, d := range defs {
-		sb.WriteString(d.Name)
-		sb.WriteByte(':')
-		sb.Write(d.Parameters)
-		sb.WriteByte('\n')
-	}
-	h := sha256.Sum256([]byte(sb.String()))
-	return hex.EncodeToString(h[:4])
+func ComputeToolsetVersion(ts *ToolSet) string {
+	return ts.Version()
 }
 
 func IsResumable(err error) bool {

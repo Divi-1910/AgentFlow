@@ -38,6 +38,7 @@ func (r *AgentRepo) Create(ctx context.Context, userID string, input *agent.Agen
 		Model:              input.Model,
 		SystemPrompt:       input.SystemPrompt,
 		Tools:              input.Tools,
+		Delegates:          toDelegateConfigDocs(input.Delegates),
 		ContextWindow:      input.ContextWindow,
 		ContextKeepRatio:   input.ContextKeepRatio,
 		SummarizationModel: input.SummarizationModel,
@@ -128,6 +129,7 @@ type UpdateAgentInput struct {
 	Description        *string
 	SystemPrompt       *string
 	Tools              *[]string
+	Delegates          *[]agent.DelegateConfig
 	Provider           *string
 	Model              *string
 	Temperature        *float64
@@ -159,6 +161,9 @@ func (r *AgentRepo) Update(ctx context.Context, agentID, userID string, input Up
 	}
 	if input.Tools != nil {
 		set["tools"] = *input.Tools
+	}
+	if input.Delegates != nil {
+		set["delegates"] = toDelegateConfigDocs(*input.Delegates)
 	}
 	if input.Provider != nil {
 		set["provider"] = *input.Provider
@@ -229,6 +234,7 @@ func (r *AgentRepo) toRuntimeAgent(ctx context.Context, doc model.AgentDocument)
 		Model:              doc.Model,
 		SystemPrompt:       doc.SystemPrompt,
 		Tools:              doc.Tools,
+		Delegates:          toDelegateConfigs(doc.Delegates),
 		ModelContextLimit:  r.resolveContextLimit(ctx, doc.Provider, doc.Model),
 		ContextWindow:      doc.ContextWindow,
 		ContextKeepRatio:   doc.ContextKeepRatio,
@@ -238,6 +244,38 @@ func (r *AgentRepo) toRuntimeAgent(ctx context.Context, doc model.AgentDocument)
 		MaxTokens:          doc.MaxTokens,
 		CreatedAt:          doc.CreatedAt,
 	}
+}
+
+func toDelegateConfigDocs(in []agent.DelegateConfig) []model.DelegateConfigDoc {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]model.DelegateConfigDoc, len(in))
+	for i, d := range in {
+		out[i] = model.DelegateConfigDoc{
+			AgentID:      d.AgentID,
+			ToolName:     d.ToolName,
+			Description:  d.Description,
+			Instructions: d.Instructions,
+		}
+	}
+	return out
+}
+
+func toDelegateConfigs(in []model.DelegateConfigDoc) []agent.DelegateConfig {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]agent.DelegateConfig, len(in))
+	for i, d := range in {
+		out[i] = agent.DelegateConfig{
+			AgentID:      d.AgentID,
+			ToolName:     d.ToolName,
+			Description:  d.Description,
+			Instructions: d.Instructions,
+		}
+	}
+	return out
 }
 
 func (r *AgentRepo) resolveContextLimit(ctx context.Context, provider, modelID string) int {

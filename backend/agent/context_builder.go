@@ -10,7 +10,6 @@ import (
 	"backend/llm"
 	"backend/memory"
 	"backend/runtimectx"
-	"backend/tools"
 )
 
 const (
@@ -60,25 +59,22 @@ const (
 // Build is the single source of truth for both fresh runs and checkpoint
 // resumes — the same system message is produced in either path.
 type ContextBuilder struct {
-	platform     *PlatformConfig
-	memService   *memory.Service
-	metaStore    memory.MetaStore
-	toolRegistry *tools.ToolRegistry
-	now          func() time.Time
+	platform   *PlatformConfig
+	memService *memory.Service
+	metaStore  memory.MetaStore
+	now        func() time.Time
 }
 
 func NewContextBuilder(
 	platform *PlatformConfig,
 	memSvc *memory.Service,
 	metaStore memory.MetaStore,
-	toolRegistry *tools.ToolRegistry,
 ) *ContextBuilder {
 	return &ContextBuilder{
-		platform:     platform,
-		memService:   memSvc,
-		metaStore:    metaStore,
-		toolRegistry: toolRegistry,
-		now:          func() time.Time { return time.Now().UTC() },
+		platform:   platform,
+		memService: memSvc,
+		metaStore:  metaStore,
+		now:        func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -95,8 +91,8 @@ func NewContextBuilder(
 // Build does NOT truncate tool results. The returned slice is the canonical
 // state the runtime mutates and checkpoints; truncation is a display concern
 // applied separately by RenderForLLM just before a ChatCompletion call.
-func (cb *ContextBuilder) Build(ctx context.Context, agent *Agent, runCtx RunContext) ([]llm.ChatMessage, error) {
-	systemContent, err := cb.buildSystemContent(ctx, agent, runCtx)
+func (cb *ContextBuilder) Build(ctx context.Context, agent *Agent, runCtx RunContext, toolDefs []llm.ToolDefinition) ([]llm.ChatMessage, error) {
+	systemContent, err := cb.buildSystemContent(ctx, agent, runCtx, toolDefs)
 	if err != nil {
 		return nil, err
 	}
@@ -121,8 +117,8 @@ func (cb *ContextBuilder) Build(ctx context.Context, agent *Agent, runCtx RunCon
 // (agent, runCtx). The runtime calls this before each ChatCompletion so the
 // <state> block reflects live values (current step, phase, last action) while
 // the static prefix stays byte-identical for prompt caching.
-func (cb *ContextBuilder) BuildSystemContent(ctx context.Context, agent *Agent, runCtx RunContext) (string, error) {
-	return cb.buildSystemContent(ctx, agent, runCtx)
+func (cb *ContextBuilder) BuildSystemContent(ctx context.Context, agent *Agent, runCtx RunContext, toolDefs []llm.ToolDefinition) (string, error) {
+	return cb.buildSystemContent(ctx, agent, runCtx, toolDefs)
 }
 
 // RenderForLLM returns a copy of canonical with display-only truncation
@@ -132,7 +128,7 @@ func (cb *ContextBuilder) RenderForLLM(canonical []llm.ChatMessage) []llm.ChatMe
 	return truncateToolResults(canonical)
 }
 
-func (cb *ContextBuilder) buildSystemContent(ctx context.Context, agent *Agent, runCtx RunContext) (string, error) {
+func (cb *ContextBuilder) buildSystemContent(ctx context.Context, agent *Agent, runCtx RunContext, toolDefs []llm.ToolDefinition) (string, error) {
 	var sb strings.Builder
 
 	// ── Static prefix ─────────────────────────────────────────────────────────
@@ -147,7 +143,7 @@ func (cb *ContextBuilder) buildSystemContent(ctx context.Context, agent *Agent, 
 		sb.WriteString("\n</agent>\n\n")
 	}
 
-	if block := cb.renderToolInstructions(agent); block != "" {
+	if block := renderToolInstructions(toolDefs); block != "" {
 		sb.WriteString(block)
 		sb.WriteString("\n")
 	}
@@ -171,25 +167,19 @@ func (cb *ContextBuilder) buildSystemContent(ctx context.Context, agent *Agent, 
 	return strings.TrimRight(sb.String(), "\n"), nil
 }
 
-// renderToolInstructions emits <tool_instructions> for tools in agent.Tools
-// whose Definition() carries a non-empty Instructions string. Tools without
-// instructions are skipped; the whole block is elided when nothing has any.
-func (cb *ContextBuilder) renderToolInstructions(agent *Agent) string {
-	if cb.toolRegistry == nil || len(agent.Tools) == 0 {
-		return ""
-	}
+// renderToolInstructions emits <tool_instructions> for the run's effective
+// tools (delegates included) whose Definition carries a non-empty Instructions
+// string. Reads from the per-run tool definitions, not the global registry, so
+// the prompt reflects exactly what the run can call.
+func renderToolInstructions(toolDefs []llm.ToolDefinition) string {
 	var inner strings.Builder
-	for _, name := range agent.Tools {
-		tool, err := cb.toolRegistry.Get(name)
-		if err != nil {
-			continue
-		}
-		instructions := strings.TrimSpace(tool.Definition().Instructions)
+	for _, def := range toolDefs {
+		instructions := strings.TrimSpace(def.Instructions)
 		if instructions == "" {
 			continue
 		}
 		fmt.Fprintf(&inner, "  <%s>\n    %s\n  </%s>\n",
-			name, escapeXMLContent(instructions), name)
+			def.Name, escapeXMLContent(instructions), def.Name)
 	}
 	if inner.Len() == 0 {
 		return ""
@@ -473,8 +463,8 @@ func truncateRunes(s string, maxRunes int, suffix string) string {
 // 4-chars-per-token heuristic as the runtime's existing estimators. The
 // system message is rendered once and discarded — callers that want the
 // actual bytes should use Build / BuildSystemContent.
-func (cb *ContextBuilder) EstimateSystemPromptTokens(ctx context.Context, agent *Agent, runCtx RunContext) int {
-	content, err := cb.buildSystemContent(ctx, agent, runCtx)
+func (cb *ContextBuilder) EstimateSystemPromptTokens(ctx context.Context, agent *Agent, runCtx RunContext, toolDefs []llm.ToolDefinition) int {
+	content, err := cb.buildSystemContent(ctx, agent, runCtx, toolDefs)
 	if err != nil {
 		return 0
 	}
