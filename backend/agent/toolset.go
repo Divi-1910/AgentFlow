@@ -89,6 +89,17 @@ func (ts *ToolSet) Get(name string) (tools.Tool, bool) {
 	return t, ok
 }
 
+func (ts *ToolSet) DelegateTarget(name string) (string, bool) {
+	if ts.kinds[name] != toolKindDelegate {
+		return "", false
+	}
+	dt, ok := ts.tools[name].(*delegateTool)
+	if !ok {
+		return "", false
+	}
+	return dt.cfg.AgentID, true
+}
+
 func (ts *ToolSet) Names() []string {
 	out := make([]string, len(ts.order))
 	copy(out, ts.order)

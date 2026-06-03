@@ -69,6 +69,8 @@ type StreamEvent struct {
 }
 
 type EventSink interface {
+	// Emit may be called concurrently. Implementations must be concurrency-safe.
+	// Close is called only after all emits for the run have returned.
 	Emit(e StreamEvent)
 	Close()
 }
@@ -93,9 +95,10 @@ func NewChannelSink(ctx context.Context, runID string, ch chan<- StreamEvent) *C
 
 func (s *ChannelSink) Emit(e StreamEvent) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	seq := s.seq
 	s.seq++
-	s.mu.Unlock()
 
 	e.ID = fmt.Sprintf("%s-%d", s.runID, seq)
 	e.RunID = s.runID

@@ -62,6 +62,12 @@ func TestBuildToolSet_IncludesDelegatesInDefinitionsAndLookup(t *testing.T) {
 	if !hasDelegate {
 		t.Fatal("delegate definition missing or missing instructions")
 	}
+	if target, ok := ts.DelegateTarget("ask_researcher"); !ok || target != "agent-b" {
+		t.Fatalf("DelegateTarget(ask_researcher) = %q, %v; want agent-b, true", target, ok)
+	}
+	if target, ok := ts.DelegateTarget("calculator"); ok || target != "" {
+		t.Fatalf("DelegateTarget(calculator) = %q, %v; want empty, false", target, ok)
+	}
 }
 
 func TestBuildToolSet_NilInvokerWithDelegatesFails(t *testing.T) {

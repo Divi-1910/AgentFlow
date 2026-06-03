@@ -3,10 +3,8 @@ package agent
 import (
 	"backend/llm"
 	"backend/model"
-	"backend/runtimectx"
 	"backend/tools"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -429,153 +427,33 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			toolCalls = resp.ToolCalls
 		}
 
-		for _, call := range toolCalls {
-			logger.Info("executing tool", "tool", call.Name, "call_id", call.ID)
-
-			var rawArgs json.RawMessage
-			if json.Valid(call.Arguments) {
-				rawArgs = call.Arguments
-			} else {
-				rawArgs = json.RawMessage(`"` + strings.ReplaceAll(string(call.Arguments), `"`, `\"`) + `"`)
-			}
-
-			sink.Emit(StreamEvent{
-				Type: EventToolStarted,
-				Tool: &ToolMeta{ID: call.ID, Name: call.Name, Args: rawArgs},
-				Step: steps,
-			})
-			sink.Emit(StreamEvent{Type: EventStatusUpdated, Status: fmt.Sprintf("Using %s", call.Name), Step: steps})
-
-			tool, ok := toolSet.Get(call.Name)
-			if !ok {
-				logger.Error("tool not found, aborting", "tool", call.Name)
+		planned, missing := validateToolBatch(toolSet, toolCalls)
+		if len(missing) > 0 {
+			for _, m := range missing {
+				logger.Error("tool not found, aborting", "tool", m.call.Name)
 				sink.Emit(StreamEvent{
 					Type:  EventToolFailed,
-					Tool:  &ToolMeta{ID: call.ID, Name: call.Name, Args: rawArgs},
+					Tool:  &ToolMeta{ID: m.call.ID, Name: m.call.Name, Args: m.rawArgs},
 					Error: &ErrMeta{Code: "tool.not_found", Message: "tool not available"},
 					Step:  steps,
 				})
-				return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, call.Name)
 			}
+			return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, missing[0].call.Name)
+		}
+		if ctx.Err() != nil {
+			state = stateCancelled
+			return nil, ctx.Err()
+		}
 
-			start := time.Now()
+		outcomes := runToolBatch(ctx, runCtx, sink, steps, planned, logger)
+		if ctx.Err() != nil {
+			state = stateCancelled
+			return nil, ctx.Err()
+		}
 
-			if ctx.Err() != nil {
-				state = stateCancelled
-				return nil, ctx.Err()
-			}
-
-			toolTimeout := 30 * time.Second
-			inheritCtx := false
-			if tt, ok := tool.(tools.TimeoutTool); ok {
-				if d := tt.Timeout(); d > 0 {
-					toolTimeout = d
-				} else {
-					inheritCtx = true // 0 → no extra wall-clock cap, inherit parent ctx
-				}
-			}
-			var toolCtx context.Context
-			var toolCancel context.CancelFunc
-			if inheritCtx {
-				toolCtx, toolCancel = context.WithCancel(ctx)
-			} else {
-				toolCtx, toolCancel = context.WithTimeout(ctx, toolTimeout)
-			}
-			toolCtx = runtimectx.WithMemoryScope(toolCtx, runCtx.Memory)
-			toolCtx = runtimectx.WithDelegation(toolCtx, runtimectx.DelegationInfo{
-				OriginatorRunID: runCtx.OriginatorRunID,
-				RunID:           runCtx.RunID,
-				Chain:           runCtx.DelegationChain,
-				Depth:           runCtx.DelegationDepth,
-				UserID:          runCtx.Memory.UserID,
-			})
-			toolResult, err := tool.Execute(toolCtx, tools.ToolCall{
-				ID:   call.ID,
-				Args: call.Arguments,
-			})
-			toolCancel()
-
-			latencyMs := time.Since(start).Milliseconds()
-
-			if err != nil {
-				toolFailures[call.Name]++
-				if toolFailures[call.Name] >= 3 {
-					state = stateFailed
-					return nil, fmt.Errorf("tool %q exceeded failure threshold: %v", call.Name, err)
-				}
-
-				errMsg := llm.ChatMessage{
-					Role:       "tool",
-					ToolCallID: call.ID,
-					Content:    fmt.Sprintf("[error] tool %q failed: %s", call.Name, err.Error()),
-					Metadata: map[string]any{
-						"tool_name":  call.Name,
-						"arguments":  string(call.Arguments),
-						"is_error":   true,
-						"latency_ms": latencyMs,
-					},
-				}
-				messages = append(messages, errMsg)
-				newMessages = append(newMessages, errMsg)
-				runCtx.LastAction = fmt.Sprintf("%s → error", call.Name)
-				logger.Error("tool execution failed", "tool", call.Name, "error", err)
-
-				sink.Emit(StreamEvent{
-					Type:       EventToolFailed,
-					Step:       steps,
-					Tool:       &ToolMeta{ID: call.ID, Name: call.Name, Args: rawArgs},
-					Error:      &ErrMeta{Code: "tool.execution_failed", Message: err.Error()},
-					DurationMs: latencyMs,
-				})
-				continue
-			}
-
-			if len(toolResult.Content) > 8000 {
-				r := []rune(toolResult.Content)
-				if len(r) > 8000 {
-					toolResult.Content = string(r[:8000]) + "\n\n...(truncated due to length limit)"
-				}
-			}
-
-			logger.Info("tool completed",
-				"tool", call.Name,
-				"is_error", toolResult.IsError,
-				"content_len", len(toolResult.Content),
-				"latency_ms", latencyMs)
-
-			toolMsg := llm.ChatMessage{
-				Role:       "tool",
-				ToolCallID: call.ID,
-				Content:    toolResult.Content,
-				Metadata: map[string]any{
-					"tool_name":  call.Name,
-					"arguments":  string(call.Arguments),
-					"is_error":   toolResult.IsError,
-					"latency_ms": latencyMs,
-				},
-			}
-			messages = append(messages, toolMsg)
-			newMessages = append(newMessages, toolMsg)
-			if toolResult.IsError {
-				runCtx.LastAction = fmt.Sprintf("%s → error", call.Name)
-			} else {
-				runCtx.LastAction = fmt.Sprintf("%s → success", call.Name)
-			}
-
-			displayStr := fmt.Sprintf("Finished %s", call.Name)
-			if toolResult.Content != "" && len(toolResult.Content) < 50 {
-				displayStr = fmt.Sprintf("Result: %s", toolResult.Content)
-			}
-			if toolResult.IsError {
-				displayStr = fmt.Sprintf("Error in %s", call.Name)
-			}
-
-			sink.Emit(StreamEvent{
-				Type:       EventToolCompleted,
-				Step:       steps,
-				Tool:       &ToolMeta{ID: call.ID, Name: call.Name, Args: rawArgs, Display: displayStr},
-				DurationMs: latencyMs,
-			})
+		if err := applyToolOutcomes(&messages, &newMessages, toolFailures, &runCtx, outcomes); err != nil {
+			state = stateFailed
+			return nil, err
 		}
 		sink.Emit(StreamEvent{Type: EventStepCompleted, Step: steps})
 	}
