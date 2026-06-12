@@ -17,7 +17,7 @@ import (
 // the target through the bus and applies depth/cycle/ownership guards) and is
 // injected into the runtime via AgentRuntime.SetDelegateInvoker.
 type DelegateInvoker interface {
-	InvokeDelegate(ctx context.Context, parent runtimectx.DelegationInfo, targetAgentID, task string) (string, error)
+	InvokeDelegate(ctx context.Context, parent runtimectx.DelegationInfo, targetAgentID, task, toolCallID string) (string, error)
 }
 
 // delegateTool exposes another agent as a callable tool. Synthesized per
@@ -78,7 +78,7 @@ func (t *delegateTool) Execute(ctx context.Context, call tools.ToolCall) (*tools
 		}, nil
 	}
 
-	out, err := t.invoker.InvokeDelegate(ctx, info, t.cfg.AgentID, args.Task)
+	out, err := t.invoker.InvokeDelegate(ctx, info, t.cfg.AgentID, args.Task, call.ID)
 	if err != nil {
 		return &tools.ToolResult{
 			Content: fmt.Sprintf("delegate %s failed: %v", t.cfg.ToolName, err),

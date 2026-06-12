@@ -59,15 +59,19 @@ func (r *RunRepo) EnsureIndexes(ctx context.Context) error {
 
 func (r *RunRepo) CreateRun(ctx context.Context, runID, threadID, agentID, userID string) error {
 	// Top-level run: it is its own originator, no parent.
-	return r.createRun(ctx, runID, threadID, agentID, userID, runID, "")
+	return r.createRun(ctx, runID, threadID, agentID, userID, runID, "", agent.InvocationTopLevel, "")
 }
 
 // CreateChildRun records a delegated (child) run with its delegation lineage.
 func (r *RunRepo) CreateChildRun(ctx context.Context, runID, threadID, agentID, userID, originatorRunID, parentRunID string) error {
-	return r.createRun(ctx, runID, threadID, agentID, userID, originatorRunID, parentRunID)
+	return r.createRun(ctx, runID, threadID, agentID, userID, originatorRunID, parentRunID, agent.InvocationSyncDelegate, "")
 }
 
-func (r *RunRepo) createRun(ctx context.Context, runID, threadID, agentID, userID, originatorRunID, parentRunID string) error {
+func (r *RunRepo) CreateChildRunWithKind(ctx context.Context, runID, threadID, agentID, userID, originatorRunID, parentRunID, invocationKind, jobID string) error {
+	return r.createRun(ctx, runID, threadID, agentID, userID, originatorRunID, parentRunID, invocationKind, jobID)
+}
+
+func (r *RunRepo) createRun(ctx context.Context, runID, threadID, agentID, userID, originatorRunID, parentRunID, invocationKind, jobID string) error {
 	now := time.Now()
 	doc := model.RunDocument{
 		ID:              bson.NewObjectID(),
@@ -79,6 +83,8 @@ func (r *RunRepo) createRun(ctx context.Context, runID, threadID, agentID, userI
 		Attempt:         1,
 		OriginatorRunID: originatorRunID,
 		ParentRunID:     parentRunID,
+		InvocationKind:  invocationKind,
+		JobID:           jobID,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
@@ -119,7 +125,7 @@ func (r *RunRepo) Save(ctx context.Context, snapshot agent.RunSnapshot) error {
 }
 
 func (r *RunRepo) LoadLatest(ctx context.Context, runID string) (*agent.RunSnapshot, error) {
-	opts := options.FindOne().SetSort(bson.D{{Key: "step", Value: -1}})
+	opts := options.FindOne().SetSort(bson.D{{Key: "step", Value: -1}, {Key: "created_at", Value: -1}})
 	var doc model.RunCheckpointDocument
 	err := r.checkpoints.FindOne(ctx, bson.M{"run_id": runID}, opts).Decode(&doc)
 	if err == mongo.ErrNoDocuments {
@@ -226,6 +232,8 @@ func (r *RunRepo) GetRun(ctx context.Context, runID string) (*agent.RunInfo, err
 		LastError:       doc.LastError,
 		OriginatorRunID: doc.OriginatorRunID,
 		ParentRunID:     doc.ParentRunID,
+		InvocationKind:  doc.InvocationKind,
+		JobID:           doc.JobID,
 	}, nil
 }
 
@@ -249,5 +257,7 @@ func (r *RunRepo) GetRunForUser(ctx context.Context, runID, userID string) (*age
 		LastError:       doc.LastError,
 		OriginatorRunID: doc.OriginatorRunID,
 		ParentRunID:     doc.ParentRunID,
+		InvocationKind:  doc.InvocationKind,
+		JobID:           doc.JobID,
 	}, nil
 }

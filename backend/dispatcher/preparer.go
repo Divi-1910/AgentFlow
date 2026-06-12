@@ -20,6 +20,7 @@ type RunPreparerConfig struct {
 	Summarizer   Summarizer
 	Runtime      Runtime
 	ToolRegistry *tools.ToolRegistry
+	Tasks        taskBudgetStore
 	Background   context.Context
 }
 
@@ -31,6 +32,7 @@ type RunPreparer struct {
 	summarizer   Summarizer
 	runtime      Runtime
 	toolRegistry *tools.ToolRegistry
+	tasks        taskBudgetStore
 	background   context.Context
 
 	summarizing sync.Map
@@ -54,6 +56,7 @@ func NewRunPreparer(cfg RunPreparerConfig) *RunPreparer {
 		summarizer:   cfg.Summarizer,
 		runtime:      cfg.Runtime,
 		toolRegistry: cfg.ToolRegistry,
+		tasks:        cfg.Tasks,
 		background:   background,
 	}
 }
@@ -163,16 +166,30 @@ func (p *RunPreparer) prepareFresh(ctx context.Context, req DispatchRequest) (Pr
 	if len(chain) == 0 {
 		chain = []string{ag.ID}
 	}
+	invocationKind := req.InvocationKind
+	if invocationKind == "" {
+		if req.ParentRunID != "" {
+			invocationKind = agent.InvocationSyncDelegate
+		} else {
+			invocationKind = agent.InvocationTopLevel
+		}
+	}
+	if invocationKind == agent.InvocationTopLevel && p.tasks != nil {
+		if err := p.tasks.EnsureTask(ctx, originator, req.UserID, ag.MaxRuns); err != nil {
+			return PreparedRun{}, fmt.Errorf("dispatcher: ensure task budget: %w", err)
+		}
+	}
 
 	return PreparedRun{
 		Agent: ag,
 		RunCtx: agent.RunContext{
-			RunID:    req.RunID,
-			ThreadID: req.ThreadID,
-			Attempt:  1,
-			Summary:  currentSummary,
-			History:  agent.FlattenTurns(turns),
-			Input:    req.Input,
+			RunID:         req.RunID,
+			ThreadID:      req.ThreadID,
+			Attempt:       1,
+			Summary:       currentSummary,
+			History:       agent.FlattenTurns(turns),
+			Input:         req.Input,
+			SystemContext: req.SystemContext,
 			Memory: runtimectx.MemoryScope{
 				UserID:   req.UserID,
 				AgentID:  ag.ID,
@@ -183,6 +200,8 @@ func (p *RunPreparer) prepareFresh(ctx context.Context, req DispatchRequest) (Pr
 			ParentRunID:     req.ParentRunID,
 			DelegationChain: chain,
 			DelegationDepth: req.Depth,
+			InvocationKind:  invocationKind,
+			JobID:           req.JobID,
 		},
 	}, nil
 }
@@ -250,6 +269,9 @@ func (p *RunPreparer) prepareResume(ctx context.Context, req DispatchRequest) (P
 			ParentRunID:     snapshot.Meta.ParentRunID,
 			DelegationChain: snapshot.Meta.DelegationChain,
 			DelegationDepth: snapshot.Meta.DelegationDepth,
+			InvocationKind:  snapshot.Meta.InvocationKind,
+			JobID:           snapshot.Meta.JobID,
+			SystemContext:   snapshot.Meta.SystemContext,
 		},
 	}, nil
 }

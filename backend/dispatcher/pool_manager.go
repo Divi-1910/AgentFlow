@@ -17,6 +17,10 @@ type PoolManager struct {
 	preparer *RunPreparer
 	runtime  Runtime
 	status   runStatusUpdater
+	messages MessageStore
+	jobs     asyncJobStatusStore
+	tasks    durableCancelStore
+	hub      *JobHub
 	workers  int
 	cancels  *CancelRegistry
 
@@ -30,6 +34,10 @@ type PoolManagerConfig struct {
 	Preparer  *RunPreparer
 	Runtime   Runtime
 	Status    runStatusUpdater // run-status store for worker pre-RunStream bail paths
+	Messages  MessageStore
+	Jobs      asyncJobStatusStore
+	Tasks     durableCancelStore
+	Hub       *JobHub
 	Workers   int
 	CancelTTL time.Duration // 0 → DefaultCancelTTL
 }
@@ -49,6 +57,10 @@ func NewPoolManager(cfg PoolManagerConfig) *PoolManager {
 		preparer: cfg.Preparer,
 		runtime:  cfg.Runtime,
 		status:   cfg.Status,
+		messages: cfg.Messages,
+		jobs:     cfg.Jobs,
+		tasks:    cfg.Tasks,
+		hub:      cfg.Hub,
 		workers:  workers,
 		cancels:  NewCancelRegistry(cfg.CancelTTL),
 		pools:    make(map[string]*AgentPool),
@@ -69,7 +81,7 @@ func (m *PoolManager) Ensure(ctx context.Context, agentID string) error {
 		return nil
 	}
 
-	pool := NewAgentPool(m.rootCtx, agentID, m.bus, m.preparer, m.runtime, m.status, m.workers, m.cancels)
+	pool := NewAgentPool(m.rootCtx, agentID, m.bus, m.preparer, m.runtime, m.status, m.messages, m.jobs, m.tasks, m.hub, m.workers, m.cancels)
 	if err := pool.Start(); err != nil {
 		return err
 	}
@@ -84,6 +96,9 @@ func (m *PoolManager) CancelTask(originatorRunID string) {
 		return
 	}
 	m.cancels.Cancel(originatorRunID)
+	if m.tasks != nil {
+		_ = m.tasks.CancelTask(context.Background(), originatorRunID, "cancelled")
+	}
 }
 
 func (m *PoolManager) PoolCount() int {

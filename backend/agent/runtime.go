@@ -5,10 +5,12 @@ import (
 	"backend/model"
 	"backend/tools"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"time"
 )
@@ -21,6 +23,7 @@ type AgentRuntime struct {
 	contextBuilder  *ContextBuilder
 	checkpointStore CheckpointStore
 	delegateInvoker DelegateInvoker
+	asyncJobs       AsyncJobStore
 }
 
 func NewAgentRuntime(
@@ -42,6 +45,7 @@ func (r *AgentRuntime) WithCheckpointStore(store CheckpointStore) *AgentRuntime 
 		contextBuilder:  r.contextBuilder,
 		checkpointStore: store,
 		delegateInvoker: r.delegateInvoker,
+		asyncJobs:       r.asyncJobs,
 	}
 }
 
@@ -51,6 +55,10 @@ func (r *AgentRuntime) WithCheckpointStore(store CheckpointStore) *AgentRuntime 
 // Delegates configured; BuildToolSet fails fast otherwise.
 func (r *AgentRuntime) SetDelegateInvoker(inv DelegateInvoker) {
 	r.delegateInvoker = inv
+}
+
+func (r *AgentRuntime) SetAsyncJobStore(store AsyncJobStore) {
+	r.asyncJobs = store
 }
 
 func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext) (*RunResult, error) {
@@ -84,6 +92,7 @@ const (
 	stateFailed terminalState = iota
 	stateSuccess
 	stateCancelled
+	stateWaiting
 )
 
 func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx RunContext, sink EventSink) (result *RunResult, err error) {
@@ -129,6 +138,8 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			})
 		case stateCancelled:
 			sink.Emit(StreamEvent{Type: EventRunCancelled, DurationMs: duration})
+		case stateWaiting:
+			sink.Emit(StreamEvent{Type: EventRunWaiting, DurationMs: duration, Step: result.Steps})
 		case stateFailed:
 			errMsg := "unknown error"
 			if err != nil {
@@ -152,6 +163,8 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 				} else {
 					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, string(model.RunStatusFailed), "interrupted before first checkpoint")
 				}
+			case stateWaiting:
+				_ = r.checkpointStore.UpdateStatus(context.Background(), runID, string(model.RunStatusWaitingJobs), "")
 			case stateFailed:
 				errMsg := "unknown error"
 				if err != nil {
@@ -179,7 +192,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		return nil, err
 	}
 
-	toolSet, err := BuildToolSet(r.toolRegistry, r.delegateInvoker, agent)
+	toolSet, err := BuildToolSet(r.toolRegistry, r.delegateInvoker, agent, r.asyncJobs)
 	if err != nil {
 		return nil, err
 	}
@@ -193,6 +206,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		toolFailures       map[string]int
 		checkpointFailures int
 		pendingToolCalls   []llm.ToolCall
+		pendingAwaits      []PendingAwait
 	)
 
 	if runCtx.Checkpoint != nil {
@@ -200,6 +214,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		steps = s.StepsCompleted
 		totalUsage = s.TotalUsage
 		toolFailures = s.ToolFailures
+		pendingAwaits = s.PendingAwaits
 		if toolFailures == nil {
 			toolFailures = make(map[string]int)
 		}
@@ -232,6 +247,15 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		if runCtx.DelegationDepth == 0 {
 			runCtx.DelegationDepth = runCtx.Checkpoint.Meta.DelegationDepth
 		}
+		if runCtx.InvocationKind == "" {
+			runCtx.InvocationKind = runCtx.Checkpoint.Meta.InvocationKind
+		}
+		if runCtx.JobID == "" {
+			runCtx.JobID = runCtx.Checkpoint.Meta.JobID
+		}
+		if runCtx.SystemContext == "" {
+			runCtx.SystemContext = runCtx.Checkpoint.Meta.SystemContext
+		}
 
 		sink.Emit(StreamEvent{
 			Type:    EventRunResumed,
@@ -255,6 +279,13 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 	if len(runCtx.DelegationChain) == 0 {
 		runCtx.DelegationChain = []string{agent.ID}
 	}
+	if runCtx.InvocationKind == "" {
+		if runCtx.ParentRunID != "" {
+			runCtx.InvocationKind = InvocationSyncDelegate
+		} else {
+			runCtx.InvocationKind = InvocationTopLevel
+		}
+	}
 
 	if r.contextBuilder == nil {
 		return nil, fmt.Errorf("runtime: context builder is not configured")
@@ -276,6 +307,30 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		}
 	}
 
+	if runCtx.Checkpoint != nil && runCtx.Checkpoint.Meta.Phase == PhaseWaitingJobs {
+		if len(pendingAwaits) == 0 {
+			return nil, fmt.Errorf("waiting_for_jobs resume: no pending awaits")
+		}
+		waitingAgain, waitErr := r.resumePendingAwaits(
+			ctx, &runCtx, sink, steps, &messages, &newMessages,
+			pendingAwaits, logger,
+		)
+		if waitErr != nil {
+			state = stateFailed
+			return nil, waitErr
+		}
+		if waitingAgain {
+			state = stateWaiting
+			return &RunResult{
+				Status:      RunResultWaiting,
+				NewMessages: newMessages,
+				Steps:       steps,
+				Usage:       totalUsage,
+			}, nil
+		}
+		pendingAwaits = nil
+	}
+
 	for steps < maxSteps {
 		if ctx.Err() != nil {
 			state = stateCancelled
@@ -293,7 +348,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			if r.checkpointStore != nil {
 				snapshot := buildSnapshot(
 					runCtx, agent, messages, runCtx.Summary, steps, maxSteps,
-					totalUsage, toolFailures, checkpointFailures, PhasePreModel, toolSet,
+					totalUsage, toolFailures, checkpointFailures, PhasePreModel, nil, toolSet,
 				)
 				var saveErr error
 				if checkpointFailures, saveErr = r.trySaveCheckpoint(snapshot, sink, steps, checkpointFailures, hasSnapshot, logger); saveErr != nil {
@@ -360,27 +415,93 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			totalUsage.TotalTokens += resp.Usage.TotalTokens
 
 			if len(resp.ToolCalls) == 0 {
-				output := strings.TrimSpace(resp.Content)
-				if output == "" {
+				autoCalls, err := r.buildAutoAwaitCalls(ctx, runCtx)
+				if err != nil {
 					state = stateFailed
-					return nil, ErrNoFinalOutput
+					return nil, err
 				}
+				if len(autoCalls) > 0 {
+					logger.Info("auto-awaiting required jobs", "count", len(autoCalls))
+					assistantMsg := llm.ChatMessage{
+						Role:      "assistant",
+						ToolCalls: autoCalls,
+						Metadata:  map[string]any{"synthetic": "auto_await"},
+					}
+					messages = append(messages, assistantMsg)
+					newMessages = append(newMessages, assistantMsg)
 
-				finalMsg := llm.ChatMessage{Role: "assistant", Content: resp.Content}
-				messages = append(messages, finalMsg)
-				newMessages = append(newMessages, finalMsg)
+					if r.checkpointStore != nil {
+						snapshot := buildSnapshot(
+							runCtx, agent, messages, runCtx.Summary, steps, maxSteps,
+							totalUsage, toolFailures, checkpointFailures, PhasePostModel, nil, toolSet,
+						)
+						var saveErr error
+						if checkpointFailures, saveErr = r.trySaveCheckpoint(snapshot, sink, steps, checkpointFailures, hasSnapshot, logger); saveErr != nil {
+							state = stateFailed
+							return nil, saveErr
+						}
+						hasSnapshot = true
+					}
+					toolCalls = autoCalls
+				} else {
+					output := strings.TrimSpace(resp.Content)
+					if output == "" {
+						state = stateFailed
+						return nil, ErrNoFinalOutput
+					}
 
-				logger.Info("run completed",
-					"steps", steps,
-					"prompt_tokens", totalUsage.PromptTokens,
-					"completion_tokens", totalUsage.CompletionTokens)
+					finalMsg := llm.ChatMessage{Role: "assistant", Content: resp.Content}
+					messages = append(messages, finalMsg)
+					newMessages = append(newMessages, finalMsg)
 
-				sink.Emit(StreamEvent{Type: EventStepCompleted, Step: steps})
+					logger.Info("run completed",
+						"steps", steps,
+						"prompt_tokens", totalUsage.PromptTokens,
+						"completion_tokens", totalUsage.CompletionTokens)
+
+					sink.Emit(StreamEvent{Type: EventStepCompleted, Step: steps})
+
+					if r.checkpointStore != nil {
+						snapshot := buildSnapshot(
+							runCtx, agent, messages, runCtx.Summary, steps, maxSteps,
+							totalUsage, toolFailures, checkpointFailures, PhaseStepCompleted, nil, toolSet,
+						)
+						var saveErr error
+						if checkpointFailures, saveErr = r.trySaveCheckpoint(snapshot, sink, steps, checkpointFailures, hasSnapshot, logger); saveErr != nil {
+							state = stateFailed
+							return nil, saveErr
+						}
+						hasSnapshot = true
+					}
+
+					state = stateSuccess
+					return &RunResult{
+						Status:      RunResultCompleted,
+						Output:      output,
+						NewMessages: newMessages,
+						Steps:       steps,
+						Usage:       totalUsage,
+					}, nil
+				}
+			}
+
+			if len(resp.ToolCalls) > 0 {
+				logger.Info("model returned tool calls",
+					"step", steps,
+					"tool_calls", len(resp.ToolCalls))
+
+				assistantMsg := llm.ChatMessage{
+					Role:      "assistant",
+					Content:   resp.Content,
+					ToolCalls: resp.ToolCalls,
+				}
+				messages = append(messages, assistantMsg)
+				newMessages = append(newMessages, assistantMsg)
 
 				if r.checkpointStore != nil {
 					snapshot := buildSnapshot(
 						runCtx, agent, messages, runCtx.Summary, steps, maxSteps,
-						totalUsage, toolFailures, checkpointFailures, PhaseStepCompleted, toolSet,
+						totalUsage, toolFailures, checkpointFailures, PhasePostModel, nil, toolSet,
 					)
 					var saveErr error
 					if checkpointFailures, saveErr = r.trySaveCheckpoint(snapshot, sink, steps, checkpointFailures, hasSnapshot, logger); saveErr != nil {
@@ -390,41 +511,8 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 					hasSnapshot = true
 				}
 
-				state = stateSuccess
-				return &RunResult{
-					Output:      output,
-					NewMessages: newMessages,
-					Steps:       steps,
-					Usage:       totalUsage,
-				}, nil
+				toolCalls = resp.ToolCalls
 			}
-
-			logger.Info("model returned tool calls",
-				"step", steps,
-				"tool_calls", len(resp.ToolCalls))
-
-			assistantMsg := llm.ChatMessage{
-				Role:      "assistant",
-				Content:   resp.Content,
-				ToolCalls: resp.ToolCalls,
-			}
-			messages = append(messages, assistantMsg)
-			newMessages = append(newMessages, assistantMsg)
-
-			if r.checkpointStore != nil {
-				snapshot := buildSnapshot(
-					runCtx, agent, messages, runCtx.Summary, steps, maxSteps,
-					totalUsage, toolFailures, checkpointFailures, PhasePostModel, toolSet,
-				)
-				var saveErr error
-				if checkpointFailures, saveErr = r.trySaveCheckpoint(snapshot, sink, steps, checkpointFailures, hasSnapshot, logger); saveErr != nil {
-					state = stateFailed
-					return nil, saveErr
-				}
-				hasSnapshot = true
-			}
-
-			toolCalls = resp.ToolCalls
 		}
 
 		planned, missing := validateToolBatch(toolSet, toolCalls)
@@ -454,6 +542,51 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		if err := applyToolOutcomes(&messages, &newMessages, toolFailures, &runCtx, outcomes); err != nil {
 			state = stateFailed
 			return nil, err
+		}
+		deliveredResults, deliveredAwaits := collectDeliveredAwaits(outcomes)
+		if len(deliveredResults) > 0 {
+			if r.asyncJobs == nil {
+				state = stateFailed
+				return nil, fmt.Errorf("runtime: async job store is not configured")
+			}
+			if err := r.asyncJobs.MarkDelivered(ctx, runCtx.RunID, runCtx.Memory.UserID, deliveredResults, deliveredAwaits); err != nil {
+				state = stateFailed
+				return nil, err
+			}
+		}
+		pendingAwaits = collectPendingAwaits(outcomes)
+		if len(pendingAwaits) > 0 {
+			if r.asyncJobs == nil {
+				state = stateFailed
+				return nil, fmt.Errorf("runtime: async job store is not configured")
+			}
+			if r.checkpointStore == nil {
+				state = stateFailed
+				return nil, fmt.Errorf("runtime: checkpoint store is required for waiting_for_jobs")
+			}
+			if err := r.asyncJobs.MarkAwaiting(ctx, runCtx.RunID, pendingAwaits); err != nil {
+				state = stateFailed
+				return nil, err
+			}
+			if r.checkpointStore != nil {
+				snapshot := buildSnapshot(
+					runCtx, agent, messages, runCtx.Summary, steps, maxSteps,
+					totalUsage, toolFailures, checkpointFailures, PhaseWaitingJobs, pendingAwaits, toolSet,
+				)
+				var saveErr error
+				if checkpointFailures, saveErr = r.trySaveCheckpoint(snapshot, sink, steps, checkpointFailures, hasSnapshot, logger); saveErr != nil {
+					state = stateFailed
+					return nil, saveErr
+				}
+				hasSnapshot = true
+			}
+			state = stateWaiting
+			return &RunResult{
+				Status:      RunResultWaiting,
+				NewMessages: newMessages,
+				Steps:       steps,
+				Usage:       totalUsage,
+			}, nil
 		}
 		sink.Emit(StreamEvent{Type: EventStepCompleted, Step: steps})
 	}
@@ -516,10 +649,135 @@ func deriveLastActionFromMessages(messages []llm.ChatMessage) string {
 	return ""
 }
 
+func collectPendingAwaits(outcomes []toolOutcome) []PendingAwait {
+	var awaits []PendingAwait
+	for _, outcome := range outcomes {
+		if !outcome.awaitPending {
+			continue
+		}
+		awaits = append(awaits, outcome.pendingAwait)
+	}
+	sortPendingAwaits(awaits)
+	return awaits
+}
+
+func collectDeliveredAwaits(outcomes []toolOutcome) ([]AwaitJobResult, []PendingAwait) {
+	var results []AwaitJobResult
+	var awaits []PendingAwait
+	for _, outcome := range outcomes {
+		if !outcome.awaitDelivered {
+			continue
+		}
+		results = append(results, outcome.awaitResult)
+		awaits = append(awaits, outcome.deliveredAwait)
+	}
+	return results, awaits
+}
+
+func sortPendingAwaits(awaits []PendingAwait) {
+	sort.SliceStable(awaits, func(i, j int) bool {
+		if awaits[i].CreatedAt.Equal(awaits[j].CreatedAt) {
+			return awaits[i].JobID < awaits[j].JobID
+		}
+		return awaits[i].CreatedAt.Before(awaits[j].CreatedAt)
+	})
+}
+
+func (r *AgentRuntime) buildAutoAwaitCalls(ctx context.Context, runCtx RunContext) ([]llm.ToolCall, error) {
+	if r.asyncJobs == nil {
+		return nil, nil
+	}
+	jobs, err := r.asyncJobs.PendingRequiredJobs(ctx, runCtx.RunID, runCtx.Memory.UserID)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(jobs, func(i, j int) bool {
+		if jobs[i].CreatedAt.Equal(jobs[j].CreatedAt) {
+			return jobs[i].JobID < jobs[j].JobID
+		}
+		return jobs[i].CreatedAt.Before(jobs[j].CreatedAt)
+	})
+	calls := make([]llm.ToolCall, 0, len(jobs))
+	for _, job := range jobs {
+		args, _ := json.Marshal(map[string]string{"job_id": job.JobID})
+		calls = append(calls, llm.ToolCall{
+			ID:        "auto-await:" + runCtx.RunID + ":" + job.JobID,
+			Name:      AsyncToolAwaitJob,
+			Arguments: args,
+		})
+	}
+	return calls, nil
+}
+
+func (r *AgentRuntime) resumePendingAwaits(
+	ctx context.Context,
+	runCtx *RunContext,
+	sink EventSink,
+	step int,
+	messages *[]llm.ChatMessage,
+	newMessages *[]llm.ChatMessage,
+	awaits []PendingAwait,
+	logger *slog.Logger,
+) (bool, error) {
+	if r.asyncJobs == nil {
+		return false, fmt.Errorf("runtime: async job store is not configured")
+	}
+	sortPendingAwaits(awaits)
+	results, allTerminal, err := r.asyncJobs.ResolveAwaits(ctx, runCtx.RunID, runCtx.Memory.UserID, awaits)
+	if err != nil {
+		return false, err
+	}
+	if !allTerminal {
+		if err := r.asyncJobs.MarkAwaiting(ctx, runCtx.RunID, awaits); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if err := r.asyncJobs.MarkDelivered(ctx, runCtx.RunID, runCtx.Memory.UserID, results, awaits); err != nil {
+		return false, err
+	}
+	for i, res := range results {
+		await := awaits[i]
+		toolResult, _ := awaitResultToToolResult(res)
+		content := truncateToolContent(toolResult.Content)
+		isErr := toolResult.IsError
+		args, _ := json.Marshal(map[string]string{"job_id": res.JobID})
+		latencyMs := int64(0)
+		msg := llm.ChatMessage{
+			Role:       "tool",
+			ToolCallID: await.AwaitToolCallID,
+			Content:    content,
+			Metadata: map[string]any{
+				"tool_name":  AsyncToolAwaitJob,
+				"arguments":  string(args),
+				"is_error":   isErr,
+				"latency_ms": latencyMs,
+				"job_id":     res.JobID,
+			},
+		}
+		*messages = append(*messages, msg)
+		*newMessages = append(*newMessages, msg)
+		runCtx.LastAction = AsyncToolAwaitJob + " → success"
+		display := "Finished await_job"
+		if isErr {
+			runCtx.LastAction = AsyncToolAwaitJob + " → error"
+			display = "Error in await_job"
+		}
+		sink.Emit(StreamEvent{
+			Type:       EventToolCompleted,
+			Step:       step,
+			Tool:       &ToolMeta{ID: await.AwaitToolCallID, Name: AsyncToolAwaitJob, Args: args, Display: display},
+			DurationMs: latencyMs,
+		})
+		logger.Info("await_job resolved", "job_id", res.JobID, "status", res.Status)
+	}
+	return false, nil
+}
+
 func buildSnapshot(
 	runCtx RunContext, ag *Agent, messages []llm.ChatMessage, summary string,
 	steps, maxSteps int, usage llm.TokenUsage, toolFailures map[string]int,
-	checkpointFailures int, phase string, toolSet *ToolSet,
+	checkpointFailures int, phase string, pendingAwaits []PendingAwait, toolSet *ToolSet,
 ) RunSnapshot {
 
 	return RunSnapshot{
@@ -532,6 +790,7 @@ func buildSnapshot(
 			MaxSteps:       maxSteps,
 			TotalUsage:     usage,
 			ToolFailures:   toolFailures,
+			PendingAwaits:  pendingAwaits,
 		},
 		Meta: SnapshotMeta{
 			AgentID:            ag.ID,
@@ -550,6 +809,9 @@ func buildSnapshot(
 			ParentRunID:        runCtx.ParentRunID,
 			DelegationChain:    runCtx.DelegationChain,
 			DelegationDepth:    runCtx.DelegationDepth,
+			InvocationKind:     runCtx.InvocationKind,
+			JobID:              runCtx.JobID,
+			SystemContext:      runCtx.SystemContext,
 		},
 	}
 }

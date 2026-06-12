@@ -16,11 +16,12 @@ var (
 )
 
 const (
-	DefaultMaxSteps         = 25
-	DefaultContextWindow    = 6
-	DefaultContextKeepRatio = 0.5
-	DefaultTemperature      = 0.7
-	DefaultMaxTokens        = 4096
+	DefaultMaxSteps           = 25
+	DefaultContextWindow      = 6
+	DefaultContextKeepRatio   = 0.5
+	DefaultTemperature        = 0.7
+	DefaultMaxTokens          = 4096
+	DefaultMaxDelegationDepth = 5
 
 	contextTriggerRatio = 0.85
 )
@@ -41,6 +42,7 @@ type Agent struct {
 	MaxSteps           int
 	Temperature        float64
 	MaxTokens          int
+	MaxRuns            int
 	CreatedAt          time.Time
 }
 
@@ -56,15 +58,16 @@ type DelegateConfig struct {
 }
 
 type RunContext struct {
-	RunID      string
-	ThreadID   string
-	Attempt    int
-	Summary    string
-	History    []llm.ChatMessage
-	Input      string
-	Checkpoint *RunSnapshot
-	Memory     runtimectx.MemoryScope
-	Logger     *slog.Logger
+	RunID         string
+	ThreadID      string
+	Attempt       int
+	Summary       string
+	History       []llm.ChatMessage
+	Input         string
+	SystemContext string
+	Checkpoint    *RunSnapshot
+	Memory        runtimectx.MemoryScope
+	Logger        *slog.Logger
 
 	// Phase reflects the runtime execution phase (PhasePreModel,
 	// PhasePostModel, PhaseStepCompleted). Surfaced to the model inside
@@ -90,9 +93,12 @@ type RunContext struct {
 	ParentRunID     string
 	DelegationChain []string
 	DelegationDepth int
+	InvocationKind  string
+	JobID           string
 }
 
 type RunResult struct {
+	Status      RunResultStatus
 	Output      string
 	NewMessages []llm.ChatMessage
 	Steps       int

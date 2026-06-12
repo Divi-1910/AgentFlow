@@ -565,7 +565,7 @@ func newTimingDelegateInvoker() *timingDelegateInvoker {
 	}
 }
 
-func (i *timingDelegateInvoker) InvokeDelegate(ctx context.Context, _ runtimectx.DelegationInfo, target, task string) (string, error) {
+func (i *timingDelegateInvoker) InvokeDelegate(ctx context.Context, _ runtimectx.DelegationInfo, target, task, _ string) (string, error) {
 	i.mu.Lock()
 	i.activeGlobal++
 	if i.activeGlobal > i.maxGlobal {

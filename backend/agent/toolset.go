@@ -22,6 +22,7 @@ type toolKind int
 const (
 	toolKindRegular toolKind = iota
 	toolKindDelegate
+	toolKindAsync
 )
 
 // ToolRef is the per-tool identity recorded in a snapshot for resume checks.
@@ -166,18 +167,22 @@ func hashParts(parts ...string) string {
 // BuildToolSet constructs the execution-mode tool set: registry tools + live
 // delegate tools. Fails if a delegate is configured but no invoker is supplied,
 // or on any name collision across the effective set.
-func BuildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, ag *Agent) (*ToolSet, error) {
-	return buildToolSet(reg, inv, ag, false)
+func BuildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, ag *Agent, asyncStores ...AsyncJobStore) (*ToolSet, error) {
+	var asyncStore AsyncJobStore
+	if len(asyncStores) > 0 {
+		asyncStore = asyncStores[0]
+	}
+	return buildToolSet(reg, inv, asyncStore, ag, false)
 }
 
 // BuildToolSetForValidation constructs a definition-only tool set (delegate
 // tools carry a nil invoker). Used by resume preflight, which only needs
 // names/params/identity, never execution.
 func BuildToolSetForValidation(reg *tools.ToolRegistry, ag *Agent) (*ToolSet, error) {
-	return buildToolSet(reg, nil, ag, true)
+	return buildToolSet(reg, nil, nil, ag, true)
 }
 
-func buildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, ag *Agent, validation bool) (*ToolSet, error) {
+func buildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, asyncStore AsyncJobStore, ag *Agent, validation bool) (*ToolSet, error) {
 	ts := newToolSet()
 
 	for _, name := range ag.Tools {
@@ -196,6 +201,9 @@ func buildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, ag *Agent, valid
 	}
 
 	for _, d := range ag.Delegates {
+		if d.ToolName == AsyncToolDispatchAgent || d.ToolName == AsyncToolAwaitJob {
+			return nil, fmt.Errorf("%w: delegate tool name %q is reserved", ErrToolConfig, d.ToolName)
+		}
 		if ts.Has(d.ToolName) {
 			return nil, fmt.Errorf("%w: delegate tool name %q collides with another tool or delegate", ErrToolConfig, d.ToolName)
 		}
@@ -207,6 +215,17 @@ func buildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, ag *Agent, valid
 			return nil, fmt.Errorf("%w: delegate tool name %q collides with a registered tool", ErrToolConfig, d.ToolName)
 		}
 		ts.add(d.ToolName, newDelegateTool(d, inv), toolKindDelegate)
+	}
+
+	if len(ag.Delegates) > 0 {
+		if ts.Has(AsyncToolDispatchAgent) || reg.Has(AsyncToolDispatchAgent) {
+			return nil, fmt.Errorf("%w: async tool name %q collides with another tool", ErrToolConfig, AsyncToolDispatchAgent)
+		}
+		if ts.Has(AsyncToolAwaitJob) || reg.Has(AsyncToolAwaitJob) {
+			return nil, fmt.Errorf("%w: async tool name %q collides with another tool", ErrToolConfig, AsyncToolAwaitJob)
+		}
+		ts.add(AsyncToolDispatchAgent, newDispatchAgentTool(ts, asyncStore), toolKindAsync)
+		ts.add(AsyncToolAwaitJob, newAwaitJobTool(asyncStore), toolKindAsync)
 	}
 
 	return ts, nil

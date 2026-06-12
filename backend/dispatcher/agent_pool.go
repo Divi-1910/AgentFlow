@@ -3,13 +3,16 @@ package dispatcher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"runtime/debug"
 	"sync"
 	"time"
 
 	"backend/agent"
 	"backend/bus"
+	"backend/llm"
 )
 
 // runStatusUpdater is the minimal run-status surface the worker uses to mark a
@@ -19,12 +22,35 @@ type runStatusUpdater interface {
 	UpdateStatus(ctx context.Context, runID, status, lastError string) error
 }
 
+type asyncJobStatusStore interface {
+	MarkJobSucceeded(ctx context.Context, jobID, output string) error
+	MarkJobFailed(ctx context.Context, jobID, errText string) error
+	MarkJobCancelled(ctx context.Context, jobID, errText string) error
+	MarkCallbackCompleted(ctx context.Context, jobID string) error
+	MarkCallbackFailed(ctx context.Context, jobID, errText string) error
+	MarkCallbackCancelled(ctx context.Context, jobID, errText string) error
+}
+
+type asyncJobLeaseStore interface {
+	RefreshJobLease(ctx context.Context, jobID, originatorRunID, targetAgentID, owner string, ttl time.Duration) error
+	RefreshCallbackLease(ctx context.Context, jobID, parentThreadID, owner string, ttl time.Duration) error
+}
+
+type durableCancelStore interface {
+	IsCancelled(ctx context.Context, originatorRunID string) (bool, error)
+	CancelTask(ctx context.Context, originatorRunID, reason string) error
+}
+
 type AgentPool struct {
 	agentID  string
 	bus      bus.MessageBus
 	preparer *RunPreparer
 	runtime  Runtime
 	status   runStatusUpdater
+	messages MessageStore
+	jobs     asyncJobStatusStore
+	tasks    durableCancelStore
+	hub      *JobHub
 	sub      bus.Subscription
 	workers  int
 	rootCtx  context.Context
@@ -40,6 +66,10 @@ func NewAgentPool(
 	preparer *RunPreparer,
 	runtime Runtime,
 	status runStatusUpdater,
+	messages MessageStore,
+	jobs asyncJobStatusStore,
+	tasks durableCancelStore,
+	hub *JobHub,
 	workers int,
 	cancels *CancelRegistry,
 ) *AgentPool {
@@ -59,6 +89,10 @@ func NewAgentPool(
 		preparer: preparer,
 		runtime:  runtime,
 		status:   status,
+		messages: messages,
+		jobs:     jobs,
+		tasks:    tasks,
+		hub:      hub,
 		workers:  workers,
 		rootCtx:  ctx,
 		cancel:   cancel,
@@ -125,8 +159,9 @@ func (p *AgentPool) handleDispatch(msg bus.Message) {
 	// because RunStream never starts. "failed", not "interrupted": interrupted
 	// promises a resumable checkpoint (runtime.go semantics), and a run that
 	// never started has none.
-	if p.cancels.IsCanceled(payload.OriginatorRunID) {
+	if p.isCanceled(payload.OriginatorRunID) {
 		p.markTerminal(payload.RunID, "failed", "cancelled before start (no checkpoint)")
+		p.markAsyncCanceled(payload)
 		p.publishReply(msg, DispatchReply{Error: context.Canceled.Error()})
 		return
 	}
@@ -146,6 +181,7 @@ func (p *AgentPool) handleDispatch(msg bus.Message) {
 	prepared, err := p.preparer.Prepare(runCtx, req)
 	if err != nil {
 		p.markTerminal(payload.RunID, "failed", err.Error())
+		p.markAsyncFailed(payload, err.Error())
 		p.publishReply(msg, DispatchReply{Error: err.Error()})
 		return
 	}
@@ -156,13 +192,231 @@ func (p *AgentPool) handleDispatch(msg bus.Message) {
 	eventsDone := make(chan struct{})
 	go p.forwardWorkerEvents(runCtx, payload.RunID, workerEvents, eventsDone)
 
+	stopLeaseHeartbeat := p.startLeaseHeartbeat(payload)
+	defer stopLeaseHeartbeat()
+
 	res, err := p.runtime.RunStream(runCtx, prepared.Agent, prepared.RunCtx, workerEvents)
 	<-eventsDone
+	p.afterRun(payload, prepared, res, err)
 	if err != nil {
 		p.publishReply(msg, DispatchReply{Result: wireFromRunResult(res), Error: err.Error()})
 		return
 	}
 	p.publishReply(msg, DispatchReply{Result: wireFromRunResult(res)})
+}
+
+func (p *AgentPool) afterRun(payload DispatchPayload, prepared PreparedRun, res *agent.RunResult, runErr error) {
+	kind := payload.InvocationKind
+	if kind == "" {
+		kind = prepared.RunCtx.InvocationKind
+	}
+	jobID := payload.JobID
+	if jobID == "" {
+		jobID = prepared.RunCtx.JobID
+	}
+
+	if kind == agent.InvocationAsyncJob {
+		p.persistRunMessages(payload, prepared, res, true)
+		if jobID == "" || p.jobs == nil {
+			return
+		}
+		if runErr != nil {
+			if errors.Is(runErr, context.Canceled) {
+				_ = p.jobs.MarkJobCancelled(context.Background(), jobID, runErr.Error())
+			} else {
+				_ = p.jobs.MarkJobFailed(context.Background(), jobID, runErr.Error())
+			}
+			p.notifyJobTerminal(payload, jobID, false, runErr.Error())
+			return
+		}
+		if res != nil && res.Status == agent.RunResultWaiting {
+			return
+		}
+		output := ""
+		if res != nil {
+			output = res.Output
+		}
+		_ = p.jobs.MarkJobSucceeded(context.Background(), jobID, output)
+		p.notifyJobTerminal(payload, jobID, true, "")
+		return
+	}
+
+	if kind == agent.InvocationCallback {
+		p.persistRunMessages(payload, prepared, res, false)
+		if jobID == "" || p.jobs == nil {
+			return
+		}
+		if runErr != nil {
+			if errors.Is(runErr, context.Canceled) {
+				_ = p.jobs.MarkCallbackCancelled(context.Background(), jobID, runErr.Error())
+			} else {
+				_ = p.jobs.MarkCallbackFailed(context.Background(), jobID, runErr.Error())
+			}
+			return
+		}
+		if res != nil && res.Status == agent.RunResultWaiting {
+			return
+		}
+		_ = p.jobs.MarkCallbackCompleted(context.Background(), jobID)
+		return
+	}
+
+	if payload.PersistResultMessages {
+		p.persistRunMessages(payload, prepared, res, false)
+	}
+}
+
+func (p *AgentPool) startLeaseHeartbeat(payload DispatchPayload) func() {
+	if p.jobs == nil || payload.JobID == "" {
+		return func() {}
+	}
+	leases, ok := p.jobs.(asyncJobLeaseStore)
+	if !ok {
+		return func() {}
+	}
+	kind := payload.InvocationKind
+	ttl := defaultJobLockLease
+	if kind == agent.InvocationCallback {
+		ttl = defaultCallbackLockLease
+	}
+	refresh := func(ctx context.Context, owner string) error {
+		switch kind {
+		case agent.InvocationAsyncJob:
+			return leases.RefreshJobLease(ctx, payload.JobID, payload.OriginatorRunID, payload.AgentID, owner, ttl)
+		case agent.InvocationCallback:
+			return leases.RefreshCallbackLease(ctx, payload.JobID, payload.ThreadID, owner, ttl)
+		default:
+			return nil
+		}
+	}
+	if kind != agent.InvocationAsyncJob && kind != agent.InvocationCallback {
+		return func() {}
+	}
+
+	owner := "worker:" + payload.RunID
+	ctx, cancel := context.WithCancel(p.rootCtx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		interval := leaseRefreshInterval(ttl)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			p.refreshLease(ctx, refresh, owner)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (p *AgentPool) refreshLease(ctx context.Context, refresh func(context.Context, string) error, owner string) {
+	if ctx.Err() != nil {
+		return
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := refresh(refreshCtx, owner); err != nil {
+		requestLogger := slog.Default()
+		requestLogger.Warn("async lease refresh failed", "error", err)
+	}
+}
+
+func leaseRefreshInterval(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		ttl = defaultJobLockLease
+	}
+	interval := ttl / 3
+	if interval < time.Second {
+		interval = ttl / 2
+	}
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	return interval
+}
+
+func (p *AgentPool) persistRunMessages(payload DispatchPayload, prepared PreparedRun, res *agent.RunResult, includeInput bool) {
+	if p.messages == nil || res == nil {
+		return
+	}
+	msgs := make([]llm.ChatMessage, 0, len(res.NewMessages)+1)
+	if includeInput && !payload.IsResume && payload.Input != "" {
+		msgs = append(msgs, llm.ChatMessage{Role: "user", Content: payload.Input})
+	}
+	msgs = append(msgs, res.NewMessages...)
+	if len(msgs) == 0 {
+		return
+	}
+	_, _ = p.messages.InsertMany(context.Background(), prepared.RunCtx.ThreadID, prepared.Agent.ID, prepared.RunCtx.Memory.UserID, msgs)
+}
+
+func (p *AgentPool) notifyJobTerminal(payload DispatchPayload, jobID string, succeeded bool, errText string) {
+	if p.hub != nil {
+		p.hub.Notify(jobID)
+	}
+	if p.bus == nil || payload.ParentRunID == "" {
+		return
+	}
+	eventType := agent.EventJobCompleted
+	var errMeta *agent.ErrMeta
+	if !succeeded {
+		eventType = agent.EventJobFailed
+		errMeta = &agent.ErrMeta{Code: "job.failed", Message: errText}
+	}
+	_ = p.bus.Publish(context.Background(), eventsTopic(payload.ParentRunID), bus.Message{
+		Body: mustJSON(agent.StreamEvent{
+			Type:  eventType,
+			Job:   &agent.JobMeta{ID: jobID},
+			Error: errMeta,
+		}),
+	})
+}
+
+func (p *AgentPool) markAsyncFailed(payload DispatchPayload, errText string) {
+	if p.jobs == nil || payload.JobID == "" {
+		return
+	}
+	switch payload.InvocationKind {
+	case agent.InvocationAsyncJob:
+		_ = p.jobs.MarkJobFailed(context.Background(), payload.JobID, errText)
+		p.notifyJobTerminal(payload, payload.JobID, false, errText)
+	case agent.InvocationCallback:
+		_ = p.jobs.MarkCallbackFailed(context.Background(), payload.JobID, errText)
+	}
+}
+
+func (p *AgentPool) markAsyncCanceled(payload DispatchPayload) {
+	if p.jobs == nil || payload.JobID == "" {
+		return
+	}
+	switch payload.InvocationKind {
+	case agent.InvocationAsyncJob:
+		_ = p.jobs.MarkJobCancelled(context.Background(), payload.JobID, "cancelled before start")
+		p.notifyJobTerminal(payload, payload.JobID, false, "cancelled before start")
+	case agent.InvocationCallback:
+		_ = p.jobs.MarkCallbackCancelled(context.Background(), payload.JobID, "cancelled before start")
+	}
+}
+
+func (p *AgentPool) isCanceled(originatorRunID string) bool {
+	if p.cancels != nil && p.cancels.IsCanceled(originatorRunID) {
+		return true
+	}
+	if p.tasks != nil {
+		cancelled, err := p.tasks.IsCancelled(context.Background(), originatorRunID)
+		return err == nil && cancelled
+	}
+	return false
 }
 
 // markTerminal sets a run's status on pre-RunStream bail paths. Best-effort:
@@ -195,7 +449,7 @@ func (p *AgentPool) watchCancellation(ctx context.Context, originatorRunID strin
 	}()
 	// Re-check after subscribing: closes the dispatch→subscribe race for a
 	// cancel that landed between dispatch publish and this subscription.
-	if p.cancels.IsCanceled(originatorRunID) {
+	if p.isCanceled(originatorRunID) {
 		cancel()
 	}
 	return sub, done
@@ -216,6 +470,11 @@ func (p *AgentPool) forwardWorkerEvents(ctx context.Context, runID string, worke
 			continue
 		}
 	}
+}
+
+func mustJSON(v any) []byte {
+	body, _ := json.Marshal(v)
+	return body
 }
 
 func (p *AgentPool) publishReply(request bus.Message, reply DispatchReply) {

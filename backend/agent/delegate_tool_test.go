@@ -61,7 +61,7 @@ func TestDelegateTool_HappyPathForwardsToInvoker(t *testing.T) {
 	t.Parallel()
 	inv := &stubInvoker{out: "the answer"}
 	dt := newDelegateTool(DelegateConfig{AgentID: "agent-b", ToolName: "ask_b"}, inv)
-	res, err := dt.Execute(delegationCtx(), tools.ToolCall{Args: json.RawMessage(`{"task":"find X"}`)})
+	res, err := dt.Execute(delegationCtx(), tools.ToolCall{ID: "call-1", Args: json.RawMessage(`{"task":"find X"}`)})
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
@@ -70,6 +70,9 @@ func TestDelegateTool_HappyPathForwardsToInvoker(t *testing.T) {
 	}
 	if inv.gotTarget != "agent-b" || inv.gotTask != "find X" {
 		t.Fatalf("invoker got target=%q task=%q", inv.gotTarget, inv.gotTask)
+	}
+	if inv.gotCallID != "call-1" {
+		t.Fatalf("invoker tool call id = %q, want call-1", inv.gotCallID)
 	}
 	if inv.gotParent.OriginatorRunID != "orig-1" || inv.gotParent.RunID != "run-a" {
 		t.Fatalf("invoker parent delegation info wrong: %+v", inv.gotParent)

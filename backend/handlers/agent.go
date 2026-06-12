@@ -48,10 +48,10 @@ func NewAgentHandler(agentRepo agentStore, toolRegistry *tools.ToolRegistry) *Ag
 }
 
 type CreateAgentRequest struct {
-	Name               string   `json:"name"`
-	Description        string   `json:"description"`
-	Provider           string   `json:"provider"`
-	Model              string   `json:"model"`
+	Name               string               `json:"name"`
+	Description        string               `json:"description"`
+	Provider           string               `json:"provider"`
+	Model              string               `json:"model"`
 	SystemPrompt       string               `json:"system_prompt"`
 	Tools              []string             `json:"tools"`
 	Delegates          []DelegateConfigJSON `json:"delegates"`
@@ -61,6 +61,7 @@ type CreateAgentRequest struct {
 	MaxSteps           *int                 `json:"max_steps"`
 	Temperature        *float64             `json:"temperature"`
 	MaxTokens          *int                 `json:"max_tokens"`
+	MaxRuns            *int                 `json:"max_runs"`
 }
 
 type UpdateAgentRequest struct {
@@ -76,6 +77,7 @@ type UpdateAgentRequest struct {
 	MaxSteps           *int                  `json:"max_steps"`
 	Temperature        *float64              `json:"temperature"`
 	MaxTokens          *int                  `json:"max_tokens"`
+	MaxRuns            *int                  `json:"max_runs"`
 }
 
 type AgentResponse struct {
@@ -93,6 +95,7 @@ type AgentResponse struct {
 	MaxSteps           int                  `json:"max_steps"`
 	Temperature        float64              `json:"temperature"`
 	MaxTokens          int                  `json:"max_tokens"`
+	MaxRuns            int                  `json:"max_runs"`
 	CreatedAt          string               `json:"created_at"`
 }
 
@@ -112,6 +115,7 @@ func toAgentResponse(a *agent.Agent) AgentResponse {
 		MaxSteps:           a.MaxSteps,
 		Temperature:        a.Temperature,
 		MaxTokens:          a.MaxTokens,
+		MaxRuns:            resolveAgentMaxRuns(a.MaxRuns),
 		CreatedAt:          a.CreatedAt.UTC().Format(time.RFC3339Nano),
 	}
 }
@@ -128,6 +132,20 @@ func resolveFloat(v *float64, def float64) float64 {
 		return *v
 	}
 	return def
+}
+
+func resolveAgentMaxRuns(v int) int {
+	if v <= 0 {
+		return agent.DefaultMaxTaskRuns
+	}
+	return v
+}
+
+func validatePositiveInt(name string, v *int) error {
+	if v != nil && *v <= 0 {
+		return fmt.Errorf("%s must be greater than 0", name)
+	}
+	return nil
 }
 
 func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -154,6 +172,10 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := validatePositiveInt("max_runs", req.MaxRuns); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	delegates := toDelegateConfigs(req.Delegates)
 	// thisAgentID is empty on create (id not yet assigned); self-delegate is
 	// impossible (a self-reference can't resolve) and is backstopped by the
@@ -174,6 +196,7 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		SummarizationModel: req.SummarizationModel,
 		MaxSteps:           resolveInt(req.MaxSteps, agent.DefaultMaxSteps),
 		MaxTokens:          resolveInt(req.MaxTokens, agent.DefaultMaxTokens),
+		MaxRuns:            resolveInt(req.MaxRuns, agent.DefaultMaxTaskRuns),
 		ContextWindow:      resolveInt(req.ContextWindow, agent.DefaultContextWindow),
 		Temperature:        resolveFloat(req.Temperature, agent.DefaultTemperature),
 		ContextKeepRatio:   resolveFloat(req.ContextKeepRatio, agent.DefaultContextKeepRatio),
@@ -250,8 +273,13 @@ func (h *AgentHandler) Update(w http.ResponseWriter, r *http.Request) {
 		Temperature:        req.Temperature,
 		MaxSteps:           req.MaxSteps,
 		MaxTokens:          req.MaxTokens,
+		MaxRuns:            req.MaxRuns,
 		ContextKeepRatio:   req.ContextKeepRatio,
 		SummarizationModel: req.SummarizationModel,
+	}
+	if err := validatePositiveInt("max_runs", req.MaxRuns); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if req.Tools != nil {
 		if err := h.validateTools(*req.Tools); err != nil {

@@ -17,7 +17,6 @@ import (
 )
 
 const (
-	defaultMaxDelegationDepth    = 5
 	defaultDelegateSafetyTimeout = 30 * time.Minute
 )
 
@@ -40,6 +39,7 @@ type BusDelegateInvoker struct {
 	threads       ThreadStore
 	runs          RunStore
 	messages      MessageStore
+	tasks         taskBudgetStore
 	maxDepth      int
 	safetyTimeout time.Duration
 }
@@ -51,6 +51,7 @@ type BusDelegateInvokerConfig struct {
 	Threads       ThreadStore
 	Runs          RunStore
 	Messages      MessageStore
+	Tasks         taskBudgetStore
 	MaxDepth      int
 	SafetyTimeout time.Duration
 }
@@ -58,7 +59,7 @@ type BusDelegateInvokerConfig struct {
 func NewBusDelegateInvoker(cfg BusDelegateInvokerConfig) *BusDelegateInvoker {
 	maxDepth := cfg.MaxDepth
 	if maxDepth <= 0 {
-		maxDepth = defaultMaxDelegationDepth
+		maxDepth = agent.DefaultMaxDelegationDepth
 	}
 	safety := cfg.SafetyTimeout
 	if safety <= 0 {
@@ -71,12 +72,13 @@ func NewBusDelegateInvoker(cfg BusDelegateInvokerConfig) *BusDelegateInvoker {
 		threads:       cfg.Threads,
 		runs:          cfg.Runs,
 		messages:      cfg.Messages,
+		tasks:         cfg.Tasks,
 		maxDepth:      maxDepth,
 		safetyTimeout: safety,
 	}
 }
 
-func (iv *BusDelegateInvoker) InvokeDelegate(ctx context.Context, parent runtimectx.DelegationInfo, targetAgentID, task string) (string, error) {
+func (iv *BusDelegateInvoker) InvokeDelegate(ctx context.Context, parent runtimectx.DelegationInfo, targetAgentID, task, toolCallID string) (string, error) {
 	if parent.Depth >= iv.maxDepth {
 		return "", fmt.Errorf("%w: depth %d reached max %d", ErrDelegationDepthExceeded, parent.Depth, iv.maxDepth)
 	}
@@ -87,12 +89,16 @@ func (iv *BusDelegateInvoker) InvokeDelegate(ctx context.Context, parent runtime
 		return "", fmt.Errorf("%w: %s", ErrDelegateNotOwned, targetAgentID)
 	}
 
+	childRunID := uuid.NewString()
+	if err := iv.consumeRunBudget(ctx, parent, toolCallID, childRunID); err != nil {
+		return "", err
+	}
+
 	subThreadID, err := iv.threads.FindOrCreateSubThread(ctx, parent.UserID, parent.OriginatorRunID, targetAgentID)
 	if err != nil {
 		return "", fmt.Errorf("delegate: resolve sub-thread: %w", err)
 	}
 
-	childRunID := uuid.NewString()
 	if err := iv.runs.CreateChildRun(ctx, childRunID, subThreadID, targetAgentID, parent.UserID, parent.OriginatorRunID, parent.RunID); err != nil {
 		return "", fmt.Errorf("delegate: create child run: %w", err)
 	}
@@ -189,6 +195,30 @@ func (iv *BusDelegateInvoker) InvokeDelegate(ctx context.Context, parent runtime
 	case <-sub.Done():
 		return "", errors.New("delegate: reply subscription closed")
 	}
+}
+
+func (iv *BusDelegateInvoker) consumeRunBudget(ctx context.Context, parent runtimectx.DelegationInfo, toolCallID, childRunID string) error {
+	if iv.tasks == nil {
+		return nil
+	}
+	if _, err := iv.tasks.BudgetStatus(ctx, parent.OriginatorRunID); err != nil {
+		return fmt.Errorf("delegate: budget status: %w", err)
+	}
+	status, ok, err := iv.tasks.TryConsumeRun(ctx, parent.OriginatorRunID, parent.UserID, syncBudgetKey(parent.RunID, toolCallID, childRunID))
+	if err != nil {
+		return fmt.Errorf("delegate: consume run budget: %w", err)
+	}
+	if !ok {
+		return agent.RunBudgetErrorFromStatus(status)
+	}
+	return nil
+}
+
+func syncBudgetKey(parentRunID, toolCallID, childRunID string) string {
+	if parentRunID != "" && toolCallID != "" {
+		return "sync:" + parentRunID + ":" + toolCallID
+	}
+	return "sync:" + childRunID
 }
 
 func (iv *BusDelegateInvoker) persistSubThread(ctx context.Context, subThreadID, targetAgentID string, parent runtimectx.DelegationInfo, task string, res *agent.RunResult) {

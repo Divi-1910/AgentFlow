@@ -40,6 +40,11 @@ type toolOutcome struct {
 	thresholdErrorText string
 	lastAction         string
 	ran                bool
+	awaitPending       bool
+	pendingAwait       PendingAwait
+	awaitDelivered     bool
+	deliveredAwait     PendingAwait
+	awaitResult        AwaitJobResult
 }
 
 func validateToolBatch(toolSet *ToolSet, calls []llm.ToolCall) ([]plannedCall, []missingCall) {
@@ -193,6 +198,7 @@ func runToolCall(
 		Depth:           runCtx.DelegationDepth,
 		UserID:          runCtx.Memory.UserID,
 	})
+	toolCtx = withAsyncRunInfo(toolCtx, asyncRunInfoForToolContext(runCtx))
 
 	toolResult, err := p.tool.Execute(toolCtx, tools.ToolCall{
 		ID:   call.ID,
@@ -230,6 +236,28 @@ func runToolCall(
 		return outcome
 	}
 
+	if pending, _ := toolResult.Metadata[awaitMetadataPending].(bool); pending {
+		jobID, _ := toolResult.Metadata[awaitMetadataJobID].(string)
+		delegateTool, _ := toolResult.Metadata[awaitMetadataDelegateTool].(string)
+		createdAt, _ := toolResult.Metadata[awaitMetadataCreatedAt].(time.Time)
+		if createdAt.IsZero() {
+			createdAt = time.Now()
+		}
+		logger.Info("await_job pending", "job_id", jobID, "call_id", call.ID)
+		return toolOutcome{
+			index:        p.index,
+			toolName:     call.Name,
+			awaitPending: true,
+			pendingAwait: PendingAwait{
+				JobID:           jobID,
+				AwaitToolCallID: call.ID,
+				CreatedAt:       createdAt,
+				DelegateTool:    delegateTool,
+			},
+			ran: true,
+		}
+	}
+
 	content := truncateToolContent(toolResult.Content)
 	logger.Info("tool completed",
 		"tool", call.Name,
@@ -258,6 +286,32 @@ func runToolCall(
 	if toolResult.IsError {
 		outcome.lastAction = fmt.Sprintf("%s → error", call.Name)
 	}
+	if terminal, _ := toolResult.Metadata[awaitMetadataTerminal].(bool); terminal {
+		jobID, _ := toolResult.Metadata[awaitMetadataJobID].(string)
+		delegateTool, _ := toolResult.Metadata[awaitMetadataDelegateTool].(string)
+		status, _ := toolResult.Metadata[awaitMetadataStatus].(string)
+		output, _ := toolResult.Metadata[awaitMetadataOutput].(string)
+		errText, _ := toolResult.Metadata[awaitMetadataError].(string)
+		createdAt, _ := toolResult.Metadata[awaitMetadataCreatedAt].(time.Time)
+		if createdAt.IsZero() {
+			createdAt = time.Now()
+		}
+		outcome.awaitDelivered = true
+		outcome.deliveredAwait = PendingAwait{
+			JobID:           jobID,
+			AwaitToolCallID: call.ID,
+			CreatedAt:       createdAt,
+			DelegateTool:    delegateTool,
+		}
+		outcome.awaitResult = AwaitJobResult{
+			JobID:        jobID,
+			Status:       status,
+			Output:       output,
+			Error:        errText,
+			CreatedAt:    createdAt,
+			DelegateTool: delegateTool,
+		}
+	}
 
 	displayStr := fmt.Sprintf("Finished %s", call.Name)
 	if content != "" && len(content) < 50 {
@@ -265,6 +319,19 @@ func runToolCall(
 	}
 	if toolResult.IsError {
 		displayStr = fmt.Sprintf("Error in %s", call.Name)
+	}
+
+	if dispatched, _ := toolResult.Metadata["job_dispatched"].(bool); dispatched {
+		jobID, _ := toolResult.Metadata["job_id"].(string)
+		status, _ := toolResult.Metadata["job_status"].(string)
+		mode, _ := toolResult.Metadata["job_mode"].(string)
+		delegateTool, _ := toolResult.Metadata["delegate_tool"].(string)
+		target, _ := toolResult.Metadata["target_agent_id"].(string)
+		sink.Emit(StreamEvent{
+			Type: EventJobDispatched,
+			Step: step,
+			Job:  &JobMeta{ID: jobID, Status: status, Mode: mode, DelegateTool: delegateTool, TargetAgentID: target},
+		})
 	}
 
 	sink.Emit(StreamEvent{
@@ -288,6 +355,9 @@ func applyToolOutcomes(
 
 	for _, outcome := range outcomes {
 		if !outcome.ran {
+			continue
+		}
+		if outcome.awaitPending {
 			continue
 		}
 		*messages = append(*messages, outcome.message)

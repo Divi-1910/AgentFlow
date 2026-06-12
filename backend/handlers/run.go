@@ -85,6 +85,7 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 	resumableStatuses := map[string]bool{
 		string(model.RunStatusResumable):   true,
 		string(model.RunStatusInterrupted): true,
+		string(model.RunStatusWaitingJobs): true,
 	}
 	if !resumableStatuses[info.Status] {
 		writeError(w, http.StatusConflict, fmt.Sprintf("Run is not resumable, current status: %s", info.Status))
@@ -191,29 +192,35 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 	out := sr.out
 
 	if out.res != nil {
-		persistCtx, cancelPersist := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancelPersist()
-
-		savedDocs, insertErr := h.messageRepo.InsertMany(
-			persistCtx,
-			snapshot.Meta.ThreadID,
-			snapshot.Meta.AgentID,
-			userID,
-			out.res.NewMessages,
-		)
-		if insertErr != nil {
-			runLogger.Error("message persist failed", "attempt", newAttempt, "thread_id", snapshot.Meta.ThreadID, "error", insertErr)
-			if !sr.clientDisconnected {
-				emitEvent(w, flusher, agent.StreamEvent{
-					Type:  agent.EventRunPersistFail,
-					Time:  time.Now(),
-					Error: &agent.ErrMeta{Code: "internal.persistence_error", Message: "Failed to persist messages"},
-				})
-			}
-		} else {
-			runLogger.Info("messages persisted", "attempt", newAttempt, "steps", out.res.Steps, "thread_id", snapshot.Meta.ThreadID, "messages", len(savedDocs))
+		if len(out.res.NewMessages) == 0 {
 			if !sr.clientDisconnected {
 				emitEvent(w, flusher, agent.StreamEvent{Type: agent.EventRunPersisted, Time: time.Now()})
+			}
+		} else {
+			persistCtx, cancelPersist := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelPersist()
+
+			savedDocs, insertErr := h.messageRepo.InsertMany(
+				persistCtx,
+				snapshot.Meta.ThreadID,
+				snapshot.Meta.AgentID,
+				userID,
+				out.res.NewMessages,
+			)
+			if insertErr != nil {
+				runLogger.Error("message persist failed", "attempt", newAttempt, "thread_id", snapshot.Meta.ThreadID, "error", insertErr)
+				if !sr.clientDisconnected {
+					emitEvent(w, flusher, agent.StreamEvent{
+						Type:  agent.EventRunPersistFail,
+						Time:  time.Now(),
+						Error: &agent.ErrMeta{Code: "internal.persistence_error", Message: "Failed to persist messages"},
+					})
+				}
+			} else {
+				runLogger.Info("messages persisted", "attempt", newAttempt, "steps", out.res.Steps, "thread_id", snapshot.Meta.ThreadID, "messages", len(savedDocs))
+				if !sr.clientDisconnected {
+					emitEvent(w, flusher, agent.StreamEvent{Type: agent.EventRunPersisted, Time: time.Now()})
+				}
 			}
 		}
 	}

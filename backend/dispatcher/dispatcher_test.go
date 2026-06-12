@@ -119,7 +119,7 @@ func TestAgentPool_HonorsPreCanceledTask(t *testing.T) {
 	}
 	preparer := newTestPreparer(rt)
 	status := &recordingStatusUpdater{}
-	pool := NewAgentPool(context.Background(), testAgentID, b, preparer, rt, status, 1, cancels)
+	pool := NewAgentPool(context.Background(), testAgentID, b, preparer, rt, status, nil, nil, nil, nil, 1, cancels)
 	if err := pool.Start(); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -214,6 +214,37 @@ func TestRunPreparer_ResumeAppliesRequestAttempt(t *testing.T) {
 	}
 	if prepared.RunCtx.Checkpoint == nil || prepared.RunCtx.Checkpoint.Meta.Attempt != 7 {
 		t.Fatalf("snapshot attempt = %+v, want 7", prepared.RunCtx.Checkpoint)
+	}
+}
+
+func TestRunPreparerFreshTopLevelEnsuresTaskBudgetFromRootAgent(t *testing.T) {
+	t.Parallel()
+
+	rt := &fakeRuntime{}
+	agentObj := &agent.Agent{ID: testAgentID, Provider: "fake", Model: "fake", MaxSteps: 5, MaxRuns: 13}
+	agentOID, _ := bson.ObjectIDFromHex(testAgentID)
+	threadOID, _ := bson.ObjectIDFromHex(testThreadID)
+	userOID, _ := bson.ObjectIDFromHex(testUserID)
+	thread := &model.ThreadDocument{ID: threadOID, AgentID: agentOID, UserID: userOID}
+	tasks := &fakeBudgetStore{}
+	preparer := NewRunPreparer(RunPreparerConfig{
+		Agents:       &fakeAgentStore{agent: agentObj},
+		Threads:      &fakeThreadStore{thread: thread},
+		Messages:     &fakeMessageStore{messages: []llm.ChatMessage{{Role: "user", Content: "hello"}}},
+		Runtime:      rt,
+		ToolRegistry: tools.NewEmptyRegistry(),
+		Tasks:        tasks,
+	})
+
+	prepared, err := preparer.Prepare(context.Background(), freshDispatchRequest())
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if prepared.RunCtx.InvocationKind != agent.InvocationTopLevel {
+		t.Fatalf("InvocationKind = %q, want top_level", prepared.RunCtx.InvocationKind)
+	}
+	if tasks.ensureCalls != 1 || tasks.ensureMax != 13 {
+		t.Fatalf("EnsureTask calls/max = %d/%d, want 1/13", tasks.ensureCalls, tasks.ensureMax)
 	}
 }
 
@@ -349,7 +380,7 @@ func TestAgentPool_CancelDuringPrepareAbortsRun(t *testing.T) {
 		Background:   context.Background(),
 	})
 
-	pool := NewAgentPool(context.Background(), testAgentID, b, preparer, rt, nil, 1, NewCancelRegistry(0))
+	pool := NewAgentPool(context.Background(), testAgentID, b, preparer, rt, nil, nil, nil, nil, nil, 1, NewCancelRegistry(0))
 	if err := pool.Start(); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -499,7 +530,7 @@ func (f *fakeRunStore) CreateRun(context.Context, string, string, string, string
 func (f *fakeRunStore) CreateChildRun(context.Context, string, string, string, string, string, string) error {
 	return nil
 }
-func (f *fakeRunStore) Save(context.Context, agent.RunSnapshot) error                   { return nil }
+func (f *fakeRunStore) Save(context.Context, agent.RunSnapshot) error { return nil }
 func (f *fakeRunStore) LoadLatest(context.Context, string) (*agent.RunSnapshot, error) {
 	if f.snapshot == nil {
 		return nil, errors.New("missing checkpoint")

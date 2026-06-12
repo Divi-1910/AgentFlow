@@ -221,6 +221,28 @@ func TestAgentHandlerCreateReturns201WithDefaults(t *testing.T) {
 	if resp["max_tokens"] == nil {
 		t.Error("max_tokens should be set from defaults, got nil")
 	}
+	if resp["max_runs"] != float64(agent.DefaultMaxTaskRuns) {
+		t.Errorf("max_runs: got %v, want %d", resp["max_runs"], agent.DefaultMaxTaskRuns)
+	}
+}
+
+func TestAgentHandlerCreateRejectsInvalidMaxRuns(t *testing.T) {
+	t.Parallel()
+	b, _ := json.Marshal(map[string]any{
+		"name":          "a",
+		"provider":      "openai",
+		"model":         "gpt-4",
+		"system_prompt": "x",
+		"max_runs":      0,
+	})
+	h := newAgentHandler(&fakeAgentStore{})
+	r := httptest.NewRequest(http.MethodPost, "/api/agents", bytes.NewBuffer(b))
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.Create(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("got %d, want 400", w.Code)
+	}
 }
 
 func TestAgentHandlerCreateAcceptsKnownTool(t *testing.T) {
@@ -395,6 +417,48 @@ func TestAgentHandlerUpdateReturns200WithPatchedName(t *testing.T) {
 	decodeJSON(t, w.Body.Bytes(), &resp)
 	if resp["name"] != newName {
 		t.Errorf("name: got %v, want %q", resp["name"], newName)
+	}
+}
+
+func TestAgentHandlerUpdateAcceptsMaxRuns(t *testing.T) {
+	t.Parallel()
+	const maxRuns = 12
+	store := &fakeAgentStore{
+		updateFn: func(_ context.Context, agentID, _ string, input repository.UpdateAgentInput) (*agent.Agent, error) {
+			if input.MaxRuns == nil || *input.MaxRuns != maxRuns {
+				t.Fatalf("MaxRuns input = %v, want %d", input.MaxRuns, maxRuns)
+			}
+			return &agent.Agent{ID: agentID, Name: "updated", MaxRuns: *input.MaxRuns}, nil
+		},
+	}
+	b, _ := json.Marshal(map[string]any{"max_runs": maxRuns})
+	h := newAgentHandler(store)
+	r := httptest.NewRequest(http.MethodPut, "/api/agents/"+testAgentID, bytes.NewBuffer(b))
+	r.SetPathValue("id", testAgentID)
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.Update(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 — body: %s", w.Code, w.Body)
+	}
+	var resp map[string]any
+	decodeJSON(t, w.Body.Bytes(), &resp)
+	if resp["max_runs"] != float64(maxRuns) {
+		t.Errorf("max_runs: got %v, want %d", resp["max_runs"], maxRuns)
+	}
+}
+
+func TestAgentHandlerUpdateRejectsInvalidMaxRuns(t *testing.T) {
+	t.Parallel()
+	b, _ := json.Marshal(map[string]any{"max_runs": -1})
+	h := newAgentHandler(&fakeAgentStore{})
+	r := httptest.NewRequest(http.MethodPut, "/api/agents/"+testAgentID, bytes.NewBuffer(b))
+	r.SetPathValue("id", testAgentID)
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.Update(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("got %d, want 400", w.Code)
 	}
 }
 

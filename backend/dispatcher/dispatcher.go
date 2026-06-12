@@ -16,14 +16,18 @@ type Dispatcher interface {
 }
 
 type DispatchRequest struct {
-	RunID    string
-	AgentID  string
-	UserID   string
-	ThreadID string
-	Input    string
-	IsResume bool
-	Attempt  int
-	Logger   *slog.Logger
+	RunID                 string
+	AgentID               string
+	UserID                string
+	ThreadID              string
+	Input                 string
+	IsResume              bool
+	Attempt               int
+	Logger                *slog.Logger
+	SystemContext         string
+	InvocationKind        string
+	JobID                 string
+	PersistResultMessages bool
 
 	// Delegation tree. For top-level runs these are left zero and defaulted
 	// in the preparer (OriginatorRunID=RunID, Chain=[agentID], Depth=0). For
@@ -42,17 +46,21 @@ type EstimateRequest struct {
 }
 
 type DispatchPayload struct {
-	RunID           string   `json:"run_id"`
-	OriginatorRunID string   `json:"originator_run_id"`
-	ParentRunID     string   `json:"parent_run_id,omitempty"`
-	AgentID         string   `json:"agent_id"`
-	UserID          string   `json:"user_id"`
-	ThreadID        string   `json:"thread_id"`
-	Input           string   `json:"input"`
-	IsResume        bool     `json:"is_resume"`
-	Attempt         int      `json:"attempt"`
-	Chain           []string `json:"chain,omitempty"`
-	Depth           int      `json:"depth,omitempty"`
+	RunID                 string   `json:"run_id"`
+	OriginatorRunID       string   `json:"originator_run_id"`
+	ParentRunID           string   `json:"parent_run_id,omitempty"`
+	AgentID               string   `json:"agent_id"`
+	UserID                string   `json:"user_id"`
+	ThreadID              string   `json:"thread_id"`
+	Input                 string   `json:"input"`
+	IsResume              bool     `json:"is_resume"`
+	Attempt               int      `json:"attempt"`
+	Chain                 []string `json:"chain,omitempty"`
+	Depth                 int      `json:"depth,omitempty"`
+	SystemContext         string   `json:"system_context,omitempty"`
+	InvocationKind        string   `json:"invocation_kind,omitempty"`
+	JobID                 string   `json:"job_id,omitempty"`
+	PersistResultMessages bool     `json:"persist_result_messages,omitempty"`
 }
 
 type DispatchReply struct {
@@ -61,6 +69,7 @@ type DispatchReply struct {
 }
 
 type RunResultWire struct {
+	Status      string            `json:"status,omitempty"`
 	Output      string            `json:"output"`
 	NewMessages []llm.ChatMessage `json:"new_messages"`
 	Steps       int               `json:"steps"`
@@ -113,17 +122,21 @@ func payloadFromRequest(req DispatchRequest) DispatchPayload {
 		originator = req.RunID
 	}
 	return DispatchPayload{
-		RunID:           req.RunID,
-		OriginatorRunID: originator,
-		ParentRunID:     req.ParentRunID,
-		AgentID:         req.AgentID,
-		UserID:          req.UserID,
-		ThreadID:        req.ThreadID,
-		Input:           req.Input,
-		IsResume:        req.IsResume,
-		Attempt:         req.Attempt,
-		Chain:           req.Chain,
-		Depth:           req.Depth,
+		RunID:                 req.RunID,
+		OriginatorRunID:       originator,
+		ParentRunID:           req.ParentRunID,
+		AgentID:               req.AgentID,
+		UserID:                req.UserID,
+		ThreadID:              req.ThreadID,
+		Input:                 req.Input,
+		IsResume:              req.IsResume,
+		Attempt:               req.Attempt,
+		Chain:                 req.Chain,
+		Depth:                 req.Depth,
+		SystemContext:         req.SystemContext,
+		InvocationKind:        req.InvocationKind,
+		JobID:                 req.JobID,
+		PersistResultMessages: req.PersistResultMessages,
 	}
 }
 
@@ -136,18 +149,22 @@ func requestFromPayload(payload DispatchPayload) DispatchRequest {
 		"agent_id", payload.AgentID,
 	)
 	return DispatchRequest{
-		RunID:           payload.RunID,
-		OriginatorRunID: payload.OriginatorRunID,
-		ParentRunID:     payload.ParentRunID,
-		AgentID:         payload.AgentID,
-		UserID:          payload.UserID,
-		ThreadID:        payload.ThreadID,
-		Input:           payload.Input,
-		IsResume:        payload.IsResume,
-		Attempt:         payload.Attempt,
-		Chain:           payload.Chain,
-		Depth:           payload.Depth,
-		Logger:          logger,
+		RunID:                 payload.RunID,
+		OriginatorRunID:       payload.OriginatorRunID,
+		ParentRunID:           payload.ParentRunID,
+		AgentID:               payload.AgentID,
+		UserID:                payload.UserID,
+		ThreadID:              payload.ThreadID,
+		Input:                 payload.Input,
+		IsResume:              payload.IsResume,
+		Attempt:               payload.Attempt,
+		Chain:                 payload.Chain,
+		Depth:                 payload.Depth,
+		SystemContext:         payload.SystemContext,
+		InvocationKind:        payload.InvocationKind,
+		JobID:                 payload.JobID,
+		PersistResultMessages: payload.PersistResultMessages,
+		Logger:                logger,
 	}
 }
 
@@ -156,6 +173,7 @@ func wireFromRunResult(res *agent.RunResult) *RunResultWire {
 		return nil
 	}
 	return &RunResultWire{
+		Status:      string(res.Status),
 		Output:      res.Output,
 		NewMessages: res.NewMessages,
 		Steps:       res.Steps,
@@ -167,7 +185,12 @@ func runResultFromWire(wire *RunResultWire) *agent.RunResult {
 	if wire == nil {
 		return nil
 	}
+	status := agent.RunResultStatus(wire.Status)
+	if status == "" {
+		status = agent.RunResultCompleted
+	}
 	return &agent.RunResult{
+		Status:      status,
 		Output:      wire.Output,
 		NewMessages: wire.NewMessages,
 		Steps:       wire.Steps,

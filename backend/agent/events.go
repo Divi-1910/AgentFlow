@@ -20,6 +20,7 @@ const (
 	EventRunPersisted   EventType = "run.persisted"
 	EventRunPersistFail EventType = "run.persist_failed"
 	EventRunResumed     EventType = "run.resumed"
+	EventRunWaiting     EventType = "run.waiting"
 	EventStepStarted    EventType = "step.started"
 	EventStepCompleted  EventType = "step.completed"
 	EventModelDelta     EventType = "model.delta"
@@ -28,6 +29,10 @@ const (
 	EventToolCompleted  EventType = "tool.completed"
 	EventToolFailed     EventType = "tool.failed"
 	EventStatusUpdated  EventType = "status.updated"
+	EventJobDispatched  EventType = "job.dispatched"
+	EventJobStarted     EventType = "job.started"
+	EventJobCompleted   EventType = "job.completed"
+	EventJobFailed      EventType = "job.failed"
 )
 
 type ToolMeta struct {
@@ -40,6 +45,14 @@ type ToolMeta struct {
 type ErrMeta struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+type JobMeta struct {
+	ID            string `json:"id,omitempty"`
+	Status        string `json:"status,omitempty"`
+	Mode          string `json:"mode,omitempty"`
+	DelegateTool  string `json:"delegate_tool,omitempty"`
+	TargetAgentID string `json:"target_agent_id,omitempty"`
 }
 
 type StreamEvent struct {
@@ -64,6 +77,7 @@ type StreamEvent struct {
 	DurationMs int64 `json:"duration_ms,omitempty"`
 
 	Tool  *ToolMeta       `json:"tool,omitempty"`
+	Job   *JobMeta        `json:"job,omitempty"`
 	Usage *llm.TokenUsage `json:"usage,omitempty"`
 	Error *ErrMeta        `json:"error,omitempty"`
 }

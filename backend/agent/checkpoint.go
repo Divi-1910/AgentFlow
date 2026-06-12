@@ -18,6 +18,7 @@ const (
 	PhasePreModel      = "pre_model"
 	PhasePostModel     = "post_model"
 	PhaseStepCompleted = "step.completed"
+	PhaseWaitingJobs   = "waiting_for_jobs"
 )
 
 var ErrCheckpointStoreUnavailable = errors.New("checkpoint store unavailable")
@@ -36,6 +37,7 @@ type RuntimeState struct {
 	MaxSteps       int               `json:"max_steps"`
 	TotalUsage     llm.TokenUsage    `json:"total_usage"`
 	ToolFailures   map[string]int    `json:"tool_failures"`
+	PendingAwaits  []PendingAwait    `json:"pending_awaits,omitempty"`
 }
 
 type SnapshotMeta struct {
@@ -62,6 +64,9 @@ type SnapshotMeta struct {
 	ParentRunID     string   `json:"parent_run_id,omitempty"`
 	DelegationChain []string `json:"delegation_chain,omitempty"`
 	DelegationDepth int      `json:"delegation_depth,omitempty"`
+	InvocationKind  string   `json:"invocation_kind,omitempty"`
+	JobID           string   `json:"job_id,omitempty"`
+	SystemContext   string   `json:"system_context,omitempty"`
 }
 
 type CheckpointStore interface {
@@ -87,6 +92,8 @@ type RunInfo struct {
 	LastError       string `json:"last_error,omitempty"`
 	OriginatorRunID string `json:"originator_run_id,omitempty"`
 	ParentRunID     string `json:"parent_run_id,omitempty"`
+	InvocationKind  string `json:"invocation_kind,omitempty"`
+	JobID           string `json:"job_id,omitempty"`
 }
 
 func ValidateSnapshot(s *RunSnapshot, ts *ToolSet) error {

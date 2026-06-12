@@ -45,6 +45,7 @@ func (r *AgentRepo) Create(ctx context.Context, userID string, input *agent.Agen
 		MaxSteps:           input.MaxSteps,
 		Temperature:        input.Temperature,
 		MaxTokens:          input.MaxTokens,
+		MaxRuns:            normalizeAgentMaxRuns(input.MaxRuns),
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
@@ -135,6 +136,7 @@ type UpdateAgentInput struct {
 	Temperature        *float64
 	MaxSteps           *int
 	MaxTokens          *int
+	MaxRuns            *int
 	ContextKeepRatio   *float64
 	SummarizationModel *string
 }
@@ -179,6 +181,9 @@ func (r *AgentRepo) Update(ctx context.Context, agentID, userID string, input Up
 	}
 	if input.MaxTokens != nil {
 		set["max_tokens"] = *input.MaxTokens
+	}
+	if input.MaxRuns != nil {
+		set["max_runs"] = normalizeAgentMaxRuns(*input.MaxRuns)
 	}
 	if input.ContextKeepRatio != nil {
 		set["context_keep_ratio"] = *input.ContextKeepRatio
@@ -242,8 +247,16 @@ func (r *AgentRepo) toRuntimeAgent(ctx context.Context, doc model.AgentDocument)
 		MaxSteps:           doc.MaxSteps,
 		Temperature:        doc.Temperature,
 		MaxTokens:          doc.MaxTokens,
+		MaxRuns:            normalizeAgentMaxRuns(doc.MaxRuns),
 		CreatedAt:          doc.CreatedAt,
 	}
+}
+
+func normalizeAgentMaxRuns(maxRuns int) int {
+	if maxRuns <= 0 {
+		return agent.DefaultMaxTaskRuns
+	}
+	return maxRuns
 }
 
 func toDelegateConfigDocs(in []agent.DelegateConfig) []model.DelegateConfigDoc {

@@ -15,6 +15,7 @@ const (
 	RunStatusCancelled   RunStatus = "cancelled"   // RunStatusCancelled means the run was explicitly cancelled by the user. Distinct from RunStatusInterrupted, which is used when a run's context is cancelled (e.g. dropped SSE connection) but it can be resumed from the last checkpoint.
 	RunStatusResumable   RunStatus = "resumable"   // RunStatusResumable means the run is currently running and has at least one checkpoint saved, so if the context is cancelled (e.g. dropped SSE connection) it can be resumed from the last checkpoint.
 	RunStatusInterrupted RunStatus = "interrupted" // RunStatusInterrupted means the run was interrupted (e.g. dropped SSE connection) but it can be resumed from the last checkpoint if there is one, otherwise it will be marked as failed.
+	RunStatusWaitingJobs RunStatus = "waiting_for_jobs"
 )
 
 type RunDocument struct {
@@ -32,6 +33,8 @@ type RunDocument struct {
 	// top-level). Set on child runs created via the delegate invoker.
 	OriginatorRunID string    `bson:"originator_run_id,omitempty" json:"originator_run_id,omitempty"`
 	ParentRunID     string    `bson:"parent_run_id,omitempty"     json:"parent_run_id,omitempty"`
+	InvocationKind  string    `bson:"invocation_kind,omitempty"  json:"invocation_kind,omitempty"`
+	JobID           string    `bson:"job_id,omitempty"           json:"job_id,omitempty"`
 	CreatedAt       time.Time `bson:"created_at" json:"created_at"`
 	UpdatedAt       time.Time `bson:"updated_at" json:"updated_at"`
 }

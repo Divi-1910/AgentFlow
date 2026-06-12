@@ -27,6 +27,7 @@ type AgentDocument struct {
 	MaxSteps    int     `bson:"max_steps,omitempty"   json:"max_steps,omitempty"`
 	Temperature float64 `bson:"temperature,omitempty" json:"temperature,omitempty"`
 	MaxTokens   int     `bson:"max_tokens,omitempty"  json:"max_tokens,omitempty"`
+	MaxRuns     int     `bson:"max_runs,omitempty"    json:"max_runs,omitempty"`
 
 	CreatedAt time.Time `bson:"created_at" json:"created_at"`
 	UpdatedAt time.Time `bson:"updated_at" json:"updated_at"`

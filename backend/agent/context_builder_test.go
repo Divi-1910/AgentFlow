@@ -211,6 +211,33 @@ func TestBuildStaticPrefixIsIdenticalAcrossDifferentRunContexts(t *testing.T) {
 	}
 }
 
+func TestBuildSkipsEmptyFreshInputButKeepsSystemContext(t *testing.T) {
+	t.Parallel()
+	cb := buildBuilder(t, &fakeMetaStore{})
+	ag := buildAgent("Agent system prompt.")
+	rc := buildRunCtx("")
+	rc.SystemContext = "A background task you started earlier has finished. Share this result with the user."
+
+	msgs, err := cb.Build(context.Background(), ag, rc, defsFor(ag))
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %+v, want only the system message", msgs)
+	}
+	if msgs[0].Role != "system" {
+		t.Fatalf("first message role = %q, want system", msgs[0].Role)
+	}
+	if !strings.Contains(msgs[0].Content, "<system_context>") {
+		t.Fatalf("system context missing from system message:\n%s", msgs[0].Content)
+	}
+	for _, msg := range msgs {
+		if msg.Role == "user" && strings.TrimSpace(msg.Content) == "" {
+			t.Fatalf("empty user message emitted: %+v", msgs)
+		}
+	}
+}
+
 // ── Tool instructions filtering ───────────────────────────────────────────────
 
 func TestBuildToolInstructionsIncludesOnlyAgentTools(t *testing.T) {

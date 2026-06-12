@@ -99,6 +99,9 @@ func main() {
 	messagesCol := db.GetCollection(dbName, "messages")
 	runsCol := db.GetCollection(dbName, "runs")
 	checkpointsCol := db.GetCollection(dbName, "run_checkpoints")
+	jobsCol := db.GetCollection(dbName, "jobs")
+	jobLocksCol := db.GetCollection(dbName, "job_locks")
+	tasksCol := db.GetCollection(dbName, "tasks")
 
 	userRepo := repository.NewUserRepo(usersCol)
 	authHandler := handlers.NewAuthHandler(userRepo, nil) // nil → defaults to auth.GenerateToken
@@ -128,9 +131,20 @@ func main() {
 	threadRepo := repository.NewThreadRepo(threadsCol)
 	messageRepo := repository.NewMessageRepo(messagesCol)
 	runRepo := repository.NewRunRepo(runsCol, checkpointsCol)
+	jobRepo := repository.NewJobRepo(jobsCol, jobLocksCol)
+	taskRepo := repository.NewTaskRepo(tasksCol)
+	jobRepo.SetTaskBudgetStore(taskRepo)
 
 	if err := runRepo.EnsureIndexes(context.Background()); err != nil {
 		slog.Error("failed to create run indexes", "error", err)
+		os.Exit(1)
+	}
+	if err := jobRepo.EnsureIndexes(context.Background()); err != nil {
+		slog.Error("failed to create job indexes", "error", err)
+		os.Exit(1)
+	}
+	if err := taskRepo.EnsureIndexes(context.Background()); err != nil {
+		slog.Error("failed to create task indexes", "error", err)
 		os.Exit(1)
 	}
 	if err := threadRepo.EnsureIndexes(context.Background()); err != nil {
@@ -149,12 +163,14 @@ func main() {
 	}
 	contextBuilder := agent.NewContextBuilder(platformCfg, memorySvc, memoryMetaRepo)
 	agentRuntime := agent.NewAgentRuntime(llmRegistry, toolRegistry, contextBuilder).WithCheckpointStore(runRepo)
+	agentRuntime.SetAsyncJobStore(jobRepo)
 	summarizer := agent.NewSummarizer(llmRegistry)
 
 	// Bus, pools, and the delegate invoker are wired UNCONDITIONALLY: delegate
 	// calls always traverse the bus, even when the top-level dispatch is direct.
 	// MESSAGEBUS_DISPATCH only selects the top-level path (Bus vs Direct).
 	theBus := bus.NewInProc()
+	jobHub := dispatcher.NewJobHub()
 	preparer := dispatcher.NewRunPreparer(dispatcher.RunPreparerConfig{
 		Agents:       agentRepo,
 		Threads:      threadRepo,
@@ -163,6 +179,7 @@ func main() {
 		Summarizer:   summarizer,
 		Runtime:      agentRuntime,
 		ToolRegistry: toolRegistry,
+		Tasks:        taskRepo,
 		Background:   appCtx,
 	})
 	pools := dispatcher.NewPoolManager(dispatcher.PoolManagerConfig{
@@ -171,6 +188,10 @@ func main() {
 		Preparer: preparer,
 		Runtime:  agentRuntime,
 		Status:   runRepo,
+		Messages: messageRepo,
+		Jobs:     jobRepo,
+		Tasks:    taskRepo,
+		Hub:      jobHub,
 		Workers:  4,
 	})
 	invoker := dispatcher.NewBusDelegateInvoker(dispatcher.BusDelegateInvokerConfig{
@@ -180,8 +201,20 @@ func main() {
 		Threads:  threadRepo,
 		Runs:     runRepo,
 		Messages: messageRepo,
+		Tasks:    taskRepo,
 	})
 	agentRuntime.SetDelegateInvoker(invoker)
+	coordinator := dispatcher.NewJobCoordinator(dispatcher.JobCoordinatorConfig{
+		Bus:     theBus,
+		Pools:   pools,
+		Threads: threadRepo,
+		Runs:    runRepo,
+		Jobs:    jobRepo,
+		Tasks:   taskRepo,
+		Hub:     jobHub,
+		Logger:  slog.Default(),
+	})
+	coordinator.Start(appCtx)
 	defer theBus.Close()
 
 	var disp dispatcher.Dispatcher

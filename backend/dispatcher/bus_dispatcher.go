@@ -130,7 +130,7 @@ func (d *BusDispatcher) forwardEvents(ctx context.Context, sub bus.Subscription,
 			case <-sub.Done():
 				return
 			}
-			if isTerminalEvent(event.Type) {
+			if isStreamEndEvent(event.Type) {
 				return
 			}
 		case <-sub.Done():
@@ -163,4 +163,8 @@ func isTerminalEvent(eventType agent.EventType) bool {
 	return eventType == agent.EventRunCompleted ||
 		eventType == agent.EventRunFailed ||
 		eventType == agent.EventRunCancelled
+}
+
+func isStreamEndEvent(eventType agent.EventType) bool {
+	return isTerminalEvent(eventType) || eventType == agent.EventRunWaiting
 }

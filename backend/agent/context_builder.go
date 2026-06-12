@@ -109,7 +109,9 @@ func (cb *ContextBuilder) Build(ctx context.Context, agent *Agent, runCtx RunCon
 	out := make([]llm.ChatMessage, 0, len(runCtx.History)+2)
 	out = append(out, sysMsg)
 	out = append(out, runCtx.History...)
-	out = append(out, llm.ChatMessage{Role: "user", Content: runCtx.Input})
+	if strings.TrimSpace(runCtx.Input) != "" {
+		out = append(out, llm.ChatMessage{Role: "user", Content: runCtx.Input})
+	}
 	return out, nil
 }
 
@@ -262,11 +264,16 @@ func (cb *ContextBuilder) renderUserPreferences(ctx context.Context, runCtx RunC
 	return "<user_preferences>\n" + inner.String() + "</user_preferences>\n", nil
 }
 
-// renderContextBlock emits <context> wrapping <state>, optional <summary>,
-// and optional <memories>. <state> is always emitted; the others elide when
-// empty.
+// renderContextBlock emits <context> wrapping <state>, optional
+// <system_context>, optional <summary>, and optional <memories>. <state> is
+// always emitted; the others elide when empty.
 func (cb *ContextBuilder) renderContextBlock(ctx context.Context, agent *Agent, runCtx RunContext) (string, error) {
 	state := cb.renderState(agent, runCtx)
+
+	var systemContext string
+	if s := strings.TrimSpace(runCtx.SystemContext); s != "" {
+		systemContext = fmt.Sprintf("  <system_context>\n    %s\n  </system_context>\n", escapeXMLContent(s))
+	}
 
 	var summary string
 	if s := strings.TrimSpace(runCtx.Summary); s != "" {
@@ -278,7 +285,7 @@ func (cb *ContextBuilder) renderContextBlock(ctx context.Context, agent *Agent, 
 		return "", err
 	}
 
-	if state == "" && summary == "" && memoriesBlock == "" {
+	if state == "" && systemContext == "" && summary == "" && memoriesBlock == "" {
 		return "", nil
 	}
 
@@ -286,6 +293,9 @@ func (cb *ContextBuilder) renderContextBlock(ctx context.Context, agent *Agent, 
 	sb.WriteString("<context>\n")
 	if state != "" {
 		sb.WriteString(state)
+	}
+	if systemContext != "" {
+		sb.WriteString(systemContext)
 	}
 	if summary != "" {
 		sb.WriteString(summary)

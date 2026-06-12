@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"testing"
 
 	"backend/runtimectx"
@@ -15,14 +16,16 @@ type stubInvoker struct {
 	err        error
 	gotTarget  string
 	gotTask    string
+	gotCallID  string
 	gotParent  runtimectx.DelegationInfo
 	calledOnce bool
 }
 
-func (s *stubInvoker) InvokeDelegate(_ context.Context, parent runtimectx.DelegationInfo, target, task string) (string, error) {
+func (s *stubInvoker) InvokeDelegate(_ context.Context, parent runtimectx.DelegationInfo, target, task, toolCallID string) (string, error) {
 	s.calledOnce = true
 	s.gotTarget = target
 	s.gotTask = task
+	s.gotCallID = toolCallID
 	s.gotParent = parent
 	return s.out, s.err
 }
@@ -47,8 +50,9 @@ func TestBuildToolSet_IncludesDelegatesInDefinitionsAndLookup(t *testing.T) {
 		t.Fatalf("BuildToolSet: %v", err)
 	}
 	names := ts.Names()
-	if len(names) != 2 || names[0] != "calculator" || names[1] != "ask_researcher" {
-		t.Fatalf("Names() = %v, want [calculator ask_researcher]", names)
+	wantNames := []string{"calculator", "ask_researcher", AsyncToolDispatchAgent, AsyncToolAwaitJob}
+	if !slices.Equal(names, wantNames) {
+		t.Fatalf("Names() = %v, want %v", names, wantNames)
 	}
 	if _, ok := ts.Get("ask_researcher"); !ok {
 		t.Fatal("Get(ask_researcher) not found")
