@@ -278,7 +278,7 @@ func main() {
 		port = "9090"
 	}
 
-	const maxRequestBodyBytes = 1 << 30 // 1 GiB — sufficient for all current endpoints
+	const maxRequestBodyBytes = 1 << 20 // 1 MiB — sufficient for all current endpoints
 
 	server := &http.Server{
 		Addr: ":" + port,
