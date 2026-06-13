@@ -39,7 +39,12 @@ func NewToolRegistry(redisClient *redis.Client, memorySvc *memory.Service) *Tool
 		r.Register(NewMemoryWriteTool(memorySvc))
 		r.Register(NewMemoryReadTool(memorySvc))
 		r.Register(NewMemorySearchTool(memorySvc))
-		slog.Info("tool registered", "name", "memory_write,memory_read,memory_search")
+		r.Register(NewMemoryPatchTool(memorySvc))
+		r.Register(NewMemoryUpdateTool(memorySvc))
+		r.Register(NewMemoryRetireTool(memorySvc))
+		r.Register(NewMemoryRestoreTool(memorySvc))
+		r.Register(NewMemoryHistoryTool(memorySvc))
+		slog.Info("tool registered", "name", "memory_write,memory_read,memory_search,memory_patch,memory_update,memory_retire,memory_restore,memory_history")
 	}
 
 	slog.Info("tool registry ready", "count", len(r.tools))

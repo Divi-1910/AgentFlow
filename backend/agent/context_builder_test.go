@@ -46,40 +46,14 @@ func (f *fakeMetaStore) Upsert(_ context.Context, doc memory.MemoryDocument) err
 	return nil
 }
 
-func (f *fakeMetaStore) FindOne(_ context.Context, agentID, scope, memoryID string) (*memory.MemoryDocument, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, d := range f.docs {
-		if d.AgentID == agentID && d.Scope == scope && d.ID == memoryID {
-			dc := d
-			return &dc, nil
-		}
-	}
-	return nil, nil
-}
-
-func (f *fakeMetaStore) FindOneUserScoped(_ context.Context, userID, memoryID string) (*memory.MemoryDocument, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var best *memory.MemoryDocument
-	for i := range f.docs {
-		d := f.docs[i]
-		if d.Scope != memory.ScopeUser || d.UserID != userID || d.ID != memoryID {
-			continue
-		}
-		if best == nil || d.CreatedAt.After(best.CreatedAt) {
-			dc := d
-			best = &dc
-		}
-	}
-	return best, nil
-}
-
-func (f *fakeMetaStore) FindActive(_ context.Context, execScope runtimectx.MemoryScope, searchScope string, typeFilter *string, _ time.Time) ([]memory.MemoryDocument, error) {
+func (f *fakeMetaStore) FindActive(_ context.Context, execScope runtimectx.MemoryScope, searchScope string, typeFilter *string, includeRetired bool, _ time.Time) ([]memory.MemoryDocument, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []memory.MemoryDocument
 	for _, d := range f.docs {
+		if !includeRetired && d.RetiredAt != nil {
+			continue
+		}
 		if !scopeVisible(execScope, searchScope, d) {
 			continue
 		}
@@ -118,7 +92,7 @@ func scopeVisible(execScope runtimectx.MemoryScope, searchScope string, d memory
 	return false
 }
 
-func (f *fakeMetaStore) StampRead(_ context.Context, _, _, _ string) error { return nil }
+func (f *fakeMetaStore) StampRead(_ context.Context, _ memory.MemoryDocument) error { return nil }
 func (f *fakeMetaStore) FindExpired(_ context.Context, _ time.Time) ([]memory.MemoryDocument, error) {
 	return nil, nil
 }

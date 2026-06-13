@@ -109,13 +109,19 @@ func main() {
 	llmRegistry := llm.NewLLMRegistry()
 
 	memoryMetaCol := db.GetCollection(dbName, "memory_meta")
+	memoryRevisionCol := db.GetCollection(dbName, "memory_revisions")
 	memoryMetaRepo := repository.NewMemoryMetaRepo(memoryMetaCol)
 	if err := memoryMetaRepo.EnsureIndexes(context.Background()); err != nil {
 		slog.Error("failed to create memory meta indexes", "error", err)
 		os.Exit(1)
 	}
+	memoryRevisionRepo := repository.NewMemoryRevisionRepo(memoryRevisionCol)
+	if err := memoryRevisionRepo.EnsureIndexes(context.Background()); err != nil {
+		slog.Error("failed to create memory revision indexes", "error", err)
+		os.Exit(1)
+	}
 
-	memorySvc, err := memory.NewServiceFromEnv(memoryMetaRepo)
+	memorySvc, err := memory.NewServiceFromEnv(memoryMetaRepo, memoryRevisionRepo)
 	if err != nil {
 		slog.Error("failed to initialize memory service", "error", err)
 		os.Exit(1)
@@ -166,9 +172,6 @@ func main() {
 	agentRuntime.SetAsyncJobStore(jobRepo)
 	summarizer := agent.NewSummarizer(llmRegistry)
 
-	// Bus, pools, and the delegate invoker are wired UNCONDITIONALLY: delegate
-	// calls always traverse the bus, even when the top-level dispatch is direct.
-	// MESSAGEBUS_DISPATCH only selects the top-level path (Bus vs Direct).
 	theBus := bus.NewInProc()
 	jobHub := dispatcher.NewJobHub()
 	preparer := dispatcher.NewRunPreparer(dispatcher.RunPreparerConfig{
@@ -220,15 +223,9 @@ func main() {
 	var disp dispatcher.Dispatcher
 	if os.Getenv("MESSAGEBUS_DISPATCH") == "true" {
 		disp = &dispatcher.BusDispatcher{
-			Bus:      theBus,
-			Pools:    pools,
-			Preparer: preparer,
-			// Defense-in-depth ceiling for a wedged worker that never replies.
-			// The real run-length governor is the runtime (MaxSteps + per-step
-			// LLM/tool timeouts); this is intentionally generous so it never
-			// cuts off a run that is still making progress. On expiry the bus
-			// dispatcher cancels the task (registry + cancel topic), so the
-			// worker is freed rather than orphaned.
+			Bus:            theBus,
+			Pools:          pools,
+			Preparer:       preparer,
 			RequestTimeout: 30 * time.Minute,
 		}
 		slog.Info("dispatcher: using BusDispatcher")
@@ -262,22 +259,17 @@ func main() {
 	mux.HandleFunc("POST /api/auth/signup", authHandler.SignUp)
 	mux.HandleFunc("POST /api/auth/login", authHandler.Login)
 	mux.HandleFunc("GET /api/auth/me", middleware.RequireAuth(authHandler.Me))
-
 	mux.HandleFunc("GET /api/llms", middleware.RequireAuth(llmHandler.GetLLMs))
 	mux.HandleFunc("POST /api/llm/chat", middleware.RequireAuth(llmHandler.Chat))
-
 	mux.HandleFunc("POST /api/agents", middleware.RequireAuth(agentHandler.Create))
 	mux.HandleFunc("GET /api/agents", middleware.RequireAuth(agentHandler.List))
 	mux.HandleFunc("GET /api/agents/{id}", middleware.RequireAuth(agentHandler.Get))
 	mux.HandleFunc("PUT /api/agents/{id}", middleware.RequireAuth(agentHandler.Update))
 	mux.HandleFunc("DELETE /api/agents/{id}", middleware.RequireAuth(agentHandler.Delete))
-
 	mux.HandleFunc("POST /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.Create))
 	mux.HandleFunc("GET /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.ListByAgent))
-
 	mux.HandleFunc("POST /api/threads/{id}/messages", middleware.RequireAuth(messageHandler.Send))
 	mux.HandleFunc("GET /api/threads/{id}/messages", middleware.RequireAuth(messageHandler.List))
-
 	mux.HandleFunc("GET /api/runs/{id}", middleware.RequireAuth(runHandler.GetRun))
 	mux.HandleFunc("POST /api/runs/{id}/resume", middleware.RequireAuth(runHandler.ResumeRun))
 
@@ -286,7 +278,7 @@ func main() {
 		port = "9090"
 	}
 
-	const maxRequestBodyBytes = 1 << 20 // 1 MiB — sufficient for all current endpoints
+	const maxRequestBodyBytes = 1 << 30 // 1 GiB — sufficient for all current endpoints
 
 	server := &http.Server{
 		Addr: ":" + port,

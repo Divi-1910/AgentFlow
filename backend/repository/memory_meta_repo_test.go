@@ -24,9 +24,23 @@ func repoScope() runtimectx.MemoryScope {
 	return runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-1", ThreadID: "thread-1"}
 }
 
-// ── Upsert + FindOne ──────────────────────────────────────────────────────────
+func findProjected(t *testing.T, repo *repository.MemoryMetaRepo, execScope runtimectx.MemoryScope, docScope, memoryID string) *memory.MemoryDocument {
+	t.Helper()
+	docs, err := repo.FindActive(context.Background(), execScope, docScope, nil, true, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("FindActive: %v", err)
+	}
+	for i := range docs {
+		if docs[i].ID == memoryID && docs[i].Scope == docScope {
+			return &docs[i]
+		}
+	}
+	return nil
+}
 
-func TestMemoryMetaRepoUpsertAndFindOne(t *testing.T) {
+// ── Upsert + Projection Lookup ───────────────────────────────────────────────
+
+func TestMemoryMetaRepoUpsertAndFindActiveProjection(t *testing.T) {
 	t.Parallel()
 	repo := newMetaRepo(t)
 	ctx := context.Background()
@@ -48,10 +62,7 @@ func TestMemoryMetaRepoUpsertAndFindOne(t *testing.T) {
 		t.Fatalf("Upsert: %v", err)
 	}
 
-	got, err := repo.FindOne(ctx, scope.AgentID, memory.ScopeThread, "mem-1")
-	if err != nil {
-		t.Fatalf("FindOne: %v", err)
-	}
+	got := findProjected(t, repo, scope, memory.ScopeThread, "mem-1")
 	if got == nil {
 		t.Fatal("expected record, got nil")
 	}
@@ -69,14 +80,11 @@ func TestMemoryMetaRepoUpsertAndFindOne(t *testing.T) {
 	}
 }
 
-func TestMemoryMetaRepoFindOneNotFound(t *testing.T) {
+func TestMemoryMetaRepoProjectionNotFound(t *testing.T) {
 	t.Parallel()
 	repo := newMetaRepo(t)
 
-	got, err := repo.FindOne(context.Background(), "agent-1", memory.ScopeThread, "nonexistent")
-	if err != nil {
-		t.Fatalf("FindOne: %v", err)
-	}
+	got := findProjected(t, repo, repoScope(), memory.ScopeThread, "nonexistent")
 	if got != nil {
 		t.Errorf("expected nil for nonexistent record, got %+v", got)
 	}
@@ -103,10 +111,7 @@ func TestMemoryMetaRepoUpsertUpdatesExisting(t *testing.T) {
 		t.Fatalf("second Upsert: %v", err)
 	}
 
-	got, err := repo.FindOne(ctx, scope.AgentID, memory.ScopeThread, "mem-upd")
-	if err != nil {
-		t.Fatalf("FindOne: %v", err)
-	}
+	got := findProjected(t, repo, scope, memory.ScopeThread, "mem-upd")
 	if got.Importance != 0.9 {
 		t.Errorf("Importance after update: got %f, want 0.9", got.Importance)
 	}
@@ -127,7 +132,7 @@ func TestMemoryMetaRepoUpsertPreservesLastReadAt(t *testing.T) {
 	if err := repo.Upsert(ctx, doc); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-	if err := repo.StampRead(ctx, scope.AgentID, memory.ScopeThread, "mem-lra"); err != nil {
+	if err := repo.StampRead(ctx, doc); err != nil {
 		t.Fatalf("StampRead: %v", err)
 	}
 
@@ -137,10 +142,7 @@ func TestMemoryMetaRepoUpsertPreservesLastReadAt(t *testing.T) {
 		t.Fatalf("second Upsert: %v", err)
 	}
 
-	got, err := repo.FindOne(ctx, scope.AgentID, memory.ScopeThread, "mem-lra")
-	if err != nil {
-		t.Fatalf("FindOne: %v", err)
-	}
+	got := findProjected(t, repo, scope, memory.ScopeThread, "mem-lra")
 	if got.LastReadAt == nil {
 		t.Error("expected LastReadAt to be preserved after re-upsert, got nil")
 	}
@@ -163,14 +165,11 @@ func TestMemoryMetaRepoStampRead(t *testing.T) {
 	if err := repo.Upsert(ctx, doc); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-	if err := repo.StampRead(ctx, scope.AgentID, memory.ScopeThread, "mem-stamp"); err != nil {
+	if err := repo.StampRead(ctx, doc); err != nil {
 		t.Fatalf("StampRead: %v", err)
 	}
 
-	got, err := repo.FindOne(ctx, scope.AgentID, memory.ScopeThread, "mem-stamp")
-	if err != nil {
-		t.Fatalf("FindOne: %v", err)
-	}
+	got := findProjected(t, repo, scope, memory.ScopeThread, "mem-stamp")
 	if got.LastReadAt == nil {
 		t.Fatal("expected LastReadAt to be set after StampRead")
 	}
@@ -192,9 +191,15 @@ func TestMemoryMetaRepoFindActiveThreadScope(t *testing.T) {
 		UserID: scope.UserID, AgentID: scope.AgentID, ThreadID: scope.ThreadID,
 		Type: memory.TypeFact, Importance: 0.5, CreatedAt: now,
 	}
-	d1 := base; d1.ID = "t1"; d1.Scope = memory.ScopeThread
-	d2 := base; d2.ID = "t2"; d2.Scope = memory.ScopeThread
-	d3 := base; d3.ID = "a1"; d3.Scope = memory.ScopeAgent
+	d1 := base
+	d1.ID = "t1"
+	d1.Scope = memory.ScopeThread
+	d2 := base
+	d2.ID = "t2"
+	d2.Scope = memory.ScopeThread
+	d3 := base
+	d3.ID = "a1"
+	d3.Scope = memory.ScopeAgent
 
 	for _, d := range []memory.MemoryDocument{d1, d2, d3} {
 		if err := repo.Upsert(ctx, d); err != nil {
@@ -202,7 +207,7 @@ func TestMemoryMetaRepoFindActiveThreadScope(t *testing.T) {
 		}
 	}
 
-	docs, err := repo.FindActive(ctx, scope, memory.ScopeThread, nil, now)
+	docs, err := repo.FindActive(ctx, scope, memory.ScopeThread, nil, false, now)
 	if err != nil {
 		t.Fatalf("FindActive: %v", err)
 	}
@@ -222,9 +227,15 @@ func TestMemoryMetaRepoFindActiveAgentScope(t *testing.T) {
 		UserID: scope.UserID, AgentID: scope.AgentID, ThreadID: scope.ThreadID,
 		Type: memory.TypeFact, Importance: 0.5, CreatedAt: now,
 	}
-	d1 := base; d1.ID = "t1"; d1.Scope = memory.ScopeThread
-	d2 := base; d2.ID = "t2"; d2.Scope = memory.ScopeThread
-	d3 := base; d3.ID = "a1"; d3.Scope = memory.ScopeAgent
+	d1 := base
+	d1.ID = "t1"
+	d1.Scope = memory.ScopeThread
+	d2 := base
+	d2.ID = "t2"
+	d2.Scope = memory.ScopeThread
+	d3 := base
+	d3.ID = "a1"
+	d3.Scope = memory.ScopeAgent
 
 	for _, d := range []memory.MemoryDocument{d1, d2, d3} {
 		if err := repo.Upsert(ctx, d); err != nil {
@@ -232,7 +243,7 @@ func TestMemoryMetaRepoFindActiveAgentScope(t *testing.T) {
 		}
 	}
 
-	docs, err := repo.FindActive(ctx, scope, memory.ScopeAgent, nil, now)
+	docs, err := repo.FindActive(ctx, scope, memory.ScopeAgent, nil, false, now)
 	if err != nil {
 		t.Fatalf("FindActive: %v", err)
 	}
@@ -253,8 +264,11 @@ func TestMemoryMetaRepoFindActiveFiltersExpired(t *testing.T) {
 		UserID: scope.UserID, AgentID: scope.AgentID, ThreadID: scope.ThreadID,
 		Scope: memory.ScopeThread, Type: memory.TypeFact, Importance: 0.5, CreatedAt: now,
 	}
-	active := base; active.ID = "active"
-	expired := base; expired.ID = "expired"; expired.ExpiresAt = &past
+	active := base
+	active.ID = "active"
+	expired := base
+	expired.ID = "expired"
+	expired.ExpiresAt = &past
 
 	for _, d := range []memory.MemoryDocument{active, expired} {
 		if err := repo.Upsert(ctx, d); err != nil {
@@ -262,7 +276,7 @@ func TestMemoryMetaRepoFindActiveFiltersExpired(t *testing.T) {
 		}
 	}
 
-	docs, err := repo.FindActive(ctx, scope, memory.ScopeThread, nil, now)
+	docs, err := repo.FindActive(ctx, scope, memory.ScopeThread, nil, false, now)
 	if err != nil {
 		t.Fatalf("FindActive: %v", err)
 	}
@@ -285,9 +299,15 @@ func TestMemoryMetaRepoFindActiveFiltersType(t *testing.T) {
 		UserID: scope.UserID, AgentID: scope.AgentID, ThreadID: scope.ThreadID,
 		Scope: memory.ScopeThread, Importance: 0.5, CreatedAt: now,
 	}
-	f1 := base; f1.ID = "f1"; f1.Type = memory.TypeFact
-	f2 := base; f2.ID = "f2"; f2.Type = memory.TypeFact
-	p1 := base; p1.ID = "p1"; p1.Type = memory.TypePreference
+	f1 := base
+	f1.ID = "f1"
+	f1.Type = memory.TypeFact
+	f2 := base
+	f2.ID = "f2"
+	f2.Type = memory.TypeFact
+	p1 := base
+	p1.ID = "p1"
+	p1.Type = memory.TypePreference
 
 	for _, d := range []memory.MemoryDocument{f1, f2, p1} {
 		if err := repo.Upsert(ctx, d); err != nil {
@@ -296,7 +316,7 @@ func TestMemoryMetaRepoFindActiveFiltersType(t *testing.T) {
 	}
 
 	typeFilter := memory.TypeFact
-	docs, err := repo.FindActive(ctx, scope, memory.ScopeThread, &typeFilter, now)
+	docs, err := repo.FindActive(ctx, scope, memory.ScopeThread, &typeFilter, false, now)
 	if err != nil {
 		t.Fatalf("FindActive: %v", err)
 	}
@@ -320,9 +340,14 @@ func TestMemoryMetaRepoFindExpired(t *testing.T) {
 		UserID: scope.UserID, AgentID: scope.AgentID, ThreadID: scope.ThreadID,
 		Scope: memory.ScopeThread, Type: memory.TypeFact, Importance: 0.5, CreatedAt: now,
 	}
-	active := base; active.ID = "active"; active.ExpiresAt = &future
-	expired := base; expired.ID = "expired"; expired.ExpiresAt = &past
-	noTTL := base; noTTL.ID = "nottl"
+	active := base
+	active.ID = "active"
+	active.ExpiresAt = &future
+	expired := base
+	expired.ID = "expired"
+	expired.ExpiresAt = &past
+	noTTL := base
+	noTTL.ID = "nottl"
 
 	for _, d := range []memory.MemoryDocument{active, expired, noTTL} {
 		if err := repo.Upsert(ctx, d); err != nil {
@@ -358,20 +383,17 @@ func TestMemoryMetaRepoSoftDelete(t *testing.T) {
 		t.Fatalf("Upsert: %v", err)
 	}
 
-	// SoftDelete — record must be invisible to FindOne.
+	// SoftDelete — record must be invisible to active projection queries.
 	if err := repo.SoftDelete(ctx, scope.AgentID, memory.ScopeThread, "mem-soft"); err != nil {
 		t.Fatalf("SoftDelete: %v", err)
 	}
-	got, err := repo.FindOne(ctx, scope.AgentID, memory.ScopeThread, "mem-soft")
-	if err != nil {
-		t.Fatalf("FindOne after SoftDelete: %v", err)
-	}
+	got := findProjected(t, repo, scope, memory.ScopeThread, "mem-soft")
 	if got != nil {
-		t.Error("expected nil from FindOne after SoftDelete")
+		t.Error("expected nil from FindActive after SoftDelete")
 	}
 
 	// FindActive must also exclude the soft-deleted record.
-	docs, err := repo.FindActive(ctx, scope, memory.ScopeThread, nil, now)
+	docs, err := repo.FindActive(ctx, scope, memory.ScopeThread, nil, false, now)
 	if err != nil {
 		t.Fatalf("FindActive: %v", err)
 	}
@@ -385,10 +407,7 @@ func TestMemoryMetaRepoSoftDelete(t *testing.T) {
 	if err := repo.Upsert(ctx, doc); err != nil {
 		t.Fatalf("re-Upsert: %v", err)
 	}
-	revived, err := repo.FindOne(ctx, scope.AgentID, memory.ScopeThread, "mem-soft")
-	if err != nil {
-		t.Fatalf("FindOne after re-Upsert: %v", err)
-	}
+	revived := findProjected(t, repo, scope, memory.ScopeThread, "mem-soft")
 	if revived == nil {
 		t.Error("expected record to be revived after re-Upsert, got nil")
 	}
@@ -411,15 +430,13 @@ func TestMemoryMetaRepoKeyIsolation(t *testing.T) {
 	if err := repo.Upsert(ctx, docA); err != nil {
 		t.Fatalf("Upsert agent-A: %v", err)
 	}
-	if err := repo.StampRead(ctx, "agent-a", memory.ScopeThread, "mem-1"); err != nil {
+	if err := repo.StampRead(ctx, docA); err != nil {
 		t.Fatalf("StampRead: %v", err)
 	}
 
 	// Agent-B querying the same key must get nil.
-	got, err := repo.FindOne(ctx, "agent-b", memory.ScopeThread, "mem-1")
-	if err != nil {
-		t.Fatalf("FindOne agent-B: %v", err)
-	}
+	agentB := runtimectx.MemoryScope{UserID: "user-a", AgentID: "agent-b", ThreadID: "thread-a"}
+	got := findProjected(t, repo, agentB, memory.ScopeThread, "mem-1")
 	if got != nil {
 		t.Errorf("expected nil for agent-B query, got %+v", got)
 	}

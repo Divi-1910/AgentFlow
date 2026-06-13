@@ -1,9 +1,13 @@
 package memory
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"backend/runtimectx"
 )
 
 func EnsureDir(dir string) error {
@@ -59,4 +63,61 @@ func ReadFileLimited(path string, maxBytes int) ([]byte, error) {
 		return nil, fmt.Errorf("memory: read file: %w", err)
 	}
 	return data, nil
+}
+
+func BodySHA(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return hex.EncodeToString(sum[:])
+}
+
+func BlobPath(root, userID, bodySHA string) (string, error) {
+	if err := validateSegment("user_id", userID); err != nil {
+		return "", err
+	}
+	if len(bodySHA) != 64 {
+		return "", fmt.Errorf("%w: invalid body_sha", ErrInvalidDocument)
+	}
+	for _, c := range bodySHA {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return "", fmt.Errorf("%w: invalid body_sha", ErrInvalidDocument)
+		}
+	}
+	return filepath.Join(root, userID, "blobs", bodySHA), nil
+}
+
+func WriteBlob(root, userID, body string) (string, error) {
+	sha := BodySHA(body)
+	path, err := BlobPath(root, userID, sha)
+	if err != nil {
+		return "", err
+	}
+	if _, statErr := os.Stat(path); statErr == nil {
+		return sha, nil
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return "", fmt.Errorf("memory: stat blob: %w", statErr)
+	}
+	if err := WriteFileAtomic(path, body); err != nil {
+		return "", err
+	}
+	return sha, nil
+}
+
+func ReadBlob(root, userID, bodySHA string, maxBytes int) (string, error) {
+	path, err := BlobPath(root, userID, bodySHA)
+	if err != nil {
+		return "", err
+	}
+	data, err := ReadFileLimited(path, maxBytes)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func LegacyDocumentPath(root string, doc MemoryDocument) (string, error) {
+	return ResolveReadPath(root, runtimectx.MemoryScope{
+		UserID:   doc.UserID,
+		AgentID:  doc.AgentID,
+		ThreadID: doc.ThreadID,
+	}, doc.Scope, doc.ID)
 }

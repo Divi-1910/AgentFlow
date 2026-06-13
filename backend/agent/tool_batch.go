@@ -201,8 +201,9 @@ func runToolCall(
 	toolCtx = withAsyncRunInfo(toolCtx, asyncRunInfoForToolContext(runCtx))
 
 	toolResult, err := p.tool.Execute(toolCtx, tools.ToolCall{
-		ID:   call.ID,
-		Args: call.Arguments,
+		ID:    call.ID,
+		RunID: runCtx.RunID,
+		Args:  call.Arguments,
 	})
 	toolCancel()
 	toolCancel = nil

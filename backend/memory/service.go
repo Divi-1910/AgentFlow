@@ -14,18 +14,24 @@ import (
 	"backend/runtimectx"
 )
 
-// Service is the application-layer entry point for all memory operations.
-// It coordinates between the filesystem (content) and MetaStore (metadata).
 type Service struct {
-	cfg  Config
-	meta MetaStore
+	cfg       Config
+	meta      MetaStore
+	revisions RevisionStore
 }
 
-func NewService(cfg Config, meta MetaStore) *Service {
-	return &Service{cfg: cfg.withDefaults(), meta: meta}
+func NewService(cfg Config, meta MetaStore, revisions ...RevisionStore) *Service {
+	var revStore RevisionStore
+	if len(revisions) > 0 {
+		revStore = revisions[0]
+	}
+	if revStore == nil {
+		revStore = NewInMemoryRevisionStore()
+	}
+	return &Service{cfg: cfg.withDefaults(), meta: meta, revisions: revStore}
 }
 
-func NewServiceFromEnv(meta MetaStore) (*Service, error) {
+func NewServiceFromEnv(meta MetaStore, revisions RevisionStore) (*Service, error) {
 	root := strings.TrimSpace(os.Getenv("MEMORY_ROOT"))
 	if root == "" {
 		root = filepath.Join(os.TempDir(), "agentflow-memory")
@@ -34,7 +40,7 @@ func NewServiceFromEnv(meta MetaStore) (*Service, error) {
 	svc := NewService(Config{
 		Root:   root,
 		RGPath: os.Getenv("RG_PATH"),
-	}, meta)
+	}, meta, revisions)
 	if err := svc.ValidateStartup(); err != nil {
 		return nil, err
 	}
@@ -61,15 +67,6 @@ func (s *Service) ValidateStartup() error {
 	return nil
 }
 
-// Write creates or overwrites a memory document.
-//
-// For new memories: writes freely.
-// For existing, non-expired memories: requires that the agent called
-// memory_read within the configured ReadWindowDuration; returns
-// ErrReadBeforeWrite otherwise.
-//
-// Write order: file first, MongoDB second. If the MongoDB upsert fails,
-// a best-effort rollback removes the file to keep the two stores consistent.
 func (s *Service) Write(ctx context.Context, execScope runtimectx.MemoryScope, memoryID string, args MemoryWriteArgs) (*WriteResult, error) {
 	if err := validateExecutionScope(execScope); err != nil {
 		return nil, err
@@ -80,47 +77,44 @@ func (s *Service) Write(ctx context.Context, execScope runtimectx.MemoryScope, m
 	if !validScope(args.Scope) {
 		return nil, ErrInvalidScope
 	}
+	mutationID, err := MutationID(args.RunID, args.ToolCallID)
+	if err != nil {
+		return nil, err
+	}
+	memoryID = strings.TrimSpace(memoryID)
+	if memoryID == "" {
+		memoryID, err = DerivedMemoryID(args.RunID, args.ToolCallID)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := validateSegment("memory_id", memoryID); err != nil {
 		return nil, err
 	}
-
-	body := strings.TrimSpace(args.Content)
-	if body == "" {
-		return nil, fmt.Errorf("%w: content is required", ErrInvalidDocument)
-	}
-	if len(body) > s.cfg.MaxBodyBytes {
-		return nil, fmt.Errorf("%w: content exceeds max body size", ErrInvalidDocument)
-	}
-
-	importance := clampImportance(args.Importance)
-
-	path, err := ResolveWritePath(s.cfg.Root, execScope, args.Scope, memoryID)
+	lineageKey, err := LineageKey(execScope, args.Scope, memoryID)
 	if err != nil {
 		return nil, err
 	}
-
-	// ── Read-before-write guardrail ───────────────────────────────────────────
-	// User-scope memories are keyed by (user_id, memory_id) across all agents,
-	// so the existence check has to use FindOneUserScoped — otherwise an
-	// agent that has never touched a user memory can blindly overwrite a
-	// memory written by another agent for the same user.
-	now := time.Now().UTC()
-	var existing *MemoryDocument
-	if args.Scope == ScopeUser {
-		existing, err = s.meta.FindOneUserScoped(ctx, execScope.UserID, memoryID)
-	} else {
-		existing, err = s.meta.FindOne(ctx, execScope.AgentID, args.Scope, memoryID)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("memory: meta lookup: %w", err)
-	}
-	if existing != nil && !isExpired(*existing, now) {
-		if existing.LastReadAt == nil || now.Sub(*existing.LastReadAt) > s.cfg.ReadWindowDuration {
-			return nil, ErrReadBeforeWrite
+	if replay, err := s.replayCreate(ctx, lineageKey, mutationID); replay != nil || err != nil {
+		if err != nil {
+			return nil, err
 		}
+		return writeResultFromRevision(*replay), nil
 	}
 
-	// ── Build document ────────────────────────────────────────────────────────
+	body := strings.TrimSpace(args.Content)
+	if err := validateBody(body, s.cfg.MaxBodyBytes); err != nil {
+		return nil, err
+	}
+
+	if latest, err := s.revisions.Latest(ctx, lineageKey); err != nil {
+		return nil, fmt.Errorf("memory: latest revision: %w", err)
+	} else if latest != nil {
+		s.bestEffortProject(ctx, lineageKey)
+		return nil, createCollisionError(*latest)
+	}
+
+	now := time.Now().UTC()
 	var expiresAt *time.Time
 	if args.TTLDays != nil {
 		if *args.TTLDays <= 0 {
@@ -130,60 +124,37 @@ func (s *Service) Write(ctx context.Context, execScope runtimectx.MemoryScope, m
 		expiresAt = &expires
 	}
 
-	// Preserve the original creation timestamp for active overwrites.
-	createdAt := now
-	if existing != nil && !isExpired(*existing, now) {
-		createdAt = existing.CreatedAt
+	bodySHA, err := WriteBlob(s.cfg.Root, execScope.UserID, body)
+	if err != nil {
+		return nil, err
 	}
-
-	doc := MemoryDocument{
+	rev := MemoryRevision{
+		LineageKey: lineageKey,
+		Revision:   1,
+		MutationID: mutationID,
+		RunID:      args.RunID,
+		ToolCallID: args.ToolCallID,
+		Operation:  OperationCreate,
 		UserID:     execScope.UserID,
 		AgentID:    execScope.AgentID,
 		ThreadID:   execScope.ThreadID,
-		ID:         memoryID,
-		Type:       args.Type,
+		MemoryID:   memoryID,
 		Scope:      args.Scope,
-		Importance: importance,
-		CreatedAt:  createdAt,
+		Type:       args.Type,
+		Importance: clampImportance(args.Importance),
+		BodySHA:    bodySHA,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 		ExpiresAt:  expiresAt,
-		Summary:    extractSummary(body),
-		Body:       body,
 	}
-
-	// ── Persist: file first, MongoDB second ───────────────────────────────────
-	if err := WriteFileAtomic(path, body); err != nil {
+	appended, _, err := s.revisions.Append(ctx, rev)
+	if err != nil {
 		return nil, err
 	}
-
-	if err := s.meta.Upsert(ctx, doc); err != nil {
-		// Rollback: remove the file we just wrote so the stores stay consistent.
-		if removeErr := os.Remove(path); removeErr != nil {
-			slog.Warn("memory: rollback failed — orphaned file may remain",
-				"path", path, "remove_error", removeErr)
-		}
-		return nil, fmt.Errorf("memory: meta upsert: %w", err)
-	}
-
-	var expiresRaw *string
-	if expiresAt != nil {
-		v := expiresAt.UTC().Format(time.RFC3339)
-		expiresRaw = &v
-	}
-	return &WriteResult{
-		MemoryID:  memoryID,
-		Scope:     args.Scope,
-		CreatedAt: createdAt.Format(time.RFC3339),
-		ExpiresAt: expiresRaw,
-	}, nil
+	s.bestEffortProject(ctx, lineageKey)
+	return writeResultFromRevision(*appended), nil
 }
 
-// Read fetches a memory document's metadata from MongoDB and its content from
-// disk. On success it stamps last_read_at in MongoDB (best-effort: a stamp
-// failure is logged but never surfaces to the caller).
-//
-// For ScopeUser the lookup is user-keyed, so a user-scoped memory written by
-// any agent for the same user is readable. For ScopeAgent / ScopeThread the
-// lookup is agent-keyed as before.
 func (s *Service) Read(ctx context.Context, execScope runtimectx.MemoryScope, args MemoryReadArgs) (*ReadResult, error) {
 	if err := validateExecutionScope(execScope); err != nil {
 		return nil, err
@@ -194,76 +165,63 @@ func (s *Service) Read(ctx context.Context, execScope runtimectx.MemoryScope, ar
 	if err := validateSegment("memory_id", args.MemoryID); err != nil {
 		return nil, err
 	}
+	lineageKey, err := LineageKey(execScope, args.Scope, args.MemoryID)
+	if err != nil {
+		return nil, err
+	}
+	s.bestEffortProject(ctx, lineageKey)
 
-	var doc *MemoryDocument
-	var err error
-	if args.Scope == ScopeUser {
-		doc, err = s.meta.FindOneUserScoped(ctx, execScope.UserID, args.MemoryID)
+	var rev *MemoryRevision
+	if args.Revision != nil {
+		if *args.Revision <= 0 {
+			return nil, fmt.Errorf("%w: revision must be positive", ErrInvalidDocument)
+		}
+		rev, err = s.revisions.FindRevision(ctx, lineageKey, *args.Revision)
 	} else {
-		doc, err = s.meta.FindOne(ctx, execScope.AgentID, args.Scope, args.MemoryID)
+		rev, err = s.revisions.Latest(ctx, lineageKey)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("memory: meta lookup: %w", err)
+		return nil, fmt.Errorf("memory: read revision: %w", err)
 	}
-	if doc == nil {
+	if rev == nil {
 		return nil, ErrMemoryNotFound
 	}
-	if isExpired(*doc, time.Now().UTC()) {
-		return nil, ErrExpiredMemory
+
+	if args.Revision == nil {
+		now := time.Now().UTC()
+		if rev.RetiredAt != nil {
+			return nil, ErrRetiredMemory
+		}
+		if isExpiredRevision(*rev, now) {
+			return nil, ErrExpiredMemory
+		}
 	}
 
-	// For ScopeUser, the on-disk path depends only on user_id, so we can
-	// reuse the resolver with the execScope (which has the calling user's
-	// id). For other scopes the execScope already names the right agent /
-	// thread that resolves the path.
-	path, err := ResolveReadPath(s.cfg.Root, execScope, args.Scope, args.MemoryID)
+	body, err := ReadBlob(s.cfg.Root, rev.UserID, rev.BodySHA, s.cfg.MaxFileBytes)
 	if err != nil {
 		return nil, err
 	}
-	data, err := ReadFileLimited(path, s.cfg.MaxFileBytes)
-	if err != nil {
-		return nil, err
-	}
-	doc.Body = strings.TrimSpace(string(data))
+	doc := documentFromRevision(*rev, strings.TrimSpace(body))
 
-	// Stamp last_read_at — enables subsequent writes within the window.
-	// For ScopeUser we stamp the record's actual writer-agent so the stamp
-	// targets the right Mongo document.
-	stampAgent := execScope.AgentID
-	if args.Scope == ScopeUser {
-		stampAgent = doc.AgentID
+	if args.Revision == nil && s.meta != nil {
+		if stampErr := s.meta.StampRead(ctx, doc); stampErr != nil {
+			slog.Warn("memory: failed to stamp last_read_at", "error", stampErr,
+				"lineage_key", doc.LineageKey, "memory_id", doc.ID)
+		}
 	}
-	if stampErr := s.meta.StampRead(ctx, stampAgent, args.Scope, args.MemoryID); stampErr != nil {
-		slog.Warn("memory: failed to stamp last_read_at", "error", stampErr,
-			"agent_id", stampAgent, "scope", args.Scope, "memory_id", args.MemoryID)
-	}
-
-	return toReadResult(*doc), nil
+	return toReadResult(doc), nil
 }
 
-// ReadByMeta reads the on-disk body for an already-discovered metadata
-// record. It bypasses the metadata FindOne lookup that Read performs (which
-// scopes by execScope.AgentID) and does NOT stamp last_read_at — it is
-// intended for context-injection paths where the caller already has the
-// document via FindActive and wants the body without affecting read-window
-// semantics.
-//
-// In particular, this is the path the ContextBuilder uses to materialise
-// user-scoped memories: those records may have been written by any agent for
-// the same user, so the current run's AgentID must not gate access to them.
 func (s *Service) ReadByMeta(_ context.Context, doc MemoryDocument) (string, error) {
-	if err := validateSegment("memory_id", doc.ID); err != nil {
-		return "", err
+	if doc.BodySHA != "" {
+		body, err := ReadBlob(s.cfg.Root, doc.UserID, doc.BodySHA, s.cfg.MaxFileBytes)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(body), nil
 	}
-	if !validScope(doc.Scope) {
-		return "", ErrInvalidScope
-	}
-	docScope := runtimectx.MemoryScope{
-		UserID:   doc.UserID,
-		AgentID:  doc.AgentID,
-		ThreadID: doc.ThreadID,
-	}
-	path, err := ResolveReadPath(s.cfg.Root, docScope, doc.Scope, doc.ID)
+
+	path, err := LegacyDocumentPath(s.cfg.Root, doc)
 	if err != nil {
 		return "", err
 	}
@@ -274,9 +232,6 @@ func (s *Service) ReadByMeta(_ context.Context, doc MemoryDocument) (string, err
 	return strings.TrimSpace(string(data)), nil
 }
 
-// Search finds memory documents whose body content matches the ripgrep pattern.
-// Candidate documents are fetched from MongoDB (scope-filtered, expiry-filtered);
-// only the files of those candidates are given to ripgrep.
 func (s *Service) Search(ctx context.Context, execScope runtimectx.MemoryScope, args MemorySearchArgs) (*SearchResponse, error) {
 	if err := validateExecutionScope(execScope); err != nil {
 		return nil, err
@@ -303,7 +258,7 @@ func (s *Service) Search(ctx context.Context, execScope runtimectx.MemoryScope, 
 		limit = MaxSearchLimit
 	}
 
-	docs, err := s.meta.FindActive(ctx, execScope, args.Scope, args.Type, time.Now().UTC())
+	docs, err := s.meta.FindActive(ctx, execScope, args.Scope, args.Type, args.IncludeRetired, time.Now().UTC())
 	if err != nil {
 		return nil, fmt.Errorf("memory: find active: %w", err)
 	}
@@ -311,20 +266,24 @@ func (s *Service) Search(ctx context.Context, execScope runtimectx.MemoryScope, 
 		return &SearchResponse{Results: []SearchResult{}}, nil
 	}
 
-	// Derive filesystem paths and build a path → doc index.
 	files := make([]string, 0, len(docs))
-	byPath := make(map[string]MemoryDocument, len(docs))
+	seenFiles := make(map[string]bool, len(docs))
+	byPath := make(map[string][]MemoryDocument, len(docs))
 	for _, doc := range docs {
-		p, pathErr := ResolveWritePath(s.cfg.Root, runtimectx.MemoryScope{
-			UserID:   doc.UserID,
-			AgentID:  doc.AgentID,
-			ThreadID: doc.ThreadID,
-		}, doc.Scope, doc.ID)
-		if pathErr != nil {
+		var p string
+		if doc.BodySHA != "" {
+			p, err = BlobPath(s.cfg.Root, doc.UserID, doc.BodySHA)
+		} else {
+			p, err = LegacyDocumentPath(s.cfg.Root, doc)
+		}
+		if err != nil {
 			continue
 		}
-		files = append(files, p)
-		byPath[p] = doc
+		if !seenFiles[p] {
+			files = append(files, p)
+			seenFiles[p] = true
+		}
+		byPath[p] = append(byPath[p], doc)
 	}
 
 	searchCtx, cancel := context.WithTimeout(ctx, s.cfg.SearchTimeout)
@@ -340,30 +299,35 @@ func (s *Service) Search(ctx context.Context, execScope runtimectx.MemoryScope, 
 
 	results := make([]SearchResult, 0, len(hits))
 	for p, lineNumber := range hits {
-		doc, ok := byPath[p]
-		if !ok {
+		docsForPath := byPath[p]
+		if len(docsForPath) == 0 {
 			continue
 		}
 		snippet := ""
 		if data, readErr := ReadFileLimited(p, s.cfg.MaxFileBytes); readErr == nil {
 			snippet = snippetAroundLine(strings.TrimSpace(string(data)), lineNumber)
 		}
-		results = append(results, SearchResult{
-			MemoryID:   doc.ID,
-			Snippet:    snippet,
-			Type:       doc.Type,
-			Scope:      doc.Scope,
-			Importance: doc.Importance,
-			CreatedAt:  doc.CreatedAt.UTC().Format(time.RFC3339),
-		})
+		for _, doc := range docsForPath {
+			results = append(results, SearchResult{
+				MemoryID:   doc.ID,
+				Snippet:    snippet,
+				Type:       doc.Type,
+				Scope:      doc.Scope,
+				Importance: doc.Importance,
+				Revision:   doc.Revision,
+				Retired:    doc.RetiredAt != nil,
+				CreatedAt:  doc.CreatedAt.UTC().Format(time.RFC3339),
+				UpdatedAt:  doc.UpdatedAt.UTC().Format(time.RFC3339),
+			})
+		}
 	}
 
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Importance != results[j].Importance {
 			return results[i].Importance > results[j].Importance
 		}
-		if results[i].CreatedAt != results[j].CreatedAt {
-			return results[i].CreatedAt > results[j].CreatedAt
+		if results[i].UpdatedAt != results[j].UpdatedAt {
+			return results[i].UpdatedAt > results[j].UpdatedAt
 		}
 		return results[i].MemoryID < results[j].MemoryID
 	})
@@ -374,10 +338,398 @@ func (s *Service) Search(ctx context.Context, execScope runtimectx.MemoryScope, 
 	return &SearchResponse{Results: results}, nil
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+func (s *Service) Patch(ctx context.Context, execScope runtimectx.MemoryScope, args MemoryPatchArgs) (*MutationResult, error) {
+	return s.mutateActive(ctx, execScope, args.MemoryID, args.Scope, args.ExpectedRevision, args.Reason, args.RunID, args.ToolCallID, OperationPatch, func(latest MemoryRevision, currentBody string, now time.Time) (MemoryRevision, error) {
+		body, err := applyPatchEdits(currentBody, args.Edits, s.cfg.MaxBodyBytes)
+		if err != nil {
+			return MemoryRevision{}, err
+		}
+		bodySHA, err := WriteBlob(s.cfg.Root, latest.UserID, body)
+		if err != nil {
+			return MemoryRevision{}, err
+		}
+		rev := nextRevisionFrom(latest, now, OperationPatch, args.Reason)
+		rev.BodySHA = bodySHA
+		return rev, nil
+	})
+}
+
+func (s *Service) Update(ctx context.Context, execScope runtimectx.MemoryScope, args MemoryUpdateArgs) (*MutationResult, error) {
+	return s.mutateActive(ctx, execScope, args.MemoryID, args.Scope, args.ExpectedRevision, args.Reason, args.RunID, args.ToolCallID, OperationUpdate, func(latest MemoryRevision, _ string, now time.Time) (MemoryRevision, error) {
+		body := strings.TrimSpace(args.Content)
+		if err := validateBody(body, s.cfg.MaxBodyBytes); err != nil {
+			return MemoryRevision{}, err
+		}
+		bodySHA, err := WriteBlob(s.cfg.Root, latest.UserID, body)
+		if err != nil {
+			return MemoryRevision{}, err
+		}
+		rev := nextRevisionFrom(latest, now, OperationUpdate, args.Reason)
+		rev.BodySHA = bodySHA
+		return rev, nil
+	})
+}
+
+func (s *Service) Retire(ctx context.Context, execScope runtimectx.MemoryScope, args MemoryRetireArgs) (*MutationResult, error) {
+	return s.mutateActive(ctx, execScope, args.MemoryID, args.Scope, args.ExpectedRevision, args.Reason, args.RunID, args.ToolCallID, OperationRetire, func(latest MemoryRevision, _ string, now time.Time) (MemoryRevision, error) {
+		rev := nextRevisionFrom(latest, now, OperationRetire, args.Reason)
+		rev.BodySHA = latest.BodySHA
+		rev.RetiredAt = &now
+		return rev, nil
+	})
+}
+
+func (s *Service) Restore(ctx context.Context, execScope runtimectx.MemoryScope, args MemoryRestoreArgs) (*MutationResult, error) {
+	if err := validateMutationInput(execScope, args.MemoryID, args.Scope, args.ExpectedRevision, args.Reason); err != nil {
+		return nil, err
+	}
+	mutationID, err := MutationID(args.RunID, args.ToolCallID)
+	if err != nil {
+		return nil, err
+	}
+	lineageKey, err := LineageKey(execScope, args.Scope, args.MemoryID)
+	if err != nil {
+		return nil, err
+	}
+	if replay, err := s.replayMutation(ctx, lineageKey, mutationID); replay != nil || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return mutationResultFromRevision(*replay), nil
+	}
+
+	latest, err := s.revisions.Latest(ctx, lineageKey)
+	if err != nil {
+		return nil, fmt.Errorf("memory: latest revision: %w", err)
+	}
+	if latest == nil {
+		return nil, ErrMemoryNotFound
+	}
+	s.bestEffortProject(ctx, lineageKey)
+	if latest.Revision != *args.ExpectedRevision {
+		return nil, ErrRevisionConflict
+	}
+
+	var from *MemoryRevision
+	if args.FromRevision != nil {
+		if *args.FromRevision <= 0 {
+			return nil, fmt.Errorf("%w: from_revision must be positive", ErrInvalidDocument)
+		}
+		from, err = s.revisions.FindRevision(ctx, lineageKey, *args.FromRevision)
+		if err != nil {
+			return nil, fmt.Errorf("memory: restore source: %w", err)
+		}
+	} else {
+		if latest.RetiredAt == nil {
+			return nil, fmt.Errorf("%w: from_revision is required when latest revision is active", ErrInvalidDocument)
+		}
+		from, err = s.latestNonRetired(ctx, lineageKey)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if from == nil {
+		return nil, ErrMemoryNotFound
+	}
+	if isExpiredRevision(*from, time.Now().UTC()) {
+		return nil, ErrExpiredMemory
+	}
+
+	now := time.Now().UTC()
+	rev := nextRevisionFrom(*latest, now, OperationRestore, args.Reason)
+	rev.RunID = args.RunID
+	rev.ToolCallID = args.ToolCallID
+	rev.MutationID = mutationID
+	rev.RestoredFrom = &from.Revision
+	rev.Type = from.Type
+	rev.Importance = from.Importance
+	rev.ExpiresAt = from.ExpiresAt
+	rev.RetiredAt = nil
+	rev.BodySHA = from.BodySHA
+	appended, _, err := s.revisions.Append(ctx, rev)
+	if err != nil {
+		return nil, err
+	}
+	s.bestEffortProject(ctx, lineageKey)
+	return mutationResultFromRevision(*appended), nil
+}
+
+func (s *Service) History(ctx context.Context, execScope runtimectx.MemoryScope, args MemoryHistoryArgs) (*HistoryResponse, error) {
+	if err := validateExecutionScope(execScope); err != nil {
+		return nil, err
+	}
+	if !validScope(args.Scope) {
+		return nil, ErrInvalidScope
+	}
+	if err := validateSegment("memory_id", args.MemoryID); err != nil {
+		return nil, err
+	}
+	lineageKey, err := LineageKey(execScope, args.Scope, args.MemoryID)
+	if err != nil {
+		return nil, err
+	}
+	s.bestEffortProject(ctx, lineageKey)
+	revs, err := s.revisions.List(ctx, lineageKey)
+	if err != nil {
+		return nil, fmt.Errorf("memory: history: %w", err)
+	}
+	if len(revs) == 0 {
+		return nil, ErrMemoryNotFound
+	}
+	sort.Slice(revs, func(i, j int) bool { return revs[i].Revision < revs[j].Revision })
+	out := make([]HistoryRevision, 0, len(revs))
+	for _, rev := range revs {
+		out = append(out, historyRevisionFromRevision(rev))
+	}
+	return &HistoryResponse{MemoryID: args.MemoryID, Scope: args.Scope, Revisions: out}, nil
+}
+
+func (s *Service) mutateActive(
+	ctx context.Context,
+	execScope runtimectx.MemoryScope,
+	memoryID string,
+	scope string,
+	expectedRevision *int,
+	reason string,
+	runID string,
+	toolCallID string,
+	op string,
+	build func(latest MemoryRevision, currentBody string, now time.Time) (MemoryRevision, error),
+) (*MutationResult, error) {
+	if err := validateMutationInput(execScope, memoryID, scope, expectedRevision, reason); err != nil {
+		return nil, err
+	}
+	mutationID, err := MutationID(runID, toolCallID)
+	if err != nil {
+		return nil, err
+	}
+	lineageKey, err := LineageKey(execScope, scope, memoryID)
+	if err != nil {
+		return nil, err
+	}
+	if replay, err := s.replayMutation(ctx, lineageKey, mutationID); replay != nil || err != nil {
+		if err != nil {
+			return nil, err
+		}
+		return mutationResultFromRevision(*replay), nil
+	}
+
+	latest, err := s.revisions.Latest(ctx, lineageKey)
+	if err != nil {
+		return nil, fmt.Errorf("memory: latest revision: %w", err)
+	}
+	if latest == nil {
+		return nil, ErrMemoryNotFound
+	}
+	s.bestEffortProject(ctx, lineageKey)
+	if latest.Revision != *expectedRevision {
+		return nil, ErrRevisionConflict
+	}
+	if latest.RetiredAt != nil {
+		return nil, ErrRetiredMemory
+	}
+	if isExpiredRevision(*latest, time.Now().UTC()) {
+		return nil, ErrExpiredMemory
+	}
+
+	currentBody := ""
+	if op == OperationPatch {
+		currentBody, err = ReadBlob(s.cfg.Root, latest.UserID, latest.BodySHA, s.cfg.MaxFileBytes)
+		if err != nil {
+			return nil, err
+		}
+	}
+	now := time.Now().UTC()
+	next, err := build(*latest, currentBody, now)
+	if err != nil {
+		return nil, err
+	}
+	next.MutationID = mutationID
+	next.RunID = runID
+	next.ToolCallID = toolCallID
+	appended, _, err := s.revisions.Append(ctx, next)
+	if err != nil {
+		return nil, err
+	}
+	s.bestEffortProject(ctx, lineageKey)
+	return mutationResultFromRevision(*appended), nil
+}
+
+func (s *Service) replayCreate(ctx context.Context, lineageKey, mutationID string) (*MemoryRevision, error) {
+	return s.replayMutation(ctx, lineageKey, mutationID)
+}
+
+func (s *Service) replayMutation(ctx context.Context, lineageKey, mutationID string) (*MemoryRevision, error) {
+	existing, err := s.revisions.FindByMutation(ctx, mutationID)
+	if err != nil {
+		return nil, fmt.Errorf("memory: mutation lookup: %w", err)
+	}
+	if existing == nil {
+		return nil, nil
+	}
+	if existing.LineageKey != lineageKey {
+		return nil, ErrRevisionConflict
+	}
+	s.bestEffortProject(ctx, lineageKey)
+	return existing, nil
+}
+
+func (s *Service) bestEffortProject(ctx context.Context, lineageKey string) {
+	if s.meta == nil {
+		return
+	}
+	latest, err := s.revisions.Latest(ctx, lineageKey)
+	if err != nil || latest == nil {
+		if err != nil {
+			slog.Warn("memory: project latest lookup failed", "lineage_key", lineageKey, "error", err)
+		}
+		return
+	}
+	body, readErr := ReadBlob(s.cfg.Root, latest.UserID, latest.BodySHA, s.cfg.MaxFileBytes)
+	if readErr != nil {
+		slog.Warn("memory: project latest blob read failed", "lineage_key", lineageKey, "revision", latest.Revision, "error", readErr)
+	}
+	if err := s.meta.Upsert(ctx, documentFromRevision(*latest, strings.TrimSpace(body))); err != nil {
+		slog.Warn("memory: project latest failed", "lineage_key", lineageKey, "revision", latest.Revision, "error", err)
+	}
+}
+
+func (s *Service) latestNonRetired(ctx context.Context, lineageKey string) (*MemoryRevision, error) {
+	revs, err := s.revisions.List(ctx, lineageKey)
+	if err != nil {
+		return nil, fmt.Errorf("memory: restore source history: %w", err)
+	}
+	sort.Slice(revs, func(i, j int) bool { return revs[i].Revision < revs[j].Revision })
+	for i := len(revs) - 1; i >= 0; i-- {
+		if revs[i].RetiredAt == nil {
+			cp := revs[i]
+			return &cp, nil
+		}
+	}
+	return nil, ErrMemoryNotFound
+}
+
+func validateMutationInput(execScope runtimectx.MemoryScope, memoryID, scope string, expectedRevision *int, reason string) error {
+	if err := validateExecutionScope(execScope); err != nil {
+		return err
+	}
+	if !validScope(scope) {
+		return ErrInvalidScope
+	}
+	if err := validateSegment("memory_id", memoryID); err != nil {
+		return err
+	}
+	if expectedRevision == nil {
+		return ErrExpectedRevisionRequired
+	}
+	if *expectedRevision <= 0 {
+		return fmt.Errorf("%w: expected_revision must be positive", ErrInvalidDocument)
+	}
+	if strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("%w: reason is required", ErrInvalidDocument)
+	}
+	return nil
+}
+
+func validateBody(body string, maxBytes int) error {
+	if strings.TrimSpace(body) == "" {
+		return fmt.Errorf("%w: content is required", ErrInvalidDocument)
+	}
+	if len(body) > maxBytes {
+		return fmt.Errorf("%w: content exceeds max body size", ErrInvalidDocument)
+	}
+	return nil
+}
+
+type patchSpan struct {
+	start int
+	end   int
+	edit  MemoryPatchEdit
+}
+
+func applyPatchEdits(body string, edits []MemoryPatchEdit, maxBytes int) (string, error) {
+	if len(edits) == 0 {
+		return "", fmt.Errorf("%w: edits are required", ErrInvalidDocument)
+	}
+	spans := make([]patchSpan, 0, len(edits))
+	for _, edit := range edits {
+		if edit.OldText == "" {
+			return "", fmt.Errorf("%w: old_text is required", ErrInvalidDocument)
+		}
+		matches := matchOffsets(body, edit.OldText)
+		if len(matches) == 0 {
+			return "", fmt.Errorf("%w: old_text did not match", ErrInvalidDocument)
+		}
+		if len(matches) > 1 {
+			return "", fmt.Errorf("%w: old_text matched more than once", ErrInvalidDocument)
+		}
+		first := matches[0]
+		spans = append(spans, patchSpan{start: first, end: first + len(edit.OldText), edit: edit})
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	for i := 1; i < len(spans); i++ {
+		if spans[i].start < spans[i-1].end {
+			return "", fmt.Errorf("%w: patch spans overlap", ErrInvalidDocument)
+		}
+	}
+	out := body
+	for i := len(spans) - 1; i >= 0; i-- {
+		span := spans[i]
+		out = out[:span.start] + span.edit.NewText + out[span.end:]
+	}
+	if err := validateBody(out, maxBytes); err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+func matchOffsets(body, needle string) []int {
+	offsets := []int{}
+	for start := 0; start <= len(body)-len(needle); {
+		idx := strings.Index(body[start:], needle)
+		if idx < 0 {
+			break
+		}
+		pos := start + idx
+		offsets = append(offsets, pos)
+		start = pos + 1
+	}
+	return offsets
+}
+
+func createCollisionError(latest MemoryRevision) error {
+	if latest.RetiredAt != nil {
+		return fmt.Errorf("%w: retired memory exists; use memory_restore or choose a new memory_id", ErrMemoryExists)
+	}
+	return fmt.Errorf("%w: active memory exists; use memory_patch or memory_update", ErrMemoryExists)
+}
+
+func nextRevisionFrom(latest MemoryRevision, now time.Time, op, reason string) MemoryRevision {
+	return MemoryRevision{
+		LineageKey: latest.LineageKey,
+		Revision:   latest.Revision + 1,
+		Operation:  op,
+		Reason:     strings.TrimSpace(reason),
+		UserID:     latest.UserID,
+		AgentID:    latest.AgentID,
+		ThreadID:   latest.ThreadID,
+		MemoryID:   latest.MemoryID,
+		Scope:      latest.Scope,
+		Type:       latest.Type,
+		Importance: latest.Importance,
+		BodySHA:    latest.BodySHA,
+		CreatedAt:  latest.CreatedAt,
+		UpdatedAt:  now,
+		ExpiresAt:  latest.ExpiresAt,
+	}
+}
 
 func isExpired(doc MemoryDocument, now time.Time) bool {
 	return doc.ExpiresAt != nil && !doc.ExpiresAt.After(now)
+}
+
+func isExpiredRevision(rev MemoryRevision, now time.Time) bool {
+	return rev.ExpiresAt != nil && !rev.ExpiresAt.After(now)
 }
 
 func clampImportance(v float64) float64 {
@@ -390,11 +742,9 @@ func clampImportance(v float64) float64 {
 	return v
 }
 
-// snippetAroundLine returns a short excerpt of body centred on absoluteLine.
-// Lines are 1-indexed; files contain no frontmatter so no offset is needed.
 func snippetAroundLine(body string, absoluteLine int) string {
 	lines := strings.Split(body, "\n")
-	relativeLine := absoluteLine - 1 // convert to 0-indexed
+	relativeLine := absoluteLine - 1
 	if relativeLine < 0 || relativeLine >= len(lines) {
 		if len(body) <= 160 {
 			return body
@@ -421,10 +771,6 @@ func snippetAroundLine(body string, absoluteLine int) string {
 	return snippet
 }
 
-// extractSummary returns a short preview of body for the memory index:
-// the first non-empty line, with leading markdown heading markers stripped,
-// capped at SummaryMaxChars runes (with an ellipsis if truncated). Operates
-// on []rune so multi-byte UTF-8 sequences are never split mid-rune.
 func extractSummary(body string) string {
 	for _, line := range strings.Split(body, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -438,11 +784,32 @@ func extractSummary(body string) string {
 		}
 		r := []rune(trimmed)
 		if len(r) > SummaryMaxChars {
-			return string(r[:SummaryMaxChars-1]) + "…"
+			return string(r[:SummaryMaxChars-1]) + "..."
 		}
 		return trimmed
 	}
 	return ""
+}
+
+func documentFromRevision(rev MemoryRevision, body string) MemoryDocument {
+	return MemoryDocument{
+		LineageKey: rev.LineageKey,
+		UserID:     rev.UserID,
+		AgentID:    rev.AgentID,
+		ThreadID:   rev.ThreadID,
+		ID:         rev.MemoryID,
+		Type:       rev.Type,
+		Scope:      rev.Scope,
+		Importance: rev.Importance,
+		Revision:   rev.Revision,
+		BodySHA:    rev.BodySHA,
+		CreatedAt:  rev.CreatedAt,
+		UpdatedAt:  rev.UpdatedAt,
+		ExpiresAt:  rev.ExpiresAt,
+		RetiredAt:  rev.RetiredAt,
+		Summary:    extractSummary(body),
+		Body:       body,
+	}
 }
 
 func toReadResult(doc MemoryDocument) *ReadResult {
@@ -459,7 +826,69 @@ func toReadResult(doc MemoryDocument) *ReadResult {
 		AgentID:    doc.AgentID,
 		ThreadID:   doc.ThreadID,
 		Importance: doc.Importance,
+		Revision:   doc.Revision,
+		Retired:    doc.RetiredAt != nil,
 		CreatedAt:  doc.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:  doc.UpdatedAt.UTC().Format(time.RFC3339),
 		ExpiresAt:  expiresAt,
+	}
+}
+
+func writeResultFromRevision(rev MemoryRevision) *WriteResult {
+	var expiresAt *string
+	if rev.ExpiresAt != nil {
+		v := rev.ExpiresAt.UTC().Format(time.RFC3339)
+		expiresAt = &v
+	}
+	return &WriteResult{
+		MemoryID:  rev.MemoryID,
+		Scope:     rev.Scope,
+		Revision:  rev.Revision,
+		CreatedAt: rev.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt: rev.UpdatedAt.UTC().Format(time.RFC3339),
+		ExpiresAt: expiresAt,
+	}
+}
+
+func mutationResultFromRevision(rev MemoryRevision) *MutationResult {
+	var expiresAt *string
+	if rev.ExpiresAt != nil {
+		v := rev.ExpiresAt.UTC().Format(time.RFC3339)
+		expiresAt = &v
+	}
+	return &MutationResult{
+		MemoryID:  rev.MemoryID,
+		Scope:     rev.Scope,
+		Revision:  rev.Revision,
+		Retired:   rev.RetiredAt != nil,
+		UpdatedAt: rev.UpdatedAt.UTC().Format(time.RFC3339),
+		ExpiresAt: expiresAt,
+	}
+}
+
+func historyRevisionFromRevision(rev MemoryRevision) HistoryRevision {
+	var expiresAt *string
+	if rev.ExpiresAt != nil {
+		v := rev.ExpiresAt.UTC().Format(time.RFC3339)
+		expiresAt = &v
+	}
+	var retiredAt *string
+	if rev.RetiredAt != nil {
+		v := rev.RetiredAt.UTC().Format(time.RFC3339)
+		retiredAt = &v
+	}
+	return HistoryRevision{
+		Revision:     rev.Revision,
+		Operation:    rev.Operation,
+		Reason:       rev.Reason,
+		RestoredFrom: rev.RestoredFrom,
+		BodySHA:      rev.BodySHA,
+		Type:         rev.Type,
+		Importance:   rev.Importance,
+		Retired:      rev.RetiredAt != nil,
+		CreatedAt:    rev.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:    rev.UpdatedAt.UTC().Format(time.RFC3339),
+		ExpiresAt:    expiresAt,
+		RetiredAt:    retiredAt,
 	}
 }

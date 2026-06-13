@@ -31,11 +31,12 @@ func (t *MemorySearchTool) Definition() llm.ToolDefinition {
 				"pattern": {"type": "string", "description": "Case-insensitive literal text to search for"},
 				"scope": {"type": "string", "enum": ["thread", "agent", "user"]},
 				"type": {"type": "string", "enum": ["fact", "preference", "procedure", "episode"]},
-				"limit": {"type": "integer", "minimum": 1, "maximum": 20}
+				"limit": {"type": "integer", "minimum": 1, "maximum": 20},
+				"include_retired": {"type": "boolean", "description": "When true, include retired latest cache rows that have not expired."}
 			},
 			"required": ["pattern", "scope"]
 		}`),
-		Instructions: "Use memory_search to find older memories that are not in <memories><index>. Prefer short literal patterns (a name, a keyword) over phrases. The result returns snippets only — follow up with memory_read(id) to get the full content of a hit. Pick the broadest scope you need: user covers everything visible, agent skips user-level, thread is just this conversation.",
+		Instructions: "Use memory_search to find active memories that are not in <memories><index>. Prefer short literal patterns. Results include snippets, revision, retired, and updated_at; use include_retired only when considering memory_restore.",
 	}
 }
 

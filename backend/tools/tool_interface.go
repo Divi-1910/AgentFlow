@@ -16,8 +16,9 @@ var (
 )
 
 type ToolCall struct {
-	ID   string
-	Args json.RawMessage
+	ID    string
+	RunID string
+	Args  json.RawMessage
 }
 
 type Tool interface {

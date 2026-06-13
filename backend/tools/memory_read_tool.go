@@ -29,11 +29,12 @@ func (t *MemoryReadTool) Definition() llm.ToolDefinition {
 			"type": "object",
 			"properties": {
 				"memory_id": {"type": "string"},
-				"scope": {"type": "string", "enum": ["thread", "agent", "user"]}
+				"scope": {"type": "string", "enum": ["thread", "agent", "user"]},
+				"revision": {"type": "integer", "minimum": 1, "description": "Optional historical revision to read"}
 			},
 			"required": ["memory_id", "scope"]
 		}`),
-		Instructions: "Use memory_read to fetch the full body of a memory you have already seen in <memories><index>. Always call memory_read before any memory_write that overwrites an existing memory ID — writes without a recent read are rejected. Do not call memory_read for user-scoped memories that already appear in <user_preferences> in full.",
+		Instructions: "Use memory_read to fetch the full body of an active memory, or pass revision to inspect a historical body from memory_history. Historical reads can return retired or expired revisions.",
 	}
 }
 

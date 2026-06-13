@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,102 +14,40 @@ import (
 	"backend/runtimectx"
 )
 
-// ── fakeMetaStore ─────────────────────────────────────────────────────────────
-
-// fakeMetaStore is an in-memory implementation of memory.MetaStore for unit
-// tests. It is safe for concurrent use.
 type fakeMetaStore struct {
-	mu          sync.Mutex
-	records     map[string]*memory.MemoryDocument // key: agentID|scope|memoryID
-	softDeleted map[string]bool                   // tracks soft-deleted keys
-	stampErr    error                             // if non-nil, StampRead returns this error
+	mu       sync.Mutex
+	records  map[string]*memory.MemoryDocument
+	stampErr error
 }
 
 func newFakeMeta() *fakeMetaStore {
-	return &fakeMetaStore{
-		records:     make(map[string]*memory.MemoryDocument),
-		softDeleted: make(map[string]bool),
-	}
-}
-
-func (f *fakeMetaStore) metaKey(agentID, scope, memoryID string) string {
-	return agentID + "|" + scope + "|" + memoryID
+	return &fakeMetaStore{records: make(map[string]*memory.MemoryDocument)}
 }
 
 func (f *fakeMetaStore) Upsert(_ context.Context, doc memory.MemoryDocument) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	// User-scope memories are conceptually keyed by (user_id, memory_id) —
-	// the real repo enforces this with a partial unique index. Mirror that
-	// here so any cross-agent overwrite reuses the same record and tests
-	// can't accidentally rely on the agent_id being part of the user-scope
-	// identity.
-	k := f.metaKey(doc.AgentID, doc.Scope, doc.ID)
-	if doc.Scope == memory.ScopeUser {
-		for existingKey, existing := range f.records {
-			if existing.Scope == memory.ScopeUser && existing.UserID == doc.UserID && existing.ID == doc.ID {
-				k = existingKey
-				break
-			}
+	if existing, ok := f.records[doc.LineageKey]; ok {
+		if existing.Revision > doc.Revision {
+			return nil
 		}
-	}
-	// Preserve last_read_at on upsert — mirrors the MongoDB $set behaviour.
-	var lastReadAt *time.Time
-	if existing, ok := f.records[k]; ok {
-		lastReadAt = existing.LastReadAt
+		doc.LastReadAt = existing.LastReadAt
 	}
 	cp := doc
-	cp.LastReadAt = lastReadAt
-	f.records[k] = &cp
-	// Clear any prior soft-delete marker — re-writing revives the slot.
-	delete(f.softDeleted, k)
+	f.records[doc.LineageKey] = &cp
 	return nil
 }
 
-func (f *fakeMetaStore) FindOne(_ context.Context, agentID, scope, memoryID string) (*memory.MemoryDocument, error) {
+func (f *fakeMetaStore) FindActive(_ context.Context, execScope runtimectx.MemoryScope, searchScope string, typeFilter *string, includeRetired bool, now time.Time) ([]memory.MemoryDocument, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	k := f.metaKey(agentID, scope, memoryID)
-	if f.softDeleted[k] {
-		return nil, nil
-	}
-	doc, ok := f.records[k]
-	if !ok {
-		return nil, nil
-	}
-	cp := *doc
-	return &cp, nil
-}
-
-func (f *fakeMetaStore) FindOneUserScoped(_ context.Context, userID, memoryID string) (*memory.MemoryDocument, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var best *memory.MemoryDocument
-	for k, doc := range f.records {
-		if f.softDeleted[k] {
-			continue
-		}
-		if doc.Scope != memory.ScopeUser || doc.UserID != userID || doc.ID != memoryID {
-			continue
-		}
-		if best == nil || doc.CreatedAt.After(best.CreatedAt) {
-			cp := *doc
-			best = &cp
-		}
-	}
-	return best, nil
-}
-
-func (f *fakeMetaStore) FindActive(_ context.Context, execScope runtimectx.MemoryScope, searchScope string, typeFilter *string, now time.Time) ([]memory.MemoryDocument, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var results []memory.MemoryDocument
-	for k, doc := range f.records {
-		if f.softDeleted[k] {
-			continue // soft-deleted — invisible to agents
-		}
+	var out []memory.MemoryDocument
+	for _, doc := range f.records {
 		if doc.ExpiresAt != nil && !doc.ExpiresAt.After(now) {
-			continue // expired
+			continue
+		}
+		if !includeRetired && doc.RetiredAt != nil {
+			continue
 		}
 		if !scopeMatch(doc, execScope, searchScope) {
 			continue
@@ -118,711 +56,463 @@ func (f *fakeMetaStore) FindActive(_ context.Context, execScope runtimectx.Memor
 			continue
 		}
 		cp := *doc
-		results = append(results, cp)
+		out = append(out, cp)
 	}
-	return results, nil
+	return out, nil
 }
 
 func scopeMatch(doc *memory.MemoryDocument, exec runtimectx.MemoryScope, searchScope string) bool {
 	switch searchScope {
 	case memory.ScopeThread:
-		return doc.Scope == memory.ScopeThread &&
-			doc.AgentID == exec.AgentID &&
-			doc.ThreadID == exec.ThreadID
+		return doc.Scope == memory.ScopeThread && doc.UserID == exec.UserID && doc.AgentID == exec.AgentID && doc.ThreadID == exec.ThreadID
 	case memory.ScopeAgent:
-		return (doc.Scope == memory.ScopeAgent && doc.AgentID == exec.AgentID) ||
-			(doc.Scope == memory.ScopeThread && doc.AgentID == exec.AgentID && doc.ThreadID == exec.ThreadID)
+		return (doc.Scope == memory.ScopeAgent && doc.UserID == exec.UserID && doc.AgentID == exec.AgentID) ||
+			(doc.Scope == memory.ScopeThread && doc.UserID == exec.UserID && doc.AgentID == exec.AgentID && doc.ThreadID == exec.ThreadID)
 	case memory.ScopeUser:
 		return (doc.Scope == memory.ScopeUser && doc.UserID == exec.UserID) ||
-			(doc.Scope == memory.ScopeAgent && doc.AgentID == exec.AgentID) ||
-			(doc.Scope == memory.ScopeThread && doc.AgentID == exec.AgentID && doc.ThreadID == exec.ThreadID)
+			(doc.Scope == memory.ScopeAgent && doc.UserID == exec.UserID && doc.AgentID == exec.AgentID) ||
+			(doc.Scope == memory.ScopeThread && doc.UserID == exec.UserID && doc.AgentID == exec.AgentID && doc.ThreadID == exec.ThreadID)
 	default:
 		return false
 	}
 }
 
-func (f *fakeMetaStore) StampRead(_ context.Context, agentID, scope, memoryID string) error {
+func (f *fakeMetaStore) StampRead(_ context.Context, doc memory.MemoryDocument) error {
 	if f.stampErr != nil {
 		return f.stampErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	doc, ok := f.records[f.metaKey(agentID, scope, memoryID)]
-	if !ok {
-		return nil // no-op for nonexistent record, matches MongoDB behaviour
+	if existing, ok := f.records[doc.LineageKey]; ok {
+		now := time.Now().UTC()
+		existing.LastReadAt = &now
 	}
-	now := time.Now().UTC()
-	doc.LastReadAt = &now
 	return nil
 }
 
 func (f *fakeMetaStore) FindExpired(_ context.Context, now time.Time) ([]memory.MemoryDocument, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var results []memory.MemoryDocument
-	for k, doc := range f.records {
-		if f.softDeleted[k] {
-			continue // already soft-deleted — don't re-process
-		}
+	var out []memory.MemoryDocument
+	for _, doc := range f.records {
 		if doc.ExpiresAt != nil && !doc.ExpiresAt.After(now) {
 			cp := *doc
-			results = append(results, cp)
+			out = append(out, cp)
 		}
 	}
-	return results, nil
+	return out, nil
 }
 
-func (f *fakeMetaStore) SoftDelete(_ context.Context, agentID, scope, memoryID string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	k := f.metaKey(agentID, scope, memoryID)
-	if _, ok := f.records[k]; ok {
-		f.softDeleted[k] = true
-	}
-	return nil
-}
+func (f *fakeMetaStore) SoftDelete(_ context.Context, _, _, _ string) error { return nil }
+func (f *fakeMetaStore) EnsureIndexes(_ context.Context) error              { return nil }
 
-func (f *fakeMetaStore) EnsureIndexes(_ context.Context) error { return nil }
-
-// ── Test helpers ──────────────────────────────────────────────────────────────
-
-// newSvc creates a Service with a fresh temp root and a fakeMetaStore.
-func newSvc(t *testing.T) (*memory.Service, string, *fakeMetaStore) {
+func newSvc(t *testing.T) (*memory.Service, string, *fakeMetaStore, *memory.InMemoryRevisionStore) {
 	t.Helper()
 	root := t.TempDir()
 	meta := newFakeMeta()
-	svc := memory.NewService(memory.Config{Root: root}, meta)
-	return svc, root, meta
+	revisions := memory.NewInMemoryRevisionStore()
+	svc := memory.NewService(memory.Config{Root: root}, meta, revisions)
+	return svc, root, meta, revisions
 }
 
-// svcWriteArgs returns a minimal valid MemoryWriteArgs for the given content.
-func svcWriteArgs(content string) memory.MemoryWriteArgs {
+func newSearchSvc(t *testing.T) (*memory.Service, *fakeMetaStore, *memory.InMemoryRevisionStore) {
+	t.Helper()
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skip("rg not in PATH - skipping search test")
+	}
+	meta := newFakeMeta()
+	revisions := memory.NewInMemoryRevisionStore()
+	svc := memory.NewService(memory.Config{Root: t.TempDir(), RGPath: "rg"}, meta, revisions)
+	return svc, meta, revisions
+}
+
+func writeArgs(content, runID, toolCallID string) memory.MemoryWriteArgs {
 	return memory.MemoryWriteArgs{
 		Content:    content,
 		Type:       memory.TypeFact,
 		Scope:      memory.ScopeThread,
 		Importance: 0.7,
+		RunID:      runID,
+		ToolCallID: toolCallID,
 	}
 }
 
-// writeExpiredDoc plants an expired record into both the fakeMetaStore and the
-// filesystem (plain text body, no frontmatter).
-func writeExpiredDoc(t *testing.T, root string, scope runtimectx.MemoryScope, memID string, meta *fakeMetaStore) {
-	t.Helper()
-	past := time.Now().UTC().Add(-48 * time.Hour)
-	expiresAt := time.Now().UTC().Add(-1 * time.Hour)
+func i(v int) *int { return &v }
 
-	path, err := memory.ResolveWritePath(root, scope, memory.ScopeThread, memID)
-	if err != nil {
-		t.Fatalf("ResolveWritePath: %v", err)
-	}
-	if err := memory.WriteFileAtomic(path, "expired content"); err != nil {
-		t.Fatalf("WriteFileAtomic: %v", err)
-	}
-
-	doc := memory.MemoryDocument{
-		UserID:     scope.UserID,
-		AgentID:    scope.AgentID,
-		ThreadID:   scope.ThreadID,
-		ID:         memID,
-		Type:       memory.TypeFact,
-		Scope:      memory.ScopeThread,
-		Importance: 0.5,
-		CreatedAt:  past,
-		ExpiresAt:  &expiresAt,
-	}
-	if err := meta.Upsert(context.Background(), doc); err != nil {
-		t.Fatalf("fakeMetaStore.Upsert: %v", err)
-	}
-}
-
-// newSearchSvc creates a Service with rg wired in; skips if rg is not in PATH.
-func newSearchSvc(t *testing.T) (*memory.Service, string, *fakeMetaStore) {
-	t.Helper()
-	if _, err := exec.LookPath("rg"); err != nil {
-		t.Skip("rg not in PATH — skipping search test")
-	}
-	root := t.TempDir()
-	meta := newFakeMeta()
-	svc := memory.NewService(memory.Config{Root: root, RGPath: "rg"}, meta)
-	return svc, root, meta
-}
-
-// ── Write ─────────────────────────────────────────────────────────────────────
-
-func TestServiceWriteRoundTrip(t *testing.T) {
+func TestServiceWriteReadAndHistory(t *testing.T) {
 	t.Parallel()
-	svc, _, _ := newSvc(t)
-
-	result, err := svc.Write(context.Background(), validScope(), "mem-rt", svcWriteArgs("hello world"))
-	if err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if result.MemoryID != "mem-rt" {
-		t.Errorf("MemoryID: got %q, want %q", result.MemoryID, "mem-rt")
-	}
-	if result.Scope != memory.ScopeThread {
-		t.Errorf("Scope: got %q, want %q", result.Scope, memory.ScopeThread)
-	}
-	if result.CreatedAt == "" {
-		t.Error("expected non-empty CreatedAt")
-	}
-}
-
-func TestServiceWritePopulatesSummary(t *testing.T) {
-	t.Parallel()
-	svc, _, meta := newSvc(t)
-
-	body := "# DB notes\nPostgreSQL 14, users + orders.\nMigrations in /db/migrations."
-	if _, err := svc.Write(context.Background(), validScope(), "mem-summary", svcWriteArgs(body)); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	doc, err := meta.FindOne(context.Background(), validScope().AgentID, memory.ScopeThread, "mem-summary")
-	if err != nil {
-		t.Fatalf("FindOne: %v", err)
-	}
-	if doc == nil {
-		t.Fatal("expected document, got nil")
-	}
-	if doc.Summary != "DB notes" {
-		t.Errorf("Summary: got %q, want %q", doc.Summary, "DB notes")
-	}
-}
-
-func TestServiceWriteSummaryFallsBackToFirstNonHeaderLine(t *testing.T) {
-	t.Parallel()
-	svc, _, meta := newSvc(t)
-
-	body := "User prefers concise responses."
-	if _, err := svc.Write(context.Background(), validScope(), "mem-plain", svcWriteArgs(body)); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	doc, err := meta.FindOne(context.Background(), validScope().AgentID, memory.ScopeThread, "mem-plain")
-	if err != nil {
-		t.Fatalf("FindOne: %v", err)
-	}
-	if doc == nil {
-		t.Fatal("expected document, got nil")
-	}
-	if doc.Summary != "User prefers concise responses." {
-		t.Errorf("Summary: got %q, want %q", doc.Summary, body)
-	}
-}
-
-func TestServiceWriteExistingFileRequiresRead(t *testing.T) {
-	t.Parallel()
-	svc, _, _ := newSvc(t)
+	svc, _, meta, _ := newSvc(t)
 	scope := validScope()
 
-	// First write — new file, must succeed.
-	if _, err := svc.Write(context.Background(), scope, "mem-guard", svcWriteArgs("initial content")); err != nil {
+	wr, err := svc.Write(context.Background(), scope, "mem-rt", writeArgs("hello world", "run-1", "call-1"))
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if wr.Revision != 1 {
+		t.Fatalf("revision = %d, want 1", wr.Revision)
+	}
+
+	read, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "mem-rt", Scope: memory.ScopeThread})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if read.Content != "hello world" || read.Revision != 1 {
+		t.Fatalf("read = (%q, rev %d), want hello world rev 1", read.Content, read.Revision)
+	}
+
+	lineage, _ := memory.LineageKey(scope, memory.ScopeThread, "mem-rt")
+	if meta.records[lineage].LastReadAt == nil {
+		t.Fatal("latest read should stamp last_read_at")
+	}
+
+	history, err := svc.History(context.Background(), scope, memory.MemoryHistoryArgs{MemoryID: "mem-rt", Scope: memory.ScopeThread})
+	if err != nil {
+		t.Fatalf("History: %v", err)
+	}
+	if len(history.Revisions) != 1 || history.Revisions[0].Operation != memory.OperationCreate {
+		t.Fatalf("history = %+v, want one create revision", history.Revisions)
+	}
+}
+
+func TestServiceCreateRejectsExistingLineage(t *testing.T) {
+	t.Parallel()
+	svc, _, _, _ := newSvc(t)
+	scope := validScope()
+	if _, err := svc.Write(context.Background(), scope, "same-id", writeArgs("v1", "run-1", "call-1")); err != nil {
 		t.Fatalf("first Write: %v", err)
 	}
-
-	// Second write without reading — must fail with ErrReadBeforeWrite.
-	_, err := svc.Write(context.Background(), scope, "mem-guard", svcWriteArgs("overwrite attempt"))
-	if !errors.Is(err, memory.ErrReadBeforeWrite) {
-		t.Fatalf("expected ErrReadBeforeWrite on blind overwrite, got: %v", err)
+	_, err := svc.Write(context.Background(), scope, "same-id", writeArgs("v2", "run-2", "call-2"))
+	if !errors.Is(err, memory.ErrMemoryExists) {
+		t.Fatalf("expected ErrMemoryExists, got %v", err)
 	}
-}
-
-func TestServiceWriteAllowedAfterRead(t *testing.T) {
-	t.Parallel()
-	svc, _, _ := newSvc(t)
-	scope := validScope()
-
-	// Write → Read (stamps last_read_at) → Write again must succeed.
-	if _, err := svc.Write(context.Background(), scope, "mem-rw", svcWriteArgs("v1")); err != nil {
-		t.Fatalf("first Write: %v", err)
+	if !strings.Contains(err.Error(), "memory_patch or memory_update") {
+		t.Fatalf("active collision should guide patch/update, got %v", err)
 	}
-	if _, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{
-		MemoryID: "mem-rw", Scope: memory.ScopeThread,
+
+	if _, err := svc.Retire(context.Background(), scope, memory.MemoryRetireArgs{
+		MemoryID: "same-id", Scope: memory.ScopeThread, ExpectedRevision: i(1), Reason: "retire",
+		RunID: "run-3", ToolCallID: "retire-1",
 	}); err != nil {
-		t.Fatalf("Read: %v", err)
+		t.Fatalf("Retire: %v", err)
 	}
-	if _, err := svc.Write(context.Background(), scope, "mem-rw", svcWriteArgs("v2")); err != nil {
-		t.Fatalf("second Write after Read: %v", err)
+	_, err = svc.Write(context.Background(), scope, "same-id", writeArgs("v3", "run-4", "call-4"))
+	if !errors.Is(err, memory.ErrMemoryExists) {
+		t.Fatalf("expected ErrMemoryExists for retired collision, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "memory_restore") {
+		t.Fatalf("retired collision should guide restore, got %v", err)
 	}
 }
 
-func TestServiceWriteExpiredWindowRequiresReRead(t *testing.T) {
+func TestServiceMutationReplayAfterHeadMoved(t *testing.T) {
 	t.Parallel()
-	meta := newFakeMeta()
-	svc := memory.NewService(memory.Config{Root: t.TempDir(), ReadWindowDuration: 5 * time.Minute}, meta)
+	svc, _, _, _ := newSvc(t)
 	scope := validScope()
-
-	// Seed a non-expired record with a stale last_read_at (10 minutes ago,
-	// outside the 5-minute window).
-	staleRead := time.Now().UTC().Add(-10 * time.Minute)
-	doc := memory.MemoryDocument{
-		UserID:     scope.UserID,
-		AgentID:    scope.AgentID,
-		ThreadID:   scope.ThreadID,
-		ID:         "mem-stale",
-		Type:       memory.TypeFact,
-		Scope:      memory.ScopeThread,
-		Importance: 0.5,
-		CreatedAt:  time.Now().UTC().Add(-1 * time.Hour),
-		LastReadAt: &staleRead,
-	}
-	if err := meta.Upsert(context.Background(), doc); err != nil {
-		t.Fatalf("seed Upsert: %v", err)
-	}
-
-	// The guardrail fires before the file write, so no file is needed.
-	_, err := svc.Write(context.Background(), scope, "mem-stale", svcWriteArgs("new content"))
-	if !errors.Is(err, memory.ErrReadBeforeWrite) {
-		t.Fatalf("expected ErrReadBeforeWrite for stale stamp, got: %v", err)
-	}
-}
-
-func TestServiceWriteExpiredRecordTreatedAsNew(t *testing.T) {
-	t.Parallel()
-	svc, root, meta := newSvc(t)
-	scope := validScope()
-
-	writeExpiredDoc(t, root, scope, "mem-reexp", meta)
-
-	// Write over expired record — no read required.
-	if _, err := svc.Write(context.Background(), scope, "mem-reexp", svcWriteArgs("fresh content")); err != nil {
-		t.Fatalf("Write over expired record: %v", err)
-	}
-}
-
-func TestServiceWriteOverwritesExpiredDoc(t *testing.T) {
-	t.Parallel()
-	svc, root, meta := newSvc(t)
-	scope := validScope()
-
-	writeExpiredDoc(t, root, scope, "mem-exp", meta)
-
-	// Write must succeed and the new content must be readable.
-	result, err := svc.Write(context.Background(), scope, "mem-exp", svcWriteArgs("fresh content"))
-	if err != nil {
-		t.Fatalf("Write over expired doc: %v", err)
-	}
-	if result.MemoryID != "mem-exp" {
-		t.Errorf("MemoryID: got %q, want %q", result.MemoryID, "mem-exp")
-	}
-
-	read, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{
-		MemoryID: "mem-exp",
-		Scope:    memory.ScopeThread,
-	})
-	if err != nil {
-		t.Fatalf("Read after overwrite: %v", err)
-	}
-	if read.Content != "fresh content" {
-		t.Errorf("Content: got %q, want %q", read.Content, "fresh content")
-	}
-}
-
-func TestServiceWriteWithTTLSetsExpiresAt(t *testing.T) {
-	t.Parallel()
-	svc, _, _ := newSvc(t)
-	ttl := 3
-	args := svcWriteArgs("temporary fact")
-	args.TTLDays = &ttl
-
-	result, err := svc.Write(context.Background(), validScope(), "mem-ttl", args)
-	if err != nil {
-		t.Fatalf("Write with TTL: %v", err)
-	}
-	if result.ExpiresAt == nil {
-		t.Fatal("expected ExpiresAt to be set when TTLDays is provided")
-	}
-}
-
-// TestServiceUserScopeWriteIsUserKeyedAcrossAgents covers review round 3
-// issue #2: a user-scope memory must have a single canonical metadata row
-// regardless of which agent wrote it. Two writes from different agents to
-// the same memory_id must:
-//   1. surface a single row (no duplicate metadata)
-//   2. enforce the read-before-write guard so an agent that has never read
-//      it cannot blindly overwrite it
-func TestServiceUserScopeWriteIsUserKeyedAcrossAgents(t *testing.T) {
-	t.Parallel()
-	svc, _, meta := newSvc(t)
-
-	agentB := runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-B", ThreadID: "thread-B"}
-	agentA := runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-A", ThreadID: "thread-A"}
-
-	// Agent B writes the user memory.
-	if _, err := svc.Write(context.Background(), agentB, "lang-pref",
-		svcUserPrefArgs("v1: prefer Marathi")); err != nil {
-		t.Fatalf("agent B write: %v", err)
-	}
-
-	// Agent A overwrites WITHOUT having read it — must be rejected.
-	_, err := svc.Write(context.Background(), agentA, "lang-pref",
-		svcUserPrefArgs("v2: agent A clobber"))
-	if !errors.Is(err, memory.ErrReadBeforeWrite) {
-		t.Fatalf("expected ErrReadBeforeWrite for cross-agent blind overwrite, got: %v", err)
-	}
-
-	// Agent A reads it (this is the cross-agent read path, which stamps the
-	// writer-agent's record).
-	if _, err := svc.Read(context.Background(), agentA, memory.MemoryReadArgs{
-		MemoryID: "lang-pref",
-		Scope:    memory.ScopeUser,
-	}); err != nil {
-		t.Fatalf("agent A read: %v", err)
-	}
-
-	// Now agent A can overwrite.
-	if _, err := svc.Write(context.Background(), agentA, "lang-pref",
-		svcUserPrefArgs("v3: agent A update")); err != nil {
-		t.Fatalf("agent A write after read: %v", err)
-	}
-
-	// Verify there is only ONE canonical row for (user-1, user, lang-pref).
-	rows := 0
-	meta.mu.Lock()
-	for _, doc := range meta.records {
-		if doc.Scope == memory.ScopeUser && doc.UserID == "user-1" && doc.ID == "lang-pref" {
-			rows++
-		}
-	}
-	meta.mu.Unlock()
-	if rows != 1 {
-		t.Errorf("user-scope metadata rows: got %d, want 1 (no duplicates across agents)", rows)
-	}
-
-	// And the canonical doc must reflect the latest writer.
-	doc, err := meta.FindOneUserScoped(context.Background(), "user-1", "lang-pref")
-	if err != nil {
-		t.Fatalf("FindOneUserScoped: %v", err)
-	}
-	if doc == nil {
-		t.Fatal("expected document, got nil")
-	}
-	if doc.AgentID != "agent-A" {
-		t.Errorf("AgentID after agent-A overwrite: got %q, want agent-A", doc.AgentID)
-	}
-}
-
-// svcUserPrefArgs returns MemoryWriteArgs for a user-scoped preference.
-func svcUserPrefArgs(content string) memory.MemoryWriteArgs {
-	return memory.MemoryWriteArgs{
-		Content:    content,
-		Type:       memory.TypePreference,
-		Scope:      memory.ScopeUser,
-		Importance: 0.5,
-	}
-}
-
-// TestServiceUserScopeReadWorksAcrossAgents is the end-to-end regression for
-// review issue #2 (round 2): agent B writes a user memory, agent A — which
-// has never seen the memory before — must still be able to read it. Without
-// the user-keyed lookup path this fails because FindOne filters by AgentID.
-func TestServiceUserScopeReadWorksAcrossAgents(t *testing.T) {
-	t.Parallel()
-	svc, _, _ := newSvc(t)
-
-	agentB := runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-B", ThreadID: "thread-B"}
-	agentA := runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-A", ThreadID: "thread-A"}
-
-	args := memory.MemoryWriteArgs{
-		Content:    "User prefers Marathi for casual chat.",
-		Type:       memory.TypePreference,
-		Scope:      memory.ScopeUser,
-		Importance: 0.6,
-	}
-	if _, err := svc.Write(context.Background(), agentB, "lang-pref", args); err != nil {
-		t.Fatalf("agent B write: %v", err)
-	}
-
-	// Agent A — never wrote this memory — must still be able to read it.
-	read, err := svc.Read(context.Background(), agentA, memory.MemoryReadArgs{
-		MemoryID: "lang-pref",
-		Scope:    memory.ScopeUser,
-	})
-	if err != nil {
-		t.Fatalf("agent A read (cross-agent user-scoped): %v", err)
-	}
-	if read.Content != args.Content {
-		t.Errorf("Content: got %q, want %q", read.Content, args.Content)
-	}
-}
-
-func TestServiceWriteRejectsEmptyContent(t *testing.T) {
-	t.Parallel()
-	svc, _, _ := newSvc(t)
-	_, err := svc.Write(context.Background(), validScope(), "mem-empty", svcWriteArgs(""))
-	if err == nil {
-		t.Fatal("expected error for empty content")
-	}
-}
-
-func TestServiceWriteRejectsInvalidType(t *testing.T) {
-	t.Parallel()
-	svc, _, _ := newSvc(t)
-	args := svcWriteArgs("some content")
-	args.Type = "not-a-type"
-	_, err := svc.Write(context.Background(), validScope(), "mem-badtype", args)
-	if !errors.Is(err, memory.ErrInvalidType) {
-		t.Fatalf("expected ErrInvalidType, got: %v", err)
-	}
-}
-
-func TestServiceWriteRejectsInvalidScope(t *testing.T) {
-	t.Parallel()
-	svc, _, _ := newSvc(t)
-	args := svcWriteArgs("some content")
-	args.Scope = "badscope"
-	_, err := svc.Write(context.Background(), validScope(), "mem-badscope", args)
-	if !errors.Is(err, memory.ErrInvalidScope) {
-		t.Fatalf("expected ErrInvalidScope, got: %v", err)
-	}
-}
-
-// ── Read ──────────────────────────────────────────────────────────────────────
-
-func TestServiceReadRoundTrip(t *testing.T) {
-	t.Parallel()
-	svc, _, _ := newSvc(t)
-	scope := validScope()
-
-	if _, err := svc.Write(context.Background(), scope, "mem-read", svcWriteArgs("content to read back")); err != nil {
+	if _, err := svc.Write(context.Background(), scope, "mem", writeArgs("alpha beta", "run-1", "call-1")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
+	patch := memory.MemoryPatchArgs{
+		MemoryID: "mem", Scope: memory.ScopeThread, ExpectedRevision: i(1), Reason: "rename",
+		Edits: []memory.MemoryPatchEdit{{OldText: "beta", NewText: "gamma"}},
+		RunID: "run-1", ToolCallID: "patch-1",
+	}
+	first, err := svc.Patch(context.Background(), scope, patch)
+	if err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	if _, err := svc.Update(context.Background(), scope, memory.MemoryUpdateArgs{
+		MemoryID: "mem", Scope: memory.ScopeThread, ExpectedRevision: i(2), Reason: "replace",
+		Content: "delta", RunID: "run-2", ToolCallID: "update-1",
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	replay, err := svc.Patch(context.Background(), scope, patch)
+	if err != nil {
+		t.Fatalf("Patch replay: %v", err)
+	}
+	if replay.Revision != first.Revision {
+		t.Fatalf("replay revision = %d, want %d", replay.Revision, first.Revision)
+	}
+}
 
-	result, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{
-		MemoryID: "mem-read",
-		Scope:    memory.ScopeThread,
+func TestServiceGeneratedIDsAreRunNamespaced(t *testing.T) {
+	t.Parallel()
+	svc, _, _, _ := newSvc(t)
+	scope := validScope()
+
+	a, err := svc.Write(context.Background(), scope, "", writeArgs("first", "run-A", "same-call"))
+	if err != nil {
+		t.Fatalf("Write A: %v", err)
+	}
+	b, err := svc.Write(context.Background(), scope, "", writeArgs("second", "run-B", "same-call"))
+	if err != nil {
+		t.Fatalf("Write B: %v", err)
+	}
+	if a.MemoryID == b.MemoryID {
+		t.Fatalf("generated IDs should differ across runs, both %q", a.MemoryID)
+	}
+}
+
+func TestServiceCrossThreadSameSlugCoexists(t *testing.T) {
+	t.Parallel()
+	svc, _, _, _ := newSvc(t)
+	threadA := validScope()
+	threadB := runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-1", ThreadID: "thread-2"}
+
+	if _, err := svc.Write(context.Background(), threadA, "slug", writeArgs("thread A", "run-A", "call-A")); err != nil {
+		t.Fatalf("Write A: %v", err)
+	}
+	if _, err := svc.Write(context.Background(), threadB, "slug", writeArgs("thread B", "run-B", "call-B")); err != nil {
+		t.Fatalf("Write B: %v", err)
+	}
+	readA, err := svc.Read(context.Background(), threadA, memory.MemoryReadArgs{MemoryID: "slug", Scope: memory.ScopeThread})
+	if err != nil {
+		t.Fatalf("Read A: %v", err)
+	}
+	readB, err := svc.Read(context.Background(), threadB, memory.MemoryReadArgs{MemoryID: "slug", Scope: memory.ScopeThread})
+	if err != nil {
+		t.Fatalf("Read B: %v", err)
+	}
+	if readA.Content != "thread A" || readB.Content != "thread B" {
+		t.Fatalf("cross-thread content = %q/%q", readA.Content, readB.Content)
+	}
+}
+
+func TestServicePatchValidationAllOrNothing(t *testing.T) {
+	t.Parallel()
+	svc, _, _, _ := newSvc(t)
+	scope := validScope()
+	if _, err := svc.Write(context.Background(), scope, "patchy", writeArgs("abcd abcd", "run-1", "call-1")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	_, err := svc.Patch(context.Background(), scope, memory.MemoryPatchArgs{
+		MemoryID: "patchy", Scope: memory.ScopeThread, ExpectedRevision: i(1), Reason: "ambiguous",
+		Edits: []memory.MemoryPatchEdit{{OldText: "abcd", NewText: "wxyz"}},
+		RunID: "run-1", ToolCallID: "patch-ambiguous",
 	})
+	if !errors.Is(err, memory.ErrInvalidDocument) {
+		t.Fatalf("expected ErrInvalidDocument for ambiguous patch, got %v", err)
+	}
+	read, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "patchy", Scope: memory.ScopeThread})
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	if result.Content != "content to read back" {
-		t.Errorf("Content: got %q, want %q", result.Content, "content to read back")
+	if read.Content != "abcd abcd" || read.Revision != 1 {
+		t.Fatalf("failed patch should not mutate, got content %q rev %d", read.Content, read.Revision)
 	}
-	if result.Type != memory.TypeFact {
-		t.Errorf("Type: got %q, want %q", result.Type, memory.TypeFact)
-	}
-	if result.MemoryID != "mem-read" {
-		t.Errorf("MemoryID: got %q, want %q", result.MemoryID, "mem-read")
-	}
-}
 
-func TestServiceReadReturnsErrMemoryNotFound(t *testing.T) {
-	t.Parallel()
-	svc, _, _ := newSvc(t)
-	_, err := svc.Read(context.Background(), validScope(), memory.MemoryReadArgs{
-		MemoryID: "mem-nonexistent",
-		Scope:    memory.ScopeThread,
+	if _, err := svc.Write(context.Background(), scope, "overlap", writeArgs("abcd", "run-2", "call-2")); err != nil {
+		t.Fatalf("Write overlap: %v", err)
+	}
+	_, err = svc.Patch(context.Background(), scope, memory.MemoryPatchArgs{
+		MemoryID: "overlap", Scope: memory.ScopeThread, ExpectedRevision: i(1), Reason: "overlap",
+		Edits: []memory.MemoryPatchEdit{
+			{OldText: "abc", NewText: "x"},
+			{OldText: "bc", NewText: "y"},
+		},
+		RunID: "run-2", ToolCallID: "patch-overlap",
 	})
-	if !errors.Is(err, memory.ErrMemoryNotFound) {
-		t.Fatalf("expected ErrMemoryNotFound, got: %v", err)
+	if !errors.Is(err, memory.ErrInvalidDocument) {
+		t.Fatalf("expected ErrInvalidDocument for overlap, got %v", err)
 	}
-}
 
-func TestServiceReadReturnsErrExpiredMemory(t *testing.T) {
-	t.Parallel()
-	svc, root, meta := newSvc(t)
-	scope := validScope()
-
-	writeExpiredDoc(t, root, scope, "mem-readexp", meta)
-
-	_, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{
-		MemoryID: "mem-readexp",
-		Scope:    memory.ScopeThread,
+	if _, err := svc.Write(context.Background(), scope, "self-overlap", writeArgs("aaa", "run-3", "call-3")); err != nil {
+		t.Fatalf("Write self-overlap: %v", err)
+	}
+	_, err = svc.Patch(context.Background(), scope, memory.MemoryPatchArgs{
+		MemoryID: "self-overlap", Scope: memory.ScopeThread, ExpectedRevision: i(1), Reason: "self overlap",
+		Edits: []memory.MemoryPatchEdit{{OldText: "aa", NewText: "b"}},
+		RunID: "run-3", ToolCallID: "patch-self-overlap",
 	})
-	if !errors.Is(err, memory.ErrExpiredMemory) {
-		t.Fatalf("expected ErrExpiredMemory, got: %v", err)
+	if !errors.Is(err, memory.ErrInvalidDocument) {
+		t.Fatalf("expected ErrInvalidDocument for self-overlap ambiguity, got %v", err)
 	}
 }
 
-func TestServiceReadStampsLastReadAt(t *testing.T) {
+func TestServiceUpdateRetireRestoreFlow(t *testing.T) {
 	t.Parallel()
-	svc, _, meta := newSvc(t)
+	svc, _, _, _ := newSvc(t)
 	scope := validScope()
-
-	if _, err := svc.Write(context.Background(), scope, "mem-stamp", svcWriteArgs("content")); err != nil {
+	if _, err := svc.Write(context.Background(), scope, "flow", writeArgs("v1", "run-1", "call-1")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if _, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{
-		MemoryID: "mem-stamp", Scope: memory.ScopeThread,
+	if _, err := svc.Update(context.Background(), scope, memory.MemoryUpdateArgs{
+		MemoryID: "flow", Scope: memory.ScopeThread, ExpectedRevision: i(1), Reason: "whole body",
+		Content: "v2", RunID: "run-1", ToolCallID: "update-1",
 	}); err != nil {
-		t.Fatalf("Read: %v", err)
+		t.Fatalf("Update: %v", err)
 	}
-
-	doc, err := meta.FindOne(context.Background(), scope.AgentID, memory.ScopeThread, "mem-stamp")
-	if err != nil {
-		t.Fatalf("FindOne: %v", err)
-	}
-	if doc == nil || doc.LastReadAt == nil {
-		t.Fatal("expected LastReadAt to be set after Read")
-	}
-}
-
-func TestServiceReadStampFailureDoesNotFailRead(t *testing.T) {
-	t.Parallel()
-	svc, _, meta := newSvc(t)
-	scope := validScope()
-
-	if _, err := svc.Write(context.Background(), scope, "mem-sfail", svcWriteArgs("content")); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	meta.stampErr = errors.New("simulated stamp failure")
-
-	result, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{
-		MemoryID: "mem-sfail", Scope: memory.ScopeThread,
+	retired, err := svc.Retire(context.Background(), scope, memory.MemoryRetireArgs{
+		MemoryID: "flow", Scope: memory.ScopeThread, ExpectedRevision: i(2), Reason: "obsolete",
+		RunID: "run-1", ToolCallID: "retire-1",
 	})
 	if err != nil {
-		t.Fatalf("Read should succeed even when stamp fails, got: %v", err)
+		t.Fatalf("Retire: %v", err)
 	}
-	if result.Content != "content" {
-		t.Errorf("Content: got %q, want %q", result.Content, "content")
+	if !retired.Retired || retired.Revision != 3 {
+		t.Fatalf("retire result = %+v", retired)
+	}
+	if _, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "flow", Scope: memory.ScopeThread}); !errors.Is(err, memory.ErrRetiredMemory) {
+		t.Fatalf("latest read should see retired memory, got %v", err)
+	}
+	historical, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "flow", Scope: memory.ScopeThread, Revision: i(3)})
+	if err != nil {
+		t.Fatalf("historical retired read: %v", err)
+	}
+	if historical.Content != "v2" || !historical.Retired {
+		t.Fatalf("historical retired read = %+v", historical)
+	}
+	restore, err := svc.Restore(context.Background(), scope, memory.MemoryRestoreArgs{
+		MemoryID: "flow", Scope: memory.ScopeThread, ExpectedRevision: i(3), Reason: "restore default",
+		RunID: "run-1", ToolCallID: "restore-1",
+	})
+	if err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if restore.Revision != 4 || restore.Retired {
+		t.Fatalf("restore result = %+v", restore)
+	}
+	read, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "flow", Scope: memory.ScopeThread})
+	if err != nil {
+		t.Fatalf("read restored: %v", err)
+	}
+	if read.Content != "v2" || read.Revision != 4 {
+		t.Fatalf("restored read = %+v", read)
 	}
 }
 
-// ── Search ────────────────────────────────────────────────────────────────────
+func TestServiceRestoreActiveWithoutFromRevisionFails(t *testing.T) {
+	t.Parallel()
+	svc, _, _, _ := newSvc(t)
+	scope := validScope()
+	if _, err := svc.Write(context.Background(), scope, "active", writeArgs("v1", "run-1", "call-1")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	_, err := svc.Restore(context.Background(), scope, memory.MemoryRestoreArgs{
+		MemoryID: "active", Scope: memory.ScopeThread, ExpectedRevision: i(1), Reason: "bad restore",
+		RunID: "run-1", ToolCallID: "restore-active",
+	})
+	if !errors.Is(err, memory.ErrInvalidDocument) {
+		t.Fatalf("expected ErrInvalidDocument, got %v", err)
+	}
+}
 
-func TestServiceSearchFindsMatch(t *testing.T) {
+func TestServiceMissingExpectedRevisionFails(t *testing.T) {
+	t.Parallel()
+	svc, _, _, _ := newSvc(t)
+	scope := validScope()
+	if _, err := svc.Write(context.Background(), scope, "exp", writeArgs("v1", "run-1", "call-1")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	_, err := svc.Update(context.Background(), scope, memory.MemoryUpdateArgs{
+		MemoryID: "exp", Scope: memory.ScopeThread, Reason: "missing", Content: "v2",
+		RunID: "run-1", ToolCallID: "update-missing",
+	})
+	if !errors.Is(err, memory.ErrExpectedRevisionRequired) {
+		t.Fatalf("expected ErrExpectedRevisionRequired, got %v", err)
+	}
+}
+
+func TestServiceSearchHidesRetiredUnlessRequested(t *testing.T) {
 	t.Parallel()
 	svc, _, _ := newSearchSvc(t)
 	scope := validScope()
-
-	if _, err := svc.Write(context.Background(), scope, "mem-match",
-		svcWriteArgs("the quick brown fox")); err != nil {
+	if _, err := svc.Write(context.Background(), scope, "search-retired", writeArgs("needle body", "run-1", "call-1")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-
-	resp, err := svc.Search(context.Background(), scope, memory.MemorySearchArgs{
-		Pattern: "quick brown",
-		Scope:   memory.ScopeThread,
-	})
+	if _, err := svc.Retire(context.Background(), scope, memory.MemoryRetireArgs{
+		MemoryID: "search-retired", Scope: memory.ScopeThread, ExpectedRevision: i(1), Reason: "hide",
+		RunID: "run-1", ToolCallID: "retire-1",
+	}); err != nil {
+		t.Fatalf("Retire: %v", err)
+	}
+	activeOnly, err := svc.Search(context.Background(), scope, memory.MemorySearchArgs{Pattern: "needle", Scope: memory.ScopeThread})
 	if err != nil {
-		t.Fatalf("Search: %v", err)
+		t.Fatalf("Search active: %v", err)
 	}
-	if len(resp.Results) == 0 {
-		t.Fatal("expected at least 1 search result")
+	if len(activeOnly.Results) != 0 {
+		t.Fatalf("expected retired memory hidden, got %+v", activeOnly.Results)
 	}
-	if resp.Results[0].MemoryID != "mem-match" {
-		t.Errorf("MemoryID: got %q, want %q", resp.Results[0].MemoryID, "mem-match")
+	withRetired, err := svc.Search(context.Background(), scope, memory.MemorySearchArgs{Pattern: "needle", Scope: memory.ScopeThread, IncludeRetired: true})
+	if err != nil {
+		t.Fatalf("Search retired: %v", err)
+	}
+	if len(withRetired.Results) != 1 || !withRetired.Results[0].Retired || withRetired.Results[0].Revision != 2 {
+		t.Fatalf("retired search results = %+v", withRetired.Results)
 	}
 }
 
-func TestServiceSearchReturnsEmptyOnNoMatch(t *testing.T) {
+func TestServiceBlobDedupeSearchReturnsAllMemories(t *testing.T) {
 	t.Parallel()
 	svc, _, _ := newSearchSvc(t)
 	scope := validScope()
-
-	if _, err := svc.Write(context.Background(), scope, "mem-nomatch",
-		svcWriteArgs("something unrelated")); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	resp, err := svc.Search(context.Background(), scope, memory.MemorySearchArgs{
-		Pattern: "zzznomatchzzz",
-		Scope:   memory.ScopeThread,
-	})
-	if err != nil {
-		t.Fatalf("Search: %v", err)
-	}
-	if len(resp.Results) != 0 {
-		t.Errorf("expected 0 results, got %d", len(resp.Results))
-	}
-}
-
-// ── Cleanup worker ────────────────────────────────────────────────────────────
-
-func TestCleanupSoftDeletesExpiredRecords(t *testing.T) {
-	t.Parallel()
-	svc, root, meta := newSvc(t)
-	scope := validScope()
-
-	writeExpiredDoc(t, root, scope, "mem-cleanup", meta)
-
-	// runCleanup is unexported; trigger via a very short-interval worker.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	svc.StartCleanupWorker(ctx, 10*time.Millisecond)
-	time.Sleep(50 * time.Millisecond) // let at least one tick fire
-
-	// Record must now be invisible to agents.
-	doc, err := meta.FindOne(context.Background(), scope.AgentID, memory.ScopeThread, "mem-cleanup")
-	if err != nil {
-		t.Fatalf("FindOne after cleanup: %v", err)
-	}
-	if doc != nil {
-		t.Error("expected soft-deleted record to be invisible (FindOne should return nil)")
-	}
-}
-
-func TestCleanupSkipsActiveRecords(t *testing.T) {
-	t.Parallel()
-	svc, _, meta := newSvc(t)
-	scope := validScope()
-
-	if _, err := svc.Write(context.Background(), scope, "mem-active", svcWriteArgs("keep me")); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	svc.StartCleanupWorker(ctx, 10*time.Millisecond)
-	time.Sleep(50 * time.Millisecond)
-
-	// Active record must still be visible.
-	doc, err := meta.FindOne(context.Background(), scope.AgentID, memory.ScopeThread, "mem-active")
-	if err != nil {
-		t.Fatalf("FindOne after cleanup: %v", err)
-	}
-	if doc == nil {
-		t.Error("expected active record to still be visible after cleanup sweep")
-	}
-}
-
-func TestCleanupFilePreservedOnDisk(t *testing.T) {
-	t.Parallel()
-	svc, root, meta := newSvc(t)
-	scope := validScope()
-
-	writeExpiredDoc(t, root, scope, "mem-audit", meta)
-
-	path, err := memory.ResolveWritePath(root, scope, memory.ScopeThread, "mem-audit")
-	if err != nil {
-		t.Fatalf("ResolveWritePath: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	svc.StartCleanupWorker(ctx, 10*time.Millisecond)
-	time.Sleep(50 * time.Millisecond)
-
-	// File must still exist on disk after soft-delete.
-	if _, statErr := os.Stat(path); statErr != nil {
-		t.Errorf("expected file to remain on disk for audit, got: %v", statErr)
-	}
-}
-
-func TestServiceSearchRespectsLimit(t *testing.T) {
-	t.Parallel()
-	svc, _, _ := newSearchSvc(t)
-	scope := validScope()
-
-	for i, id := range []string{"mem-sl1", "mem-sl2", "mem-sl3"} {
-		if _, err := svc.Write(context.Background(), scope, id,
-			svcWriteArgs(fmt.Sprintf("targetword doc number %d", i+1))); err != nil {
+	for idx, id := range []string{"same-1", "same-2"} {
+		if _, err := svc.Write(context.Background(), scope, id, writeArgs("shared needle body", fmt.Sprintf("run-%d", idx), fmt.Sprintf("call-%d", idx))); err != nil {
 			t.Fatalf("Write %s: %v", id, err)
 		}
 	}
-
-	limit := 2
-	resp, err := svc.Search(context.Background(), scope, memory.MemorySearchArgs{
-		Pattern: "targetword",
-		Scope:   memory.ScopeThread,
-		Limit:   &limit,
-	})
+	resp, err := svc.Search(context.Background(), scope, memory.MemorySearchArgs{Pattern: "needle", Scope: memory.ScopeThread})
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if len(resp.Results) > 2 {
-		t.Errorf("expected at most 2 results with limit=2, got %d", len(resp.Results))
+	if len(resp.Results) != 2 {
+		t.Fatalf("expected both deduped blob memories, got %+v", resp.Results)
+	}
+}
+
+func TestServiceConcurrentPatchOneWins(t *testing.T) {
+	t.Parallel()
+	svc, _, _, _ := newSvc(t)
+	scope := validScope()
+	if _, err := svc.Write(context.Background(), scope, "race", writeArgs("hello world", "run-1", "call-1")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for n := 0; n < 2; n++ {
+		n := n
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := svc.Patch(context.Background(), scope, memory.MemoryPatchArgs{
+				MemoryID: "race", Scope: memory.ScopeThread, ExpectedRevision: i(1), Reason: "race",
+				Edits: []memory.MemoryPatchEdit{{OldText: "world", NewText: fmt.Sprintf("world-%d", n)}},
+				RunID: "run-race", ToolCallID: fmt.Sprintf("patch-%d", n),
+			})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	successes := 0
+	conflicts := 0
+	for err := range errs {
+		if err == nil {
+			successes++
+		} else if errors.Is(err, memory.ErrRevisionConflict) {
+			conflicts++
+		} else {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("success/conflict = %d/%d, want 1/1", successes, conflicts)
+	}
+}
+
+func TestCleanupWorkerNoopsForVersionedMemories(t *testing.T) {
+	t.Parallel()
+	svc, _, meta, _ := newSvc(t)
+	scope := validScope()
+	if _, err := svc.Write(context.Background(), scope, "cleanup", writeArgs("keep projection", "run-1", "call-1")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.StartCleanupWorker(ctx, 10*time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	lineage, _ := memory.LineageKey(scope, memory.ScopeThread, "cleanup")
+	if meta.records[lineage] == nil {
+		t.Fatal("cleanup worker should not delete projection rows")
 	}
 }

@@ -29,6 +29,7 @@ func NewMemoryMetaRepo(col *mongo.Collection) *MemoryMetaRepo {
 // deleted_at is set by the cleanup worker when a record expires; it is never
 // unset except by a new Upsert (agent re-writing the same memory slot).
 type memoryMetaBSON struct {
+	LineageKey string     `bson:"lineage_key"`
 	UserID     string     `bson:"user_id"`
 	AgentID    string     `bson:"agent_id"`
 	ThreadID   string     `bson:"thread_id"`
@@ -36,156 +37,111 @@ type memoryMetaBSON struct {
 	Scope      string     `bson:"scope"`
 	Type       string     `bson:"type"`
 	Importance float64    `bson:"importance"`
+	Revision   int        `bson:"revision"`
+	BodySHA    string     `bson:"body_sha"`
 	CreatedAt  time.Time  `bson:"created_at"`
+	UpdatedAt  time.Time  `bson:"updated_at"`
 	ExpiresAt  *time.Time `bson:"expires_at"`
+	RetiredAt  *time.Time `bson:"retired_at"`
 	LastReadAt *time.Time `bson:"last_read_at"`
 	DeletedAt  *time.Time `bson:"deleted_at"`
 	Summary    string     `bson:"summary,omitempty"`
 }
 
 func (r *MemoryMetaRepo) EnsureIndexes(ctx context.Context) error {
-	// Primary lookup for ScopeAgent / ScopeThread: unique per
-	// (agent_id, scope, memory_id). ScopeUser duplicates are prevented
-	// separately by the partial user-scope index below.
-	_, err := r.col.Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys: bson.D{
-			{Key: "agent_id", Value: 1},
-			{Key: "scope", Value: 1},
-			{Key: "memory_id", Value: 1},
-		},
-		Options: options.Index().SetUnique(true),
-	})
-	if err != nil {
-		return fmt.Errorf("memory_meta_repo: primary index: %w", err)
-	}
+	_ = r.col.Indexes().DropOne(ctx, "agent_id_1_scope_1_memory_id_1")
+	_ = r.col.Indexes().DropOne(ctx, "user_scope_unique")
 
-	// Partial unique index for ScopeUser: exactly one record per
-	// (user_id, memory_id) when scope == "user", regardless of which
-	// agent originally wrote it. This makes user-scope identity
-	// consistent across the read/write/file-path layers.
-	_, err = r.col.Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys: bson.D{
-			{Key: "user_id", Value: 1},
-			{Key: "memory_id", Value: 1},
+	indexes := []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "lineage_key", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("lineage_unique"),
 		},
-		Options: options.Index().
-			SetUnique(true).
-			SetName("user_scope_unique").
-			SetPartialFilterExpression(bson.D{{Key: "scope", Value: memory.ScopeUser}}),
-	})
-	if err != nil {
-		return fmt.Errorf("memory_meta_repo: user-scope unique index: %w", err)
+		{
+			Keys: bson.D{
+				{Key: "user_id", Value: 1},
+				{Key: "scope", Value: 1},
+				{Key: "memory_id", Value: 1},
+			},
+			Options: options.Index().
+				SetUnique(true).
+				SetName("memory_meta_user_unique").
+				SetPartialFilterExpression(bson.D{{Key: "scope", Value: memory.ScopeUser}}),
+		},
+		{
+			Keys: bson.D{
+				{Key: "user_id", Value: 1},
+				{Key: "agent_id", Value: 1},
+				{Key: "scope", Value: 1},
+				{Key: "memory_id", Value: 1},
+			},
+			Options: options.Index().
+				SetUnique(true).
+				SetName("memory_meta_agent_unique").
+				SetPartialFilterExpression(bson.D{{Key: "scope", Value: memory.ScopeAgent}}),
+		},
+		{
+			Keys: bson.D{
+				{Key: "user_id", Value: 1},
+				{Key: "agent_id", Value: 1},
+				{Key: "thread_id", Value: 1},
+				{Key: "scope", Value: 1},
+				{Key: "memory_id", Value: 1},
+			},
+			Options: options.Index().
+				SetUnique(true).
+				SetName("memory_meta_thread_unique").
+				SetPartialFilterExpression(bson.D{{Key: "scope", Value: memory.ScopeThread}}),
+		},
+		{
+			Keys: bson.D{
+				{Key: "user_id", Value: 1},
+				{Key: "agent_id", Value: 1},
+				{Key: "thread_id", Value: 1},
+				{Key: "scope", Value: 1},
+				{Key: "expires_at", Value: 1},
+				{Key: "retired_at", Value: 1},
+			},
+			Options: options.Index().SetName("memory_meta_visibility"),
+		},
 	}
-
-	// Query index to accelerate FindActive (scope + expiry filter).
-	_, err = r.col.Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys: bson.D{
-			{Key: "agent_id", Value: 1},
-			{Key: "scope", Value: 1},
-			{Key: "expires_at", Value: 1},
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("memory_meta_repo: query index: %w", err)
+	if _, err := r.col.Indexes().CreateMany(ctx, indexes); err != nil {
+		return fmt.Errorf("memory_meta_repo: indexes: %w", err)
 	}
 	return nil
 }
 
-// Upsert creates or updates the metadata for a memory document.
-// last_read_at is intentionally excluded from the $set to preserve the
-// existing stamp value — it is managed exclusively by StampRead.
-// deleted_at is explicitly cleared so that re-writing a previously
-// soft-deleted slot revives it as a live record.
-//
-// For ScopeUser memories the filter is keyed on (user_id, scope, memory_id)
-// — user-scope memories are conceptually attached to the user, not the
-// writing agent. Any other agent overwriting a user-scope memory will
-// update the same metadata row instead of creating a duplicate.
-//
-// For ScopeAgent / ScopeThread memories the filter is keyed on
-// (agent_id, scope, memory_id) as before, preserving per-agent isolation.
+// Upsert projects the latest revision into memory_meta. Projection is
+// monotonic: a stale revision never overwrites a newer cache row, while the
+// same revision can repair summary/body_sha/index fields. last_read_at is
+// preserved because it is managed exclusively by StampRead.
 func (r *MemoryMetaRepo) Upsert(ctx context.Context, doc memory.MemoryDocument) error {
-	var filter bson.D
-	if doc.Scope == memory.ScopeUser {
-		filter = bson.D{
-			{Key: "user_id", Value: doc.UserID},
-			{Key: "scope", Value: doc.Scope},
-			{Key: "memory_id", Value: doc.ID},
-		}
-	} else {
-		filter = bson.D{
-			{Key: "agent_id", Value: doc.AgentID},
-			{Key: "scope", Value: doc.Scope},
-			{Key: "memory_id", Value: doc.ID},
-		}
-	}
-	update := bson.D{{Key: "$set", Value: bson.D{
-		{Key: "user_id", Value: doc.UserID},
-		{Key: "agent_id", Value: doc.AgentID},
-		{Key: "thread_id", Value: doc.ThreadID},
-		{Key: "memory_id", Value: doc.ID},
-		{Key: "scope", Value: doc.Scope},
-		{Key: "type", Value: doc.Type},
-		{Key: "importance", Value: doc.Importance},
-		{Key: "created_at", Value: doc.CreatedAt},
-		{Key: "expires_at", Value: doc.ExpiresAt},
-		{Key: "summary", Value: doc.Summary},
-		{Key: "deleted_at", Value: nil}, // clear any prior soft-delete marker
-	}}}
-	_, err := r.col.UpdateOne(ctx, filter, update, options.UpdateOne().SetUpsert(true))
+	raw, err := fromMemoryDocument(doc)
 	if err != nil {
-		return fmt.Errorf("memory_meta_repo: upsert: %w", err)
+		return err
+	}
+	filter := bson.D{
+		{Key: "lineage_key", Value: raw.LineageKey},
+		{Key: "$or", Value: bson.A{
+			bson.D{{Key: "revision", Value: bson.D{{Key: "$lte", Value: raw.Revision}}}},
+			bson.D{{Key: "revision", Value: bson.D{{Key: "$exists", Value: false}}}},
+		}},
+	}
+	update := bson.D{{Key: "$set", Value: projectionSet(raw)}}
+	_, err = r.col.UpdateOne(ctx, filter, update, options.UpdateOne().SetUpsert(true))
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			// A row either raced in, or an existing newer revision did not match
+			// the revision <= incoming filter. Retry without upsert: this repairs
+			// same/older raced rows and no-ops for newer rows.
+			if _, retryErr := r.col.UpdateOne(ctx, filter, update); retryErr != nil {
+				return fmt.Errorf("memory_meta_repo: retry projection: %w", retryErr)
+			}
+			return nil
+		}
+		return fmt.Errorf("memory_meta_repo: upsert projection: %w", err)
 	}
 	return nil
-}
-
-// FindOneUserScoped returns the user-scoped record (regardless of writer
-// AgentID) for (userID, memoryID), or (nil, nil) when no record exists or
-// the record has been soft-deleted. Cross-agent visibility of ScopeUser
-// memories requires looking up by user_id rather than agent_id.
-//
-// If two agents independently wrote a user-scoped memory with the same
-// memoryID for the same userID (rare but possible — see memory_write_tool's
-// deriveMemoryID), the most recently created record is returned.
-func (r *MemoryMetaRepo) FindOneUserScoped(ctx context.Context, userID, memoryID string) (*memory.MemoryDocument, error) {
-	filter := bson.D{
-		{Key: "user_id", Value: userID},
-		{Key: "scope", Value: memory.ScopeUser},
-		{Key: "memory_id", Value: memoryID},
-		{Key: "deleted_at", Value: nil},
-	}
-	opts := options.FindOne().SetSort(bson.D{{Key: "created_at", Value: -1}})
-	var raw memoryMetaBSON
-	err := r.col.FindOne(ctx, filter, opts).Decode(&raw)
-	if err == mongo.ErrNoDocuments {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("memory_meta_repo: find one user-scoped: %w", err)
-	}
-	doc := toMemoryDocument(raw)
-	return &doc, nil
-}
-
-// FindOne returns the metadata record for (agentID, scope, memoryID),
-// or (nil, nil) when no record exists or the record has been soft-deleted.
-func (r *MemoryMetaRepo) FindOne(ctx context.Context, agentID, scope, memoryID string) (*memory.MemoryDocument, error) {
-	filter := bson.D{
-		{Key: "agent_id", Value: agentID},
-		{Key: "scope", Value: scope},
-		{Key: "memory_id", Value: memoryID},
-		{Key: "deleted_at", Value: nil}, // exclude soft-deleted records
-	}
-	var raw memoryMetaBSON
-	err := r.col.FindOne(ctx, filter).Decode(&raw)
-	if err == mongo.ErrNoDocuments {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("memory_meta_repo: find one: %w", err)
-	}
-	doc := toMemoryDocument(raw)
-	return &doc, nil
 }
 
 // FindActive returns all non-expired, non-soft-deleted metadata records
@@ -194,7 +150,7 @@ func (r *MemoryMetaRepo) FindOne(ctx context.Context, agentID, scope, memoryID s
 //	thread → thread records for this agent+thread
 //	agent  → agent records for this agent + thread records above
 //	user   → user records for this user + agent + thread records above
-func (r *MemoryMetaRepo) FindActive(ctx context.Context, execScope runtimectx.MemoryScope, searchScope string, typeFilter *string, now time.Time) ([]memory.MemoryDocument, error) {
+func (r *MemoryMetaRepo) FindActive(ctx context.Context, execScope runtimectx.MemoryScope, searchScope string, typeFilter *string, includeRetired bool, now time.Time) ([]memory.MemoryDocument, error) {
 	scopeConditions := buildScopeConditions(execScope, searchScope)
 	if len(scopeConditions) == 0 {
 		return nil, fmt.Errorf("memory_meta_repo: unknown search scope %q", searchScope)
@@ -210,6 +166,9 @@ func (r *MemoryMetaRepo) FindActive(ctx context.Context, execScope runtimectx.Me
 		bson.D{{Key: "$or", Value: scopeConditions}},
 		expiryFilter,
 		bson.D{{Key: "deleted_at", Value: nil}}, // exclude soft-deleted records
+	}
+	if !includeRetired {
+		andClauses = append(andClauses, bson.D{{Key: "retired_at", Value: nil}})
 	}
 	if typeFilter != nil {
 		andClauses = append(andClauses, bson.D{{Key: "type", Value: *typeFilter}})
@@ -238,11 +197,14 @@ func (r *MemoryMetaRepo) FindActive(ctx context.Context, execScope runtimectx.Me
 
 // StampRead sets last_read_at to now for (agentID, scope, memoryID).
 // It only updates existing records — if no record is found the call is a no-op.
-func (r *MemoryMetaRepo) StampRead(ctx context.Context, agentID, scope, memoryID string) error {
-	filter := bson.D{
-		{Key: "agent_id", Value: agentID},
-		{Key: "scope", Value: scope},
-		{Key: "memory_id", Value: memoryID},
+func (r *MemoryMetaRepo) StampRead(ctx context.Context, doc memory.MemoryDocument) error {
+	filter := bson.D{{Key: "lineage_key", Value: doc.LineageKey}}
+	if doc.LineageKey == "" {
+		filter = bson.D{
+			{Key: "agent_id", Value: doc.AgentID},
+			{Key: "scope", Value: doc.Scope},
+			{Key: "memory_id", Value: doc.ID},
+		}
 	}
 	update := bson.D{{Key: "$set", Value: bson.D{
 		{Key: "last_read_at", Value: time.Now().UTC()},
@@ -310,11 +272,13 @@ func (r *MemoryMetaRepo) SoftDelete(ctx context.Context, agentID, scope, memoryI
 // that cover all memory scopes visible at that level.
 func buildScopeConditions(execScope runtimectx.MemoryScope, searchScope string) bson.A {
 	threadCond := bson.D{
+		{Key: "user_id", Value: execScope.UserID},
 		{Key: "agent_id", Value: execScope.AgentID},
 		{Key: "thread_id", Value: execScope.ThreadID},
 		{Key: "scope", Value: memory.ScopeThread},
 	}
 	agentCond := bson.D{
+		{Key: "user_id", Value: execScope.UserID},
 		{Key: "agent_id", Value: execScope.AgentID},
 		{Key: "scope", Value: memory.ScopeAgent},
 	}
@@ -337,6 +301,7 @@ func buildScopeConditions(execScope runtimectx.MemoryScope, searchScope string) 
 
 func toMemoryDocument(raw memoryMetaBSON) memory.MemoryDocument {
 	return memory.MemoryDocument{
+		LineageKey: raw.LineageKey,
 		UserID:     raw.UserID,
 		AgentID:    raw.AgentID,
 		ThreadID:   raw.ThreadID,
@@ -344,9 +309,78 @@ func toMemoryDocument(raw memoryMetaBSON) memory.MemoryDocument {
 		Type:       raw.Type,
 		Scope:      raw.Scope,
 		Importance: raw.Importance,
+		Revision:   raw.Revision,
+		BodySHA:    raw.BodySHA,
 		CreatedAt:  raw.CreatedAt,
+		UpdatedAt:  raw.UpdatedAt,
 		ExpiresAt:  raw.ExpiresAt,
+		RetiredAt:  raw.RetiredAt,
 		LastReadAt: raw.LastReadAt,
 		Summary:    raw.Summary,
+	}
+}
+
+func fromMemoryDocument(doc memory.MemoryDocument) (memoryMetaBSON, error) {
+	lineageKey := doc.LineageKey
+	if lineageKey == "" {
+		key, err := memory.LineageKey(runtimectx.MemoryScope{
+			UserID:   doc.UserID,
+			AgentID:  doc.AgentID,
+			ThreadID: doc.ThreadID,
+		}, doc.Scope, doc.ID)
+		if err != nil {
+			return memoryMetaBSON{}, fmt.Errorf("memory_meta_repo: lineage key: %w", err)
+		}
+		lineageKey = key
+	}
+	revision := doc.Revision
+	if revision <= 0 {
+		revision = 1
+	}
+	updatedAt := doc.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = doc.CreatedAt
+	}
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
+	return memoryMetaBSON{
+		LineageKey: lineageKey,
+		UserID:     doc.UserID,
+		AgentID:    doc.AgentID,
+		ThreadID:   doc.ThreadID,
+		MemoryID:   doc.ID,
+		Scope:      doc.Scope,
+		Type:       doc.Type,
+		Importance: doc.Importance,
+		Revision:   revision,
+		BodySHA:    doc.BodySHA,
+		CreatedAt:  doc.CreatedAt,
+		UpdatedAt:  updatedAt,
+		ExpiresAt:  doc.ExpiresAt,
+		RetiredAt:  doc.RetiredAt,
+		LastReadAt: doc.LastReadAt,
+		Summary:    doc.Summary,
+	}, nil
+}
+
+func projectionSet(raw memoryMetaBSON) bson.D {
+	return bson.D{
+		{Key: "lineage_key", Value: raw.LineageKey},
+		{Key: "user_id", Value: raw.UserID},
+		{Key: "agent_id", Value: raw.AgentID},
+		{Key: "thread_id", Value: raw.ThreadID},
+		{Key: "memory_id", Value: raw.MemoryID},
+		{Key: "scope", Value: raw.Scope},
+		{Key: "type", Value: raw.Type},
+		{Key: "importance", Value: raw.Importance},
+		{Key: "revision", Value: raw.Revision},
+		{Key: "body_sha", Value: raw.BodySHA},
+		{Key: "created_at", Value: raw.CreatedAt},
+		{Key: "updated_at", Value: raw.UpdatedAt},
+		{Key: "expires_at", Value: raw.ExpiresAt},
+		{Key: "retired_at", Value: raw.RetiredAt},
+		{Key: "deleted_at", Value: raw.DeletedAt},
+		{Key: "summary", Value: raw.Summary},
 	}
 }

@@ -202,7 +202,7 @@ func (cb *ContextBuilder) renderUserPreferences(ctx context.Context, runCtx RunC
 	if execScope.UserID == "" {
 		return "", nil
 	}
-	docs, err := cb.metaStore.FindActive(ctx, execScope, memory.ScopeUser, nil, cb.now())
+	docs, err := cb.metaStore.FindActive(ctx, execScope, memory.ScopeUser, nil, false, cb.now())
 	if err != nil {
 		return "", fmt.Errorf("context builder: find user memories: %w", err)
 	}
@@ -352,7 +352,7 @@ func (cb *ContextBuilder) renderMemoriesIndex(ctx context.Context, runCtx RunCon
 	if execScope.UserID == "" || execScope.AgentID == "" {
 		return "", nil
 	}
-	docs, err := cb.metaStore.FindActive(ctx, execScope, memory.ScopeAgent, nil, cb.now())
+	docs, err := cb.metaStore.FindActive(ctx, execScope, memory.ScopeAgent, nil, false, cb.now())
 	if err != nil {
 		return "", fmt.Errorf("context builder: find agent/thread memories: %w", err)
 	}

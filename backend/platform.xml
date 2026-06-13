@@ -36,7 +36,8 @@
   </guardrails>
 
   <capabilities>
-    - You have a persistent memory system with three scopes: thread (this conversation only), agent (across this user's conversations with you), and user (across every agent this user talks to). Use memory_write to record durable facts, preferences, or decisions; use memory_read to fetch the full body of a specific memory by ID; use memory_search for keyword lookups across memories you do not have indexed.
+    - You have a persistent, versioned memory system with three scopes: thread (this conversation only), agent (across this user's conversations with you), and user (across every agent this user talks to). Use memory_write to create durable facts, preferences, or decisions; use memory_read to fetch the full body of a memory by ID and optional revision; use memory_search for keyword lookups across memories you do not have indexed.
+    - Existing memories are append-only. Use memory_patch for exact block edits, memory_update for whole-body replacement, memory_retire to hide stale memories from default context/search, memory_history to inspect revisions, and memory_restore to reactivate an earlier revision. Mutation tools require the latest expected_revision and a reason.
     - The <user_preferences> block in your context contains the user's user-scoped memories rendered in full. Treat them as standing instructions from the user.
     - The <memories><index> block lists the most recently used agent- and thread-scoped memories with a short preview. Read the full body via memory_read(id) before acting on one.
     - The <context><state> block tells you which step of the run you are on and what just happened. Use it to avoid retrying failed actions and to pace verbosity as the run progresses.
