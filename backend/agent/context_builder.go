@@ -10,6 +10,7 @@ import (
 	"backend/llm"
 	"backend/memory"
 	"backend/runtimectx"
+	"backend/scratchpad"
 )
 
 const (
@@ -59,22 +60,25 @@ const (
 // Build is the single source of truth for both fresh runs and checkpoint
 // resumes — the same system message is produced in either path.
 type ContextBuilder struct {
-	platform   *PlatformConfig
-	memService *memory.Service
-	metaStore  memory.MetaStore
-	now        func() time.Time
+	platform      *PlatformConfig
+	memService    *memory.Service
+	metaStore     memory.MetaStore
+	scratchpadSvc *scratchpad.Service
+	now           func() time.Time
 }
 
 func NewContextBuilder(
 	platform *PlatformConfig,
 	memSvc *memory.Service,
 	metaStore memory.MetaStore,
+	scratchpadSvc *scratchpad.Service,
 ) *ContextBuilder {
 	return &ContextBuilder{
-		platform:   platform,
-		memService: memSvc,
-		metaStore:  metaStore,
-		now:        func() time.Time { return time.Now().UTC() },
+		platform:      platform,
+		memService:    memSvc,
+		metaStore:     metaStore,
+		scratchpadSvc: scratchpadSvc,
+		now:           func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -166,7 +170,76 @@ func (cb *ContextBuilder) buildSystemContent(ctx context.Context, agent *Agent, 
 		sb.WriteString(contextBlock)
 	}
 
+	// Collaboration hints are DYNAMIC — they vary per run and MUST stay in the
+	// dynamic suffix (here), never the static prefix above, or they bust the
+	// provider's prompt-prefix cache.
+	if block := cb.renderCollaboration(runCtx); block != "" {
+		sb.WriteString(block)
+	}
+	if block := cb.renderScratchpadPointer(runCtx); block != "" {
+		sb.WriteString(block)
+	}
+
 	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// renderCollaboration emits <collaboration> for a subagent run (ParentRunID
+// set): its place in the delegation tree, the delegated task, and that a shared
+// scratchpad workspace exists. Top-level runs (no parent) get no block. No-ops
+// when the scratchpad service is absent. On resume, the delegated task falls
+// back to the first user message from the checkpoint tail.
+func (cb *ContextBuilder) renderCollaboration(runCtx RunContext) string {
+	if cb.scratchpadSvc == nil || runCtx.ParentRunID == "" {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("<collaboration>\n")
+	sb.WriteString("  You are a subagent collaborating with other agents on one shared task.\n")
+	fmt.Fprintf(&sb, "  parent_run_id: %s\n", escapeXMLContent(runCtx.ParentRunID))
+	fmt.Fprintf(&sb, "  originator_run_id: %s\n", escapeXMLContent(runCtx.OriginatorRunID))
+	if task := delegatedTaskForCollaboration(runCtx); task != "" {
+		fmt.Fprintf(&sb, "  delegated_task: %s\n", escapeXMLContent(task))
+	}
+	sb.WriteString("  A shared scratchpad workspace is available to every agent on this task via the scratchpad_* tools. Publish artifacts other agents need there; to correct another agent, append a section — never edit theirs.\n")
+	sb.WriteString("</collaboration>\n")
+	return sb.String()
+}
+
+func delegatedTaskForCollaboration(runCtx RunContext) string {
+	if task := strings.TrimSpace(runCtx.Input); task != "" {
+		return task
+	}
+	if runCtx.Checkpoint == nil {
+		return ""
+	}
+	for _, msg := range runCtx.Checkpoint.State.Messages {
+		if msg.Role != "user" {
+			continue
+		}
+		if task := strings.TrimSpace(msg.Content); task != "" {
+			return task
+		}
+	}
+	return ""
+}
+
+// renderScratchpadPointer emits a tiny <scratchpad> pointer with the file count
+// for this task's shared workspace — NO section content (discovery is via the
+// scratchpad_* tools). No-ops on a nil service, an unidentified workspace, or
+// an empty workspace.
+func (cb *ContextBuilder) renderScratchpadPointer(runCtx RunContext) string {
+	if cb.scratchpadSvc == nil {
+		return ""
+	}
+	ws := scratchpad.Workspace{UserID: runCtx.Memory.UserID, OriginatorRunID: runCtx.OriginatorRunID}
+	if ws.UserID == "" || ws.OriginatorRunID == "" {
+		return ""
+	}
+	n := cb.scratchpadSvc.CountFiles(ws)
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("<scratchpad>\n  files: %d (use scratchpad_list to browse this task's shared workspace)\n</scratchpad>\n", n)
 }
 
 // renderToolInstructions emits <tool_instructions> for the run's effective

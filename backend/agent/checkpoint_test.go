@@ -9,7 +9,6 @@ import (
 	"backend/tools"
 )
 
-
 // minimalSnapshot returns a valid snapshot that can be tweaked per test.
 func minimalSnapshot() RunSnapshot {
 	return RunSnapshot{

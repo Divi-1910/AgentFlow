@@ -9,6 +9,7 @@ import (
 
 	"backend/llm"
 	"backend/memory"
+	"backend/scratchpad"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -17,7 +18,7 @@ type ToolRegistry struct {
 	tools map[string]Tool
 }
 
-func NewToolRegistry(redisClient *redis.Client, memorySvc *memory.Service) *ToolRegistry {
+func NewToolRegistry(redisClient *redis.Client, memorySvc *memory.Service, scratchpadSvc *scratchpad.Service) *ToolRegistry {
 	r := &ToolRegistry{
 		tools: make(map[string]Tool),
 	}
@@ -45,6 +46,17 @@ func NewToolRegistry(redisClient *redis.Client, memorySvc *memory.Service) *Tool
 		r.Register(NewMemoryRestoreTool(memorySvc))
 		r.Register(NewMemoryHistoryTool(memorySvc))
 		slog.Info("tool registered", "name", "memory_write,memory_read,memory_search,memory_patch,memory_update,memory_retire,memory_restore,memory_history")
+	}
+
+	if scratchpadSvc != nil {
+		r.Register(NewScratchpadCreateTool(scratchpadSvc))
+		r.Register(NewScratchpadAppendTool(scratchpadSvc))
+		r.Register(NewScratchpadReplaceTool(scratchpadSvc))
+		r.Register(NewScratchpadListTool(scratchpadSvc))
+		r.Register(NewScratchpadGetSectionsTool(scratchpadSvc))
+		r.Register(NewScratchpadReadSectionTool(scratchpadSvc))
+		r.Register(NewScratchpadSearchTool(scratchpadSvc))
+		slog.Info("tool registered", "name", "scratchpad_create,scratchpad_append_section,scratchpad_replace_section,scratchpad_list,scratchpad_get_sections,scratchpad_read_section,scratchpad_search")
 	}
 
 	slog.Info("tool registry ready", "count", len(r.tools))

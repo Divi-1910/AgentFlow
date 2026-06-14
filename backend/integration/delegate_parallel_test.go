@@ -185,6 +185,7 @@ func TestSameTargetDelegateBatchUsesMongoSubThreadHistory(t *testing.T) {
 		&agent.PlatformConfig{Body: "<platform>integration test</platform>"},
 		nil,
 		nil,
+		nil,
 	)
 	runtime := agent.NewAgentRuntime(llmReg, toolReg, contextBuilder).WithCheckpointStore(runRepo)
 
@@ -347,6 +348,7 @@ func TestSyncDelegateRunBudgetLimitsSupervisorFanout(t *testing.T) {
 	toolReg := tools.NewEmptyRegistry()
 	contextBuilder := agent.NewContextBuilder(
 		&agent.PlatformConfig{Body: "<platform>integration test</platform>"},
+		nil,
 		nil,
 		nil,
 	)

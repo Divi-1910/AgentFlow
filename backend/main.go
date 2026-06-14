@@ -10,6 +10,7 @@ import (
 	"backend/memory"
 	"backend/middleware"
 	"backend/repository"
+	"backend/scratchpad"
 	"backend/tools"
 	"context"
 	"encoding/json"
@@ -128,7 +129,13 @@ func main() {
 	}
 	memorySvc.StartCleanupWorker(appCtx, 7*24*time.Hour)
 
-	toolRegistry := tools.NewToolRegistry(db.GetRedis(), memorySvc)
+	scratchpadSvc, err := scratchpad.NewServiceFromEnv()
+	if err != nil {
+		slog.Error("failed to initialize scratchpad service", "error", err)
+		os.Exit(1)
+	}
+
+	toolRegistry := tools.NewToolRegistry(db.GetRedis(), memorySvc, scratchpadSvc)
 
 	llmModelRepo := repository.NewLLMModelRepo(llmRegistryCol)
 	llmHandler := handlers.NewLLMHandler(llmModelRepo, llmRegistry)
@@ -167,7 +174,7 @@ func main() {
 		slog.Error("failed to load platform config", "error", err, "path", platformPath)
 		os.Exit(1)
 	}
-	contextBuilder := agent.NewContextBuilder(platformCfg, memorySvc, memoryMetaRepo)
+	contextBuilder := agent.NewContextBuilder(platformCfg, memorySvc, memoryMetaRepo, scratchpadSvc)
 	agentRuntime := agent.NewAgentRuntime(llmRegistry, toolRegistry, contextBuilder).WithCheckpointStore(runRepo)
 	agentRuntime.SetAsyncJobStore(jobRepo)
 	summarizer := agent.NewSummarizer(llmRegistry)

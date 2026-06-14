@@ -7,42 +7,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"backend/fsatomic"
 )
 
-func EnsureDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("memory: ensure dir: %w", err)
-	}
-	return nil
-}
-
-// WriteFileAtomic writes content to path atomically via a temp-file rename.
-// Parent directories are created as needed.
-func WriteFileAtomic(path, content string) error {
-	dir := filepath.Dir(path)
-	if err := EnsureDir(dir); err != nil {
-		return err
-	}
-
-	tmp, err := os.CreateTemp(dir, ".memory-*")
-	if err != nil {
-		return fmt.Errorf("memory: create temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-
-	if _, err := tmp.WriteString(content); err != nil {
-		tmp.Close()
-		return fmt.Errorf("memory: write temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("memory: close temp file: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("memory: rename temp file: %w", err)
-	}
-	return nil
-}
+// EnsureDir and WriteFileAtomic are re-exported from the shared fsatomic
+// package (which the scratchpad subsystem also uses) so existing memory
+// callers and tests keep working unchanged.
+func EnsureDir(dir string) error                 { return fsatomic.EnsureDir(dir) }
+func WriteFileAtomic(path, content string) error { return fsatomic.WriteFileAtomic(path, content) }
 
 // ReadFileLimited reads path up to maxBytes. Returns ErrMemoryNotFound when
 // the file does not exist, and ErrInvalidDocument when it exceeds maxBytes.

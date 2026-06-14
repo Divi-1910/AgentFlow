@@ -592,7 +592,7 @@ func TestResumeFromPostModelPhaseSkipsInitialLLMCall(t *testing.T) {
 			ToolFailures:   map[string]int{},
 		},
 		Meta: SnapshotMeta{
-			Phase:     PhasePostModel,
+			Phase:          PhasePostModel,
 			EffectiveTools: ToolRefList{{Name: "calculator"}},
 		},
 	}
@@ -640,7 +640,7 @@ func TestResumeFromPreModelPhaseCallsLLMNormally(t *testing.T) {
 			ToolFailures:   map[string]int{},
 		},
 		Meta: SnapshotMeta{
-			Phase:     PhasePreModel,
+			Phase:          PhasePreModel,
 			EffectiveTools: ToolRefList{{Name: "calculator"}},
 		},
 	}
