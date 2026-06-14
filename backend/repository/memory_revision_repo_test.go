@@ -27,7 +27,7 @@ func revisionFor(t *testing.T, scope runtimectx.MemoryScope, memoryID string, re
 		t.Fatalf("LineageKey: %v", err)
 	}
 	now := time.Now().UTC()
-	return memory.MemoryRevision{
+	rev := memory.MemoryRevision{
 		LineageKey: lineageKey,
 		Revision:   revision,
 		MutationID: mutationID,
@@ -41,10 +41,15 @@ func revisionFor(t *testing.T, scope runtimectx.MemoryScope, memoryID string, re
 		Scope:      memory.ScopeThread,
 		Type:       memory.TypeFact,
 		Importance: 0.5,
-		BodySHA:    memory.BodySHA("body"),
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
+	bodyPath, err := memory.RevisionBodyRelPath(rev)
+	if err != nil {
+		t.Fatalf("RevisionBodyRelPath: %v", err)
+	}
+	rev.BodyPath = bodyPath
+	return rev
 }
 
 func TestMemoryRevisionRepoAppendCASConflict(t *testing.T) {
@@ -57,8 +62,15 @@ func TestMemoryRevisionRepoAppendCASConflict(t *testing.T) {
 	if _, _, err := repo.Append(ctx, rev); err != nil {
 		t.Fatalf("Append first: %v", err)
 	}
+	got, err := repo.FindRevision(ctx, rev.LineageKey, 1)
+	if err != nil {
+		t.Fatalf("FindRevision: %v", err)
+	}
+	if got == nil || got.BodyPath != rev.BodyPath {
+		t.Fatalf("BodyPath round trip = %+v, want %q", got, rev.BodyPath)
+	}
 	conflict := revisionFor(t, scope, "mem", 1, "run-1:call-2")
-	_, _, err := repo.Append(ctx, conflict)
+	_, _, err = repo.Append(ctx, conflict)
 	if !errors.Is(err, memory.ErrRevisionConflict) {
 		t.Fatalf("expected ErrRevisionConflict, got %v", err)
 	}

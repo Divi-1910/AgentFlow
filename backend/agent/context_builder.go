@@ -397,8 +397,8 @@ func (cb *ContextBuilder) renderMemoriesIndex(ctx context.Context, runCtx RunCon
 	return sb.String(), nil
 }
 
-// readBody fetches a memory body via Service.ReadByMeta, which uses the
-// document's own UserID/AgentID for path resolution. This is critical for
+// readBody fetches a memory body via Service.ReadByMeta, which reads the
+// projected body_path from the document's own metadata. This is critical for
 // user-scoped memories: they may have been written by a different agent for
 // the same user, so the current run's AgentID must not gate access.
 // ReadByMeta also does not stamp last_read_at — appropriate for context

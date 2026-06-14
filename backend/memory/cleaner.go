@@ -8,7 +8,7 @@ import (
 
 // StartCleanupWorker preserves the old startup hook. Versioned memories do not
 // need expiry cleanup: read/search enforce expiry against the latest revision
-// and immutable blobs/revisions are intentionally retained.
+// and immutable revision files are intentionally retained.
 func (s *Service) StartCleanupWorker(ctx context.Context, interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)

@@ -36,7 +36,7 @@ type memoryRevisionBSON struct {
 	Scope        string     `bson:"scope"`
 	Type         string     `bson:"type"`
 	Importance   float64    `bson:"importance"`
-	BodySHA      string     `bson:"body_sha"`
+	BodyPath     string     `bson:"body_path"`
 	CreatedAt    time.Time  `bson:"created_at"`
 	UpdatedAt    time.Time  `bson:"updated_at"`
 	ExpiresAt    *time.Time `bson:"expires_at,omitempty"`
@@ -169,7 +169,7 @@ func fromMemoryRevision(rev memory.MemoryRevision) memoryRevisionBSON {
 		Scope:        rev.Scope,
 		Type:         rev.Type,
 		Importance:   rev.Importance,
-		BodySHA:      rev.BodySHA,
+		BodyPath:     rev.BodyPath,
 		CreatedAt:    rev.CreatedAt,
 		UpdatedAt:    rev.UpdatedAt,
 		ExpiresAt:    rev.ExpiresAt,
@@ -194,7 +194,7 @@ func toMemoryRevision(raw memoryRevisionBSON) memory.MemoryRevision {
 		Scope:        raw.Scope,
 		Type:         raw.Type,
 		Importance:   raw.Importance,
-		BodySHA:      raw.BodySHA,
+		BodyPath:     raw.BodyPath,
 		CreatedAt:    raw.CreatedAt,
 		UpdatedAt:    raw.UpdatedAt,
 		ExpiresAt:    raw.ExpiresAt,

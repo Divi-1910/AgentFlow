@@ -24,6 +24,26 @@ func repoScope() runtimectx.MemoryScope {
 	return runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-1", ThreadID: "thread-1"}
 }
 
+func bodyPathForDoc(t *testing.T, doc memory.MemoryDocument) string {
+	t.Helper()
+	revision := doc.Revision
+	if revision <= 0 {
+		revision = 1
+	}
+	bodyPath, err := memory.RevisionBodyRelPath(memory.MemoryRevision{
+		UserID:   doc.UserID,
+		AgentID:  doc.AgentID,
+		ThreadID: doc.ThreadID,
+		MemoryID: doc.ID,
+		Scope:    doc.Scope,
+		Revision: revision,
+	})
+	if err != nil {
+		t.Fatalf("RevisionBodyRelPath: %v", err)
+	}
+	return bodyPath
+}
+
 func findProjected(t *testing.T, repo *repository.MemoryMetaRepo, execScope runtimectx.MemoryScope, docScope, memoryID string) *memory.MemoryDocument {
 	t.Helper()
 	docs, err := repo.FindActive(context.Background(), execScope, docScope, nil, true, time.Now().UTC())
@@ -55,8 +75,10 @@ func TestMemoryMetaRepoUpsertAndFindActiveProjection(t *testing.T) {
 		Type:       memory.TypeFact,
 		Scope:      memory.ScopeThread,
 		Importance: 0.8,
+		Revision:   1,
 		CreatedAt:  now,
 	}
+	doc.BodyPath = bodyPathForDoc(t, doc)
 
 	if err := repo.Upsert(ctx, doc); err != nil {
 		t.Fatalf("Upsert: %v", err)
@@ -77,6 +99,9 @@ func TestMemoryMetaRepoUpsertAndFindActiveProjection(t *testing.T) {
 	}
 	if got.AgentID != scope.AgentID {
 		t.Errorf("AgentID: got %q, want %q", got.AgentID, scope.AgentID)
+	}
+	if got.BodyPath != doc.BodyPath {
+		t.Errorf("BodyPath: got %q, want %q", got.BodyPath, doc.BodyPath)
 	}
 }
 

@@ -66,7 +66,7 @@ type MemoryDocument struct {
 	Scope      string
 	Importance float64
 	Revision   int
-	BodySHA    string
+	BodyPath   string
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
 	ExpiresAt  *time.Time
@@ -95,7 +95,7 @@ type MemoryRevision struct {
 	Scope        string
 	Type         string
 	Importance   float64
-	BodySHA      string
+	BodyPath     string
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	ExpiresAt    *time.Time
@@ -285,7 +285,7 @@ type HistoryRevision struct {
 	Operation    string  `json:"operation"`
 	Reason       string  `json:"reason,omitempty"`
 	RestoredFrom *int    `json:"restored_from,omitempty"`
-	BodySHA      string  `json:"body_sha"`
+	BodyPath     string  `json:"body_path"`
 	Type         string  `json:"type"`
 	Importance   float64 `json:"importance"`
 	Retired      bool    `json:"retired"`

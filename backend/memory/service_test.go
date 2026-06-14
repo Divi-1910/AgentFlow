@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -139,9 +141,47 @@ func writeArgs(content, runID, toolCallID string) memory.MemoryWriteArgs {
 
 func i(v int) *int { return &v }
 
+func revisionByNumber(t *testing.T, revisions *memory.InMemoryRevisionStore, scope runtimectx.MemoryScope, memoryID string, revision int) memory.MemoryRevision {
+	t.Helper()
+	lineage, err := memory.LineageKey(scope, memory.ScopeThread, memoryID)
+	if err != nil {
+		t.Fatalf("LineageKey: %v", err)
+	}
+	rev, err := revisions.FindRevision(context.Background(), lineage, revision)
+	if err != nil {
+		t.Fatalf("FindRevision: %v", err)
+	}
+	if rev == nil {
+		t.Fatalf("revision %d not found for %s", revision, memoryID)
+	}
+	return *rev
+}
+
+func assertRevisionFile(t *testing.T, root string, rev memory.MemoryRevision, wantBody string) string {
+	t.Helper()
+	path, err := memory.RevisionBodyPath(root, rev)
+	if err != nil {
+		t.Fatalf("RevisionBodyPath: %v", err)
+	}
+	if rev.BodyPath == "" {
+		t.Fatal("revision BodyPath is empty")
+	}
+	if filepath.Join(root, rev.BodyPath) != path {
+		t.Fatalf("BodyPath = %q, want relative path for %s", rev.BodyPath, path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile %s: %v", path, err)
+	}
+	if strings.TrimSpace(string(data)) != wantBody {
+		t.Fatalf("revision file body = %q, want %q", strings.TrimSpace(string(data)), wantBody)
+	}
+	return path
+}
+
 func TestServiceWriteReadAndHistory(t *testing.T) {
 	t.Parallel()
-	svc, _, meta, _ := newSvc(t)
+	svc, root, meta, revisions := newSvc(t)
 	scope := validScope()
 
 	wr, err := svc.Write(context.Background(), scope, "mem-rt", writeArgs("hello world", "run-1", "call-1"))
@@ -150,6 +190,11 @@ func TestServiceWriteReadAndHistory(t *testing.T) {
 	}
 	if wr.Revision != 1 {
 		t.Fatalf("revision = %d, want 1", wr.Revision)
+	}
+	rev1 := revisionByNumber(t, revisions, scope, "mem-rt", 1)
+	path1 := assertRevisionFile(t, root, rev1, "hello world")
+	if filepath.Base(path1) != "mem-rt_rev-1.md" {
+		t.Fatalf("revision filename = %s, want mem-rt_rev-1.md", filepath.Base(path1))
 	}
 
 	read, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "mem-rt", Scope: memory.ScopeThread})
@@ -171,6 +216,9 @@ func TestServiceWriteReadAndHistory(t *testing.T) {
 	}
 	if len(history.Revisions) != 1 || history.Revisions[0].Operation != memory.OperationCreate {
 		t.Fatalf("history = %+v, want one create revision", history.Revisions)
+	}
+	if history.Revisions[0].BodyPath != rev1.BodyPath {
+		t.Fatalf("history body_path = %q, want %q", history.Revisions[0].BodyPath, rev1.BodyPath)
 	}
 }
 
@@ -206,7 +254,7 @@ func TestServiceCreateRejectsExistingLineage(t *testing.T) {
 
 func TestServiceMutationReplayAfterHeadMoved(t *testing.T) {
 	t.Parallel()
-	svc, _, _, _ := newSvc(t)
+	svc, root, _, revisions := newSvc(t)
 	scope := validScope()
 	if _, err := svc.Write(context.Background(), scope, "mem", writeArgs("alpha beta", "run-1", "call-1")); err != nil {
 		t.Fatalf("Write: %v", err)
@@ -233,6 +281,45 @@ func TestServiceMutationReplayAfterHeadMoved(t *testing.T) {
 	if replay.Revision != first.Revision {
 		t.Fatalf("replay revision = %d, want %d", replay.Revision, first.Revision)
 	}
+	rev2 := revisionByNumber(t, revisions, scope, "mem", first.Revision)
+	assertRevisionFile(t, root, rev2, "alpha gamma")
+}
+
+func TestServiceReplayFinalizesPendingRevisionFile(t *testing.T) {
+	t.Parallel()
+	svc, root, _, revisions := newSvc(t)
+	scope := validScope()
+	args := writeArgs("pending body", "run-1", "call-1")
+	if _, err := svc.Write(context.Background(), scope, "pending", args); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	rev1 := revisionByNumber(t, revisions, scope, "pending", 1)
+	finalPath, err := memory.RevisionBodyPath(root, rev1)
+	if err != nil {
+		t.Fatalf("RevisionBodyPath: %v", err)
+	}
+	pendingPath, err := memory.PendingBodyPath(root, rev1)
+	if err != nil {
+		t.Fatalf("PendingBodyPath: %v", err)
+	}
+	if err := memory.EnsureDir(filepath.Dir(pendingPath)); err != nil {
+		t.Fatalf("EnsureDir pending: %v", err)
+	}
+	if err := os.Rename(finalPath, pendingPath); err != nil {
+		t.Fatalf("simulate pending body: %v", err)
+	}
+
+	replay, err := svc.Write(context.Background(), scope, "pending", args)
+	if err != nil {
+		t.Fatalf("Write replay: %v", err)
+	}
+	if replay.Revision != 1 {
+		t.Fatalf("replay revision = %d, want 1", replay.Revision)
+	}
+	assertRevisionFile(t, root, rev1, "pending body")
+	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
+		t.Fatalf("pending file should be removed after finalize, stat err=%v", err)
+	}
 }
 
 func TestServiceGeneratedIDsAreRunNamespaced(t *testing.T) {
@@ -255,7 +342,7 @@ func TestServiceGeneratedIDsAreRunNamespaced(t *testing.T) {
 
 func TestServiceCrossThreadSameSlugCoexists(t *testing.T) {
 	t.Parallel()
-	svc, _, _, _ := newSvc(t)
+	svc, _, _, revisions := newSvc(t)
 	threadA := validScope()
 	threadB := runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-1", ThreadID: "thread-2"}
 
@@ -275,6 +362,109 @@ func TestServiceCrossThreadSameSlugCoexists(t *testing.T) {
 	}
 	if readA.Content != "thread A" || readB.Content != "thread B" {
 		t.Fatalf("cross-thread content = %q/%q", readA.Content, readB.Content)
+	}
+	revA := revisionByNumber(t, revisions, threadA, "slug", 1)
+	revB := revisionByNumber(t, revisions, threadB, "slug", 1)
+	if revA.BodyPath == revB.BodyPath {
+		t.Fatalf("cross-thread same memory_id should have separate body paths, both %q", revA.BodyPath)
+	}
+	if !strings.Contains(revA.BodyPath, filepath.Join("thread", "agent-1", "thread-1", "slug")) ||
+		!strings.Contains(revB.BodyPath, filepath.Join("thread", "agent-1", "thread-2", "slug")) {
+		t.Fatalf("unexpected cross-thread body paths: %q / %q", revA.BodyPath, revB.BodyPath)
+	}
+}
+
+func TestServiceLatestReadUsesMongoNotFilenameScanning(t *testing.T) {
+	t.Parallel()
+	svc, root, _, revisions := newSvc(t)
+	scope := validScope()
+	if _, err := svc.Write(context.Background(), scope, "scan", writeArgs("canonical latest", "run-1", "call-1")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	rev1 := revisionByNumber(t, revisions, scope, "scan", 1)
+	path1 := assertRevisionFile(t, root, rev1, "canonical latest")
+	fakeNewest := filepath.Join(filepath.Dir(path1), "scan_rev-99.md")
+	if err := os.WriteFile(fakeNewest, []byte("filesystem fake newest"), 0o644); err != nil {
+		t.Fatalf("WriteFile fake newest: %v", err)
+	}
+
+	read, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "scan", Scope: memory.ScopeThread})
+	if err != nil {
+		t.Fatalf("Read latest: %v", err)
+	}
+	if read.Revision != 1 || read.Content != "canonical latest" {
+		t.Fatalf("latest read = %+v, want Mongo revision 1 body", read)
+	}
+	rev99 := 99
+	if _, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "scan", Scope: memory.ScopeThread, Revision: &rev99}); !errors.Is(err, memory.ErrMemoryNotFound) {
+		t.Fatalf("revision 99 should not be discovered by filename scan, got %v", err)
+	}
+}
+
+func TestServiceHistoricalReadUsesRequestedRevisionFile(t *testing.T) {
+	t.Parallel()
+	svc, root, _, revisions := newSvc(t)
+	scope := validScope()
+	if _, err := svc.Write(context.Background(), scope, "hist", writeArgs("v1", "run-1", "call-1")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if _, err := svc.Patch(context.Background(), scope, memory.MemoryPatchArgs{
+		MemoryID: "hist", Scope: memory.ScopeThread, ExpectedRevision: i(1), Reason: "patch",
+		Edits: []memory.MemoryPatchEdit{{OldText: "v1", NewText: "v2"}},
+		RunID: "run-1", ToolCallID: "patch-1",
+	}); err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	rev1 := revisionByNumber(t, revisions, scope, "hist", 1)
+	rev2 := revisionByNumber(t, revisions, scope, "hist", 2)
+	assertRevisionFile(t, root, rev1, "v1")
+	assertRevisionFile(t, root, rev2, "v2")
+
+	read1, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "hist", Scope: memory.ScopeThread, Revision: i(1)})
+	if err != nil {
+		t.Fatalf("Read rev1: %v", err)
+	}
+	read2, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "hist", Scope: memory.ScopeThread, Revision: i(2)})
+	if err != nil {
+		t.Fatalf("Read rev2: %v", err)
+	}
+	if read1.Content != "v1" || read2.Content != "v2" {
+		t.Fatalf("historical reads = %q/%q, want v1/v2", read1.Content, read2.Content)
+	}
+}
+
+func TestServiceReadMissingBodyPathReturnsClearError(t *testing.T) {
+	t.Parallel()
+	svc, _, _, revisions := newSvc(t)
+	scope := validScope()
+	lineage, err := memory.LineageKey(scope, memory.ScopeThread, "missing-path")
+	if err != nil {
+		t.Fatalf("LineageKey: %v", err)
+	}
+	now := time.Now().UTC()
+	_, _, err = revisions.Append(context.Background(), memory.MemoryRevision{
+		LineageKey: lineage,
+		Revision:   1,
+		MutationID: "run-1:call-1",
+		RunID:      "run-1",
+		ToolCallID: "call-1",
+		Operation:  memory.OperationCreate,
+		UserID:     scope.UserID,
+		AgentID:    scope.AgentID,
+		ThreadID:   scope.ThreadID,
+		MemoryID:   "missing-path",
+		Scope:      memory.ScopeThread,
+		Type:       memory.TypeFact,
+		Importance: 0.5,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	_, err = svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "missing-path", Scope: memory.ScopeThread})
+	if !errors.Is(err, memory.ErrInvalidDocument) || !strings.Contains(err.Error(), "body_path") {
+		t.Fatalf("expected clear body_path error, got %v", err)
 	}
 }
 
@@ -331,31 +521,51 @@ func TestServicePatchValidationAllOrNothing(t *testing.T) {
 
 func TestServiceUpdateRetireRestoreFlow(t *testing.T) {
 	t.Parallel()
-	svc, _, _, _ := newSvc(t)
+	svc, root, _, revisions := newSvc(t)
 	scope := validScope()
 	if _, err := svc.Write(context.Background(), scope, "flow", writeArgs("v1", "run-1", "call-1")); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if _, err := svc.Update(context.Background(), scope, memory.MemoryUpdateArgs{
+	rev1 := revisionByNumber(t, revisions, scope, "flow", 1)
+	assertRevisionFile(t, root, rev1, "v1")
+
+	if _, err := svc.Patch(context.Background(), scope, memory.MemoryPatchArgs{
 		MemoryID: "flow", Scope: memory.ScopeThread, ExpectedRevision: i(1), Reason: "whole body",
+		Edits: []memory.MemoryPatchEdit{{OldText: "v1", NewText: "v1 patched"}},
+		RunID: "run-1", ToolCallID: "patch-1",
+	}); err != nil {
+		t.Fatalf("Patch: %v", err)
+	}
+	rev2 := revisionByNumber(t, revisions, scope, "flow", 2)
+	assertRevisionFile(t, root, rev1, "v1")
+	assertRevisionFile(t, root, rev2, "v1 patched")
+
+	if _, err := svc.Update(context.Background(), scope, memory.MemoryUpdateArgs{
+		MemoryID: "flow", Scope: memory.ScopeThread, ExpectedRevision: i(2), Reason: "whole body",
 		Content: "v2", RunID: "run-1", ToolCallID: "update-1",
 	}); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
+	rev3 := revisionByNumber(t, revisions, scope, "flow", 3)
+	assertRevisionFile(t, root, rev3, "v2")
+
 	retired, err := svc.Retire(context.Background(), scope, memory.MemoryRetireArgs{
-		MemoryID: "flow", Scope: memory.ScopeThread, ExpectedRevision: i(2), Reason: "obsolete",
+		MemoryID: "flow", Scope: memory.ScopeThread, ExpectedRevision: i(3), Reason: "obsolete",
 		RunID: "run-1", ToolCallID: "retire-1",
 	})
 	if err != nil {
 		t.Fatalf("Retire: %v", err)
 	}
-	if !retired.Retired || retired.Revision != 3 {
+	if !retired.Retired || retired.Revision != 4 {
 		t.Fatalf("retire result = %+v", retired)
 	}
+	rev4 := revisionByNumber(t, revisions, scope, "flow", 4)
+	assertRevisionFile(t, root, rev4, "v2")
+
 	if _, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "flow", Scope: memory.ScopeThread}); !errors.Is(err, memory.ErrRetiredMemory) {
 		t.Fatalf("latest read should see retired memory, got %v", err)
 	}
-	historical, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "flow", Scope: memory.ScopeThread, Revision: i(3)})
+	historical, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "flow", Scope: memory.ScopeThread, Revision: i(4)})
 	if err != nil {
 		t.Fatalf("historical retired read: %v", err)
 	}
@@ -363,20 +573,23 @@ func TestServiceUpdateRetireRestoreFlow(t *testing.T) {
 		t.Fatalf("historical retired read = %+v", historical)
 	}
 	restore, err := svc.Restore(context.Background(), scope, memory.MemoryRestoreArgs{
-		MemoryID: "flow", Scope: memory.ScopeThread, ExpectedRevision: i(3), Reason: "restore default",
+		MemoryID: "flow", Scope: memory.ScopeThread, ExpectedRevision: i(4), Reason: "restore default",
 		RunID: "run-1", ToolCallID: "restore-1",
 	})
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
-	if restore.Revision != 4 || restore.Retired {
+	if restore.Revision != 5 || restore.Retired {
 		t.Fatalf("restore result = %+v", restore)
 	}
+	rev5 := revisionByNumber(t, revisions, scope, "flow", 5)
+	assertRevisionFile(t, root, rev5, "v2")
+
 	read, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "flow", Scope: memory.ScopeThread})
 	if err != nil {
 		t.Fatalf("read restored: %v", err)
 	}
-	if read.Content != "v2" || read.Revision != 4 {
+	if read.Content != "v2" || read.Revision != 5 {
 		t.Fatalf("restored read = %+v", read)
 	}
 }
@@ -442,14 +655,19 @@ func TestServiceSearchHidesRetiredUnlessRequested(t *testing.T) {
 	}
 }
 
-func TestServiceBlobDedupeSearchReturnsAllMemories(t *testing.T) {
+func TestServiceSameBodySearchReturnsAllMemories(t *testing.T) {
 	t.Parallel()
-	svc, _, _ := newSearchSvc(t)
+	svc, _, revisions := newSearchSvc(t)
 	scope := validScope()
 	for idx, id := range []string{"same-1", "same-2"} {
 		if _, err := svc.Write(context.Background(), scope, id, writeArgs("shared needle body", fmt.Sprintf("run-%d", idx), fmt.Sprintf("call-%d", idx))); err != nil {
 			t.Fatalf("Write %s: %v", id, err)
 		}
+	}
+	revA := revisionByNumber(t, revisions, scope, "same-1", 1)
+	revB := revisionByNumber(t, revisions, scope, "same-2", 1)
+	if revA.BodyPath == revB.BodyPath {
+		t.Fatalf("same body should still create separate readable files, both %q", revA.BodyPath)
 	}
 	resp, err := svc.Search(context.Background(), scope, memory.MemorySearchArgs{Pattern: "needle", Scope: memory.ScopeThread})
 	if err != nil {
@@ -462,7 +680,7 @@ func TestServiceBlobDedupeSearchReturnsAllMemories(t *testing.T) {
 
 func TestServiceConcurrentPatchOneWins(t *testing.T) {
 	t.Parallel()
-	svc, _, _, _ := newSvc(t)
+	svc, root, _, revisions := newSvc(t)
 	scope := validScope()
 	if _, err := svc.Write(context.Background(), scope, "race", writeArgs("hello world", "run-1", "call-1")); err != nil {
 		t.Fatalf("Write: %v", err)
@@ -497,6 +715,25 @@ func TestServiceConcurrentPatchOneWins(t *testing.T) {
 	}
 	if successes != 1 || conflicts != 1 {
 		t.Fatalf("success/conflict = %d/%d, want 1/1", successes, conflicts)
+	}
+	rev2 := revisionByNumber(t, revisions, scope, "race", 2)
+	path, err := memory.RevisionBodyPath(root, rev2)
+	if err != nil {
+		t.Fatalf("RevisionBodyPath: %v", err)
+	}
+	read, err := svc.Read(context.Background(), scope, memory.MemoryReadArgs{MemoryID: "race", Scope: memory.ScopeThread})
+	if err != nil {
+		t.Fatalf("Read winner: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile winner: %v", err)
+	}
+	if strings.TrimSpace(string(data)) != read.Content {
+		t.Fatalf("rev2 file body = %q, latest read = %q", strings.TrimSpace(string(data)), read.Content)
+	}
+	if read.Content != "hello world-0" && read.Content != "hello world-1" {
+		t.Fatalf("unexpected winning body %q", read.Content)
 	}
 }
 

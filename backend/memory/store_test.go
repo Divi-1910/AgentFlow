@@ -105,3 +105,68 @@ func TestReadFileLimitedRejectsOversizedFile(t *testing.T) {
 	}
 }
 
+// ── Revision body helpers ────────────────────────────────────────────────────
+
+func TestWritePendingFinalizeAndReadRevisionBody(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	rev := memory.MemoryRevision{
+		UserID:     "user-1",
+		AgentID:    "agent-1",
+		ThreadID:   "thread-1",
+		MemoryID:   "mem-1",
+		Scope:      memory.ScopeThread,
+		Revision:   1,
+		MutationID: "run-1:call-1",
+	}
+	bodyPath, err := memory.RevisionBodyRelPath(rev)
+	if err != nil {
+		t.Fatalf("RevisionBodyRelPath: %v", err)
+	}
+	rev.BodyPath = bodyPath
+
+	if err := memory.WritePendingRevisionBody(root, rev, "revision body"); err != nil {
+		t.Fatalf("WritePendingRevisionBody: %v", err)
+	}
+	finalPath, err := memory.RevisionBodyPath(root, rev)
+	if err != nil {
+		t.Fatalf("RevisionBodyPath: %v", err)
+	}
+	if _, err := os.Stat(finalPath); !os.IsNotExist(err) {
+		t.Fatalf("final file should not exist before finalize, stat err=%v", err)
+	}
+	if err := memory.FinalizeRevisionBody(root, rev); err != nil {
+		t.Fatalf("FinalizeRevisionBody: %v", err)
+	}
+	body, err := memory.ReadRevisionBody(root, rev, 1024)
+	if err != nil {
+		t.Fatalf("ReadRevisionBody: %v", err)
+	}
+	if body != "revision body" {
+		t.Fatalf("body = %q, want revision body", body)
+	}
+	pendingPath, err := memory.PendingBodyPath(root, rev)
+	if err != nil {
+		t.Fatalf("PendingBodyPath: %v", err)
+	}
+	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
+		t.Fatalf("pending file should be removed after finalize, stat err=%v", err)
+	}
+}
+
+func TestReadRevisionBodyRequiresBodyPath(t *testing.T) {
+	t.Parallel()
+	rev := memory.MemoryRevision{
+		UserID:     "user-1",
+		AgentID:    "agent-1",
+		ThreadID:   "thread-1",
+		MemoryID:   "mem-1",
+		Scope:      memory.ScopeThread,
+		Revision:   1,
+		MutationID: "run-1:call-1",
+	}
+	_, err := memory.ReadRevisionBody(t.TempDir(), rev, 1024)
+	if !errors.Is(err, memory.ErrInvalidDocument) || !strings.Contains(err.Error(), "body_path") {
+		t.Fatalf("expected body_path error, got %v", err)
+	}
+}

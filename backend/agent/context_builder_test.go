@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -460,7 +458,7 @@ func TestToolDefinitionInstructionsExcludedFromJSON(t *testing.T) {
 // ── Cross-agent user preferences (regression for review issue #2) ────────────
 
 // buildBuilderWithService creates a ContextBuilder backed by a real
-// memory.Service rooted at a fresh temp dir. Memory files written via
+// memory.Service rooted at a fresh temp dir. Memory revision files written via
 // writeMemoryFile show up through Service.ReadByMeta in the builder's
 // renderUserPreferences path.
 func buildBuilderWithService(t *testing.T, meta *fakeMetaStore) (*ContextBuilder, string) {
@@ -476,25 +474,38 @@ func buildBuilderWithService(t *testing.T, meta *fakeMetaStore) (*ContextBuilder
 	return cb, root
 }
 
-func writeMemoryFile(t *testing.T, root, userID, scope, scopeID, memoryID, body string) {
+func writeMemoryFile(t *testing.T, root, userID, scope, scopeID, memoryID, body string) string {
 	t.Helper()
-	var dir string
+	rev := memory.MemoryRevision{
+		UserID:   userID,
+		MemoryID: memoryID,
+		Scope:    scope,
+		Revision: 1,
+	}
 	switch scope {
 	case memory.ScopeUser:
-		dir = filepath.Join(root, userID, memory.ScopeUser)
+		// User-scoped revision paths are keyed only by user and memory ID.
 	case memory.ScopeAgent:
-		dir = filepath.Join(root, userID, memory.ScopeAgent, scopeID)
+		rev.AgentID = scopeID
 	case memory.ScopeThread:
-		dir = filepath.Join(root, userID, memory.ScopeThread, scopeID)
+		rev.AgentID = "agent-1"
+		rev.ThreadID = scopeID
 	default:
 		t.Fatalf("unknown scope %q", scope)
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
+	bodyPath, err := memory.RevisionBodyRelPath(rev)
+	if err != nil {
+		t.Fatalf("RevisionBodyRelPath: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, memoryID+".md"), []byte(body), 0o644); err != nil {
+	rev.BodyPath = bodyPath
+	path, err := memory.RevisionBodyPath(root, rev)
+	if err != nil {
+		t.Fatalf("RevisionBodyPath: %v", err)
+	}
+	if err := memory.WriteFileAtomic(path, body); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
+	return bodyPath
 }
 
 func TestBuildSurfacesUserPreferencesAcrossAgents(t *testing.T) {
@@ -507,7 +518,7 @@ func TestBuildSurfacesUserPreferencesAcrossAgents(t *testing.T) {
 	// would in Mongo) — but the file path for ScopeUser is keyed only on
 	// UserID, so the reader can still hydrate it.
 	otherAgentBody := "User prefers Hindi for casual chats."
-	writeMemoryFile(t, root, "user-1", memory.ScopeUser, "", "lang-pref", otherAgentBody)
+	otherAgentBodyPath := writeMemoryFile(t, root, "user-1", memory.ScopeUser, "", "lang-pref", otherAgentBody)
 	_ = meta.Upsert(context.Background(), memory.MemoryDocument{
 		UserID:    "user-1",
 		AgentID:   "agent-B", // different agent wrote it
@@ -515,12 +526,14 @@ func TestBuildSurfacesUserPreferencesAcrossAgents(t *testing.T) {
 		ID:        "lang-pref",
 		Type:      memory.TypePreference,
 		Scope:     memory.ScopeUser,
+		Revision:  1,
+		BodyPath:  otherAgentBodyPath,
 		CreatedAt: time.Now().UTC(),
 	})
 
 	// Memory written by agent-1 (the current run's agent) for the same user.
 	sameAgentBody := "User likes bullet points."
-	writeMemoryFile(t, root, "user-1", memory.ScopeUser, "", "fmt-pref", sameAgentBody)
+	sameAgentBodyPath := writeMemoryFile(t, root, "user-1", memory.ScopeUser, "", "fmt-pref", sameAgentBody)
 	_ = meta.Upsert(context.Background(), memory.MemoryDocument{
 		UserID:    "user-1",
 		AgentID:   "agent-1",
@@ -528,6 +541,8 @@ func TestBuildSurfacesUserPreferencesAcrossAgents(t *testing.T) {
 		ID:        "fmt-pref",
 		Type:      memory.TypePreference,
 		Scope:     memory.ScopeUser,
+		Revision:  1,
+		BodyPath:  sameAgentBodyPath,
 		CreatedAt: time.Now().UTC(),
 	})
 
@@ -557,7 +572,7 @@ func TestBuildCapsUserPreferencesByCountAndBudget(t *testing.T) {
 	body := strings.Repeat("y", 400)
 	for i := 0; i < 60; i++ {
 		id := fmt.Sprintf("u-%02d", i)
-		writeMemoryFile(t, root, "user-1", memory.ScopeUser, "", id, body+" "+id)
+		bodyPath := writeMemoryFile(t, root, "user-1", memory.ScopeUser, "", id, body+" "+id)
 		lr := time.Date(2026, 1, 1, 0, 0, i, 0, time.UTC)
 		_ = meta.Upsert(context.Background(), memory.MemoryDocument{
 			UserID:     "user-1",
@@ -566,6 +581,8 @@ func TestBuildCapsUserPreferencesByCountAndBudget(t *testing.T) {
 			ID:         id,
 			Type:       memory.TypePreference,
 			Scope:      memory.ScopeUser,
+			Revision:   1,
+			BodyPath:   bodyPath,
 			CreatedAt:  lr,
 			LastReadAt: &lr,
 		})
@@ -613,7 +630,7 @@ func TestBuildEmitsElidedNoteOnCountCapOverflow(t *testing.T) {
 	for i := 0; i < excess; i++ {
 		id := fmt.Sprintf("tiny-%02d", i)
 		body := fmt.Sprintf("pref %d", i)
-		writeMemoryFile(t, root, "user-1", memory.ScopeUser, "", id, body)
+		bodyPath := writeMemoryFile(t, root, "user-1", memory.ScopeUser, "", id, body)
 		lr := time.Date(2026, 1, 1, 0, 0, i, 0, time.UTC)
 		_ = meta.Upsert(context.Background(), memory.MemoryDocument{
 			UserID:     "user-1",
@@ -622,6 +639,8 @@ func TestBuildEmitsElidedNoteOnCountCapOverflow(t *testing.T) {
 			ID:         id,
 			Type:       memory.TypePreference,
 			Scope:      memory.ScopeUser,
+			Revision:   1,
+			BodyPath:   bodyPath,
 			CreatedAt:  lr,
 			LastReadAt: &lr,
 		})

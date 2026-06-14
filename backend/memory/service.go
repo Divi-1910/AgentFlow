@@ -124,10 +124,6 @@ func (s *Service) Write(ctx context.Context, execScope runtimectx.MemoryScope, m
 		expiresAt = &expires
 	}
 
-	bodySHA, err := WriteBlob(s.cfg.Root, execScope.UserID, body)
-	if err != nil {
-		return nil, err
-	}
 	rev := MemoryRevision{
 		LineageKey: lineageKey,
 		Revision:   1,
@@ -142,12 +138,11 @@ func (s *Service) Write(ctx context.Context, execScope runtimectx.MemoryScope, m
 		Scope:      args.Scope,
 		Type:       args.Type,
 		Importance: clampImportance(args.Importance),
-		BodySHA:    bodySHA,
 		CreatedAt:  now,
 		UpdatedAt:  now,
 		ExpiresAt:  expiresAt,
 	}
-	appended, _, err := s.revisions.Append(ctx, rev)
+	appended, _, err := s.commitRevision(ctx, rev, body)
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +192,7 @@ func (s *Service) Read(ctx context.Context, execScope runtimectx.MemoryScope, ar
 		}
 	}
 
-	body, err := ReadBlob(s.cfg.Root, rev.UserID, rev.BodySHA, s.cfg.MaxFileBytes)
+	body, err := ReadRevisionBody(s.cfg.Root, *rev, s.cfg.MaxFileBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -213,15 +208,7 @@ func (s *Service) Read(ctx context.Context, execScope runtimectx.MemoryScope, ar
 }
 
 func (s *Service) ReadByMeta(_ context.Context, doc MemoryDocument) (string, error) {
-	if doc.BodySHA != "" {
-		body, err := ReadBlob(s.cfg.Root, doc.UserID, doc.BodySHA, s.cfg.MaxFileBytes)
-		if err != nil {
-			return "", err
-		}
-		return strings.TrimSpace(body), nil
-	}
-
-	path, err := LegacyDocumentPath(s.cfg.Root, doc)
+	path, err := documentBodyPath(s.cfg.Root, doc)
 	if err != nil {
 		return "", err
 	}
@@ -270,14 +257,9 @@ func (s *Service) Search(ctx context.Context, execScope runtimectx.MemoryScope, 
 	seenFiles := make(map[string]bool, len(docs))
 	byPath := make(map[string][]MemoryDocument, len(docs))
 	for _, doc := range docs {
-		var p string
-		if doc.BodySHA != "" {
-			p, err = BlobPath(s.cfg.Root, doc.UserID, doc.BodySHA)
-		} else {
-			p, err = LegacyDocumentPath(s.cfg.Root, doc)
-		}
+		p, err := documentBodyPath(s.cfg.Root, doc)
 		if err != nil {
-			continue
+			return nil, err
 		}
 		if !seenFiles[p] {
 			files = append(files, p)
@@ -339,43 +321,32 @@ func (s *Service) Search(ctx context.Context, execScope runtimectx.MemoryScope, 
 }
 
 func (s *Service) Patch(ctx context.Context, execScope runtimectx.MemoryScope, args MemoryPatchArgs) (*MutationResult, error) {
-	return s.mutateActive(ctx, execScope, args.MemoryID, args.Scope, args.ExpectedRevision, args.Reason, args.RunID, args.ToolCallID, OperationPatch, func(latest MemoryRevision, currentBody string, now time.Time) (MemoryRevision, error) {
+	return s.mutateActive(ctx, execScope, args.MemoryID, args.Scope, args.ExpectedRevision, args.Reason, args.RunID, args.ToolCallID, OperationPatch, func(latest MemoryRevision, currentBody string, now time.Time) (MemoryRevision, string, error) {
 		body, err := applyPatchEdits(currentBody, args.Edits, s.cfg.MaxBodyBytes)
 		if err != nil {
-			return MemoryRevision{}, err
-		}
-		bodySHA, err := WriteBlob(s.cfg.Root, latest.UserID, body)
-		if err != nil {
-			return MemoryRevision{}, err
+			return MemoryRevision{}, "", err
 		}
 		rev := nextRevisionFrom(latest, now, OperationPatch, args.Reason)
-		rev.BodySHA = bodySHA
-		return rev, nil
+		return rev, body, nil
 	})
 }
 
 func (s *Service) Update(ctx context.Context, execScope runtimectx.MemoryScope, args MemoryUpdateArgs) (*MutationResult, error) {
-	return s.mutateActive(ctx, execScope, args.MemoryID, args.Scope, args.ExpectedRevision, args.Reason, args.RunID, args.ToolCallID, OperationUpdate, func(latest MemoryRevision, _ string, now time.Time) (MemoryRevision, error) {
+	return s.mutateActive(ctx, execScope, args.MemoryID, args.Scope, args.ExpectedRevision, args.Reason, args.RunID, args.ToolCallID, OperationUpdate, func(latest MemoryRevision, _ string, now time.Time) (MemoryRevision, string, error) {
 		body := strings.TrimSpace(args.Content)
 		if err := validateBody(body, s.cfg.MaxBodyBytes); err != nil {
-			return MemoryRevision{}, err
-		}
-		bodySHA, err := WriteBlob(s.cfg.Root, latest.UserID, body)
-		if err != nil {
-			return MemoryRevision{}, err
+			return MemoryRevision{}, "", err
 		}
 		rev := nextRevisionFrom(latest, now, OperationUpdate, args.Reason)
-		rev.BodySHA = bodySHA
-		return rev, nil
+		return rev, body, nil
 	})
 }
 
 func (s *Service) Retire(ctx context.Context, execScope runtimectx.MemoryScope, args MemoryRetireArgs) (*MutationResult, error) {
-	return s.mutateActive(ctx, execScope, args.MemoryID, args.Scope, args.ExpectedRevision, args.Reason, args.RunID, args.ToolCallID, OperationRetire, func(latest MemoryRevision, _ string, now time.Time) (MemoryRevision, error) {
+	return s.mutateActive(ctx, execScope, args.MemoryID, args.Scope, args.ExpectedRevision, args.Reason, args.RunID, args.ToolCallID, OperationRetire, func(latest MemoryRevision, currentBody string, now time.Time) (MemoryRevision, string, error) {
 		rev := nextRevisionFrom(latest, now, OperationRetire, args.Reason)
-		rev.BodySHA = latest.BodySHA
 		rev.RetiredAt = &now
-		return rev, nil
+		return rev, strings.TrimSpace(currentBody), nil
 	})
 }
 
@@ -434,6 +405,10 @@ func (s *Service) Restore(ctx context.Context, execScope runtimectx.MemoryScope,
 	if isExpiredRevision(*from, time.Now().UTC()) {
 		return nil, ErrExpiredMemory
 	}
+	body, err := ReadRevisionBody(s.cfg.Root, *from, s.cfg.MaxFileBytes)
+	if err != nil {
+		return nil, err
+	}
 
 	now := time.Now().UTC()
 	rev := nextRevisionFrom(*latest, now, OperationRestore, args.Reason)
@@ -445,8 +420,7 @@ func (s *Service) Restore(ctx context.Context, execScope runtimectx.MemoryScope,
 	rev.Importance = from.Importance
 	rev.ExpiresAt = from.ExpiresAt
 	rev.RetiredAt = nil
-	rev.BodySHA = from.BodySHA
-	appended, _, err := s.revisions.Append(ctx, rev)
+	appended, _, err := s.commitRevision(ctx, rev, strings.TrimSpace(body))
 	if err != nil {
 		return nil, err
 	}
@@ -494,7 +468,7 @@ func (s *Service) mutateActive(
 	runID string,
 	toolCallID string,
 	op string,
-	build func(latest MemoryRevision, currentBody string, now time.Time) (MemoryRevision, error),
+	build func(latest MemoryRevision, currentBody string, now time.Time) (MemoryRevision, string, error),
 ) (*MutationResult, error) {
 	if err := validateMutationInput(execScope, memoryID, scope, expectedRevision, reason); err != nil {
 		return nil, err
@@ -532,22 +506,19 @@ func (s *Service) mutateActive(
 		return nil, ErrExpiredMemory
 	}
 
-	currentBody := ""
-	if op == OperationPatch {
-		currentBody, err = ReadBlob(s.cfg.Root, latest.UserID, latest.BodySHA, s.cfg.MaxFileBytes)
-		if err != nil {
-			return nil, err
-		}
+	currentBody, err := ReadRevisionBody(s.cfg.Root, *latest, s.cfg.MaxFileBytes)
+	if err != nil {
+		return nil, err
 	}
 	now := time.Now().UTC()
-	next, err := build(*latest, currentBody, now)
+	next, nextBody, err := build(*latest, currentBody, now)
 	if err != nil {
 		return nil, err
 	}
 	next.MutationID = mutationID
 	next.RunID = runID
 	next.ToolCallID = toolCallID
-	appended, _, err := s.revisions.Append(ctx, next)
+	appended, _, err := s.commitRevision(ctx, next, nextBody)
 	if err != nil {
 		return nil, err
 	}
@@ -570,8 +541,31 @@ func (s *Service) replayMutation(ctx context.Context, lineageKey, mutationID str
 	if existing.LineageKey != lineageKey {
 		return nil, ErrRevisionConflict
 	}
+	if err := FinalizeRevisionBody(s.cfg.Root, *existing); err != nil {
+		return nil, err
+	}
 	s.bestEffortProject(ctx, lineageKey)
 	return existing, nil
+}
+
+func (s *Service) commitRevision(ctx context.Context, rev MemoryRevision, body string) (*MemoryRevision, bool, error) {
+	bodyPath, err := RevisionBodyRelPath(rev)
+	if err != nil {
+		return nil, false, err
+	}
+	rev.BodyPath = bodyPath
+	if err := WritePendingRevisionBody(s.cfg.Root, rev, body); err != nil {
+		return nil, false, err
+	}
+	appended, replayed, err := s.revisions.Append(ctx, rev)
+	if err != nil {
+		removePendingRevisionBody(s.cfg.Root, rev)
+		return nil, false, err
+	}
+	if err := FinalizeRevisionBody(s.cfg.Root, *appended); err != nil {
+		return nil, replayed, err
+	}
+	return appended, replayed, nil
 }
 
 func (s *Service) bestEffortProject(ctx context.Context, lineageKey string) {
@@ -585,9 +579,9 @@ func (s *Service) bestEffortProject(ctx context.Context, lineageKey string) {
 		}
 		return
 	}
-	body, readErr := ReadBlob(s.cfg.Root, latest.UserID, latest.BodySHA, s.cfg.MaxFileBytes)
+	body, readErr := ReadRevisionBody(s.cfg.Root, *latest, s.cfg.MaxFileBytes)
 	if readErr != nil {
-		slog.Warn("memory: project latest blob read failed", "lineage_key", lineageKey, "revision", latest.Revision, "error", readErr)
+		slog.Warn("memory: project latest body read failed", "lineage_key", lineageKey, "revision", latest.Revision, "body_path", latest.BodyPath, "error", readErr)
 	}
 	if err := s.meta.Upsert(ctx, documentFromRevision(*latest, strings.TrimSpace(body))); err != nil {
 		slog.Warn("memory: project latest failed", "lineage_key", lineageKey, "revision", latest.Revision, "error", err)
@@ -717,7 +711,6 @@ func nextRevisionFrom(latest MemoryRevision, now time.Time, op, reason string) M
 		Scope:      latest.Scope,
 		Type:       latest.Type,
 		Importance: latest.Importance,
-		BodySHA:    latest.BodySHA,
 		CreatedAt:  latest.CreatedAt,
 		UpdatedAt:  now,
 		ExpiresAt:  latest.ExpiresAt,
@@ -791,6 +784,22 @@ func extractSummary(body string) string {
 	return ""
 }
 
+func documentBodyPath(root string, doc MemoryDocument) (string, error) {
+	rev := MemoryRevision{
+		UserID:   doc.UserID,
+		AgentID:  doc.AgentID,
+		ThreadID: doc.ThreadID,
+		MemoryID: doc.ID,
+		Scope:    doc.Scope,
+		Revision: doc.Revision,
+		BodyPath: doc.BodyPath,
+	}
+	if err := requireStoredBodyPath(rev); err != nil {
+		return "", err
+	}
+	return RevisionBodyPath(root, rev)
+}
+
 func documentFromRevision(rev MemoryRevision, body string) MemoryDocument {
 	return MemoryDocument{
 		LineageKey: rev.LineageKey,
@@ -802,7 +811,7 @@ func documentFromRevision(rev MemoryRevision, body string) MemoryDocument {
 		Scope:      rev.Scope,
 		Importance: rev.Importance,
 		Revision:   rev.Revision,
-		BodySHA:    rev.BodySHA,
+		BodyPath:   rev.BodyPath,
 		CreatedAt:  rev.CreatedAt,
 		UpdatedAt:  rev.UpdatedAt,
 		ExpiresAt:  rev.ExpiresAt,
@@ -882,7 +891,7 @@ func historyRevisionFromRevision(rev MemoryRevision) HistoryRevision {
 		Operation:    rev.Operation,
 		Reason:       rev.Reason,
 		RestoredFrom: rev.RestoredFrom,
-		BodySHA:      rev.BodySHA,
+		BodyPath:     rev.BodyPath,
 		Type:         rev.Type,
 		Importance:   rev.Importance,
 		Retired:      rev.RetiredAt != nil,

@@ -13,84 +13,122 @@ func validScope() runtimectx.MemoryScope {
 	return runtimectx.MemoryScope{UserID: "user-1", AgentID: "agent-1", ThreadID: "thread-1"}
 }
 
-// ── ResolveWritePath ──────────────────────────────────────────────────────────
-
-func TestResolveWritePathThreadScope(t *testing.T) {
-	t.Parallel()
+func validRevision(scopeName string) memory.MemoryRevision {
 	scope := validScope()
-	path, err := memory.ResolveWritePath("/root", scope, memory.ScopeThread, "mem-1")
-	if err != nil {
-		t.Fatalf("ResolveWritePath: %v", err)
+	return memory.MemoryRevision{
+		UserID:   scope.UserID,
+		AgentID:  scope.AgentID,
+		ThreadID: scope.ThreadID,
+		MemoryID: "mem-1",
+		Scope:    scopeName,
+		Revision: 2,
 	}
-	want := filepath.Join("/root", "user-1", memory.ScopeThread, "thread-1", "mem-1.md")
+}
+
+// ── RevisionBodyRelPath ───────────────────────────────────────────────────────
+
+func TestRevisionBodyRelPathThreadScope(t *testing.T) {
+	t.Parallel()
+	rev := validRevision(memory.ScopeThread)
+	path, err := memory.RevisionBodyPath("/root", rev)
+	if err != nil {
+		t.Fatalf("RevisionBodyPath: %v", err)
+	}
+	want := filepath.Join("/root", "user-1", "memories", memory.ScopeThread, "agent-1", "thread-1", "mem-1", "mem-1_rev-2.md")
 	if path != want {
 		t.Errorf("got %q, want %q", path, want)
 	}
 }
 
-func TestResolveWritePathAgentScope(t *testing.T) {
+func TestRevisionBodyRelPathAgentScope(t *testing.T) {
 	t.Parallel()
-	scope := validScope()
-	path, err := memory.ResolveWritePath("/root", scope, memory.ScopeAgent, "mem-1")
+	rev := validRevision(memory.ScopeAgent)
+	path, err := memory.RevisionBodyPath("/root", rev)
 	if err != nil {
-		t.Fatalf("ResolveWritePath: %v", err)
+		t.Fatalf("RevisionBodyPath: %v", err)
 	}
-	want := filepath.Join("/root", "user-1", memory.ScopeAgent, "agent-1", "mem-1.md")
+	want := filepath.Join("/root", "user-1", "memories", memory.ScopeAgent, "agent-1", "mem-1", "mem-1_rev-2.md")
 	if path != want {
 		t.Errorf("got %q, want %q", path, want)
 	}
 }
 
-func TestResolveWritePathUserScope(t *testing.T) {
+func TestRevisionBodyRelPathUserScope(t *testing.T) {
 	t.Parallel()
-	scope := validScope()
-	path, err := memory.ResolveWritePath("/root", scope, memory.ScopeUser, "mem-1")
+	rev := validRevision(memory.ScopeUser)
+	path, err := memory.RevisionBodyPath("/root", rev)
 	if err != nil {
-		t.Fatalf("ResolveWritePath: %v", err)
+		t.Fatalf("RevisionBodyPath: %v", err)
 	}
-	want := filepath.Join("/root", "user-1", memory.ScopeUser, "mem-1.md")
+	want := filepath.Join("/root", "user-1", "memories", memory.ScopeUser, "mem-1", "mem-1_rev-2.md")
 	if path != want {
 		t.Errorf("got %q, want %q", path, want)
 	}
 }
 
-func TestResolveWritePathInvalidScope(t *testing.T) {
+func TestRevisionBodyRelPathInvalidScope(t *testing.T) {
 	t.Parallel()
-	_, err := memory.ResolveWritePath("/root", validScope(), "badscope", "mem-1")
+	rev := validRevision("badscope")
+	_, err := memory.RevisionBodyRelPath(rev)
 	if err == nil {
 		t.Error("expected error for invalid scope")
 	}
 }
 
-func TestResolveWritePathRejectsPathTraversalInMemoryID(t *testing.T) {
+func TestRevisionBodyRelPathRejectsPathTraversalInMemoryID(t *testing.T) {
 	t.Parallel()
-	_, err := memory.ResolveWritePath("/root", validScope(), memory.ScopeThread, "../escape")
+	rev := validRevision(memory.ScopeThread)
+	rev.MemoryID = "../escape"
+	_, err := memory.RevisionBodyRelPath(rev)
 	if err == nil {
 		t.Error("expected error for path-traversal memory ID")
 	}
 }
 
-func TestResolveWritePathRejectsEmptyUserID(t *testing.T) {
+func TestRevisionBodyRelPathRejectsEmptyUserID(t *testing.T) {
 	t.Parallel()
-	scope := runtimectx.MemoryScope{UserID: "", AgentID: "agent-1", ThreadID: "thread-1"}
-	_, err := memory.ResolveWritePath("/root", scope, memory.ScopeThread, "mem-1")
+	rev := validRevision(memory.ScopeThread)
+	rev.UserID = ""
+	_, err := memory.RevisionBodyRelPath(rev)
 	if err == nil {
 		t.Error("expected error for empty user_id")
 	}
 }
 
+func TestRevisionBodyRelPathRejectsMissingAgentForAgentScope(t *testing.T) {
+	t.Parallel()
+	rev := validRevision(memory.ScopeAgent)
+	rev.AgentID = ""
+	_, err := memory.RevisionBodyRelPath(rev)
+	if err == nil {
+		t.Error("expected error for empty agent_id")
+	}
+}
+
+func TestRevisionBodyRelPathRejectsNonPositiveRevision(t *testing.T) {
+	t.Parallel()
+	rev := validRevision(memory.ScopeThread)
+	rev.Revision = 0
+	_, err := memory.RevisionBodyRelPath(rev)
+	if err == nil {
+		t.Error("expected error for non-positive revision")
+	}
+}
+
 // ── validateSegment hardening ─────────────────────────────────────────────────
 
-func TestResolveWritePathRejectsOversizedMemoryID(t *testing.T) {
+func TestRevisionBodyRelPathRejectsOversizedMemoryID(t *testing.T) {
 	t.Parallel()
 	oversized := strings.Repeat("a", memory.MaxSegmentLen+1)
-	_, err := memory.ResolveWritePath("/root", validScope(), memory.ScopeThread, oversized)
+	rev := validRevision(memory.ScopeThread)
+	rev.MemoryID = oversized
+	_, err := memory.RevisionBodyRelPath(rev)
 	if err == nil {
 		t.Errorf("expected error for memory_id of length %d (max %d)", len(oversized), memory.MaxSegmentLen)
 	}
 }
 
-func TestResolveWritePathRejectsControlCharInMemoryID(t *testing.T) {
+func TestRevisionBodyRelPathRejectsControlCharInMemoryID(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name  string
@@ -104,7 +142,9 @@ func TestResolveWritePathRejectsControlCharInMemoryID(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := memory.ResolveWritePath("/root", validScope(), memory.ScopeThread, tc.value)
+			rev := validRevision(memory.ScopeThread)
+			rev.MemoryID = tc.value
+			_, err := memory.RevisionBodyRelPath(rev)
 			if err == nil {
 				t.Errorf("expected error for memory_id with %s", tc.name)
 			}

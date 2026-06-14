@@ -38,7 +38,7 @@ type memoryMetaBSON struct {
 	Type       string     `bson:"type"`
 	Importance float64    `bson:"importance"`
 	Revision   int        `bson:"revision"`
-	BodySHA    string     `bson:"body_sha"`
+	BodyPath   string     `bson:"body_path"`
 	CreatedAt  time.Time  `bson:"created_at"`
 	UpdatedAt  time.Time  `bson:"updated_at"`
 	ExpiresAt  *time.Time `bson:"expires_at"`
@@ -113,7 +113,7 @@ func (r *MemoryMetaRepo) EnsureIndexes(ctx context.Context) error {
 
 // Upsert projects the latest revision into memory_meta. Projection is
 // monotonic: a stale revision never overwrites a newer cache row, while the
-// same revision can repair summary/body_sha/index fields. last_read_at is
+// same revision can repair summary/body_path/index fields. last_read_at is
 // preserved because it is managed exclusively by StampRead.
 func (r *MemoryMetaRepo) Upsert(ctx context.Context, doc memory.MemoryDocument) error {
 	raw, err := fromMemoryDocument(doc)
@@ -127,7 +127,10 @@ func (r *MemoryMetaRepo) Upsert(ctx context.Context, doc memory.MemoryDocument) 
 			bson.D{{Key: "revision", Value: bson.D{{Key: "$exists", Value: false}}}},
 		}},
 	}
-	update := bson.D{{Key: "$set", Value: projectionSet(raw)}}
+	update := bson.D{
+		{Key: "$set", Value: projectionSet(raw)},
+		{Key: "$unset", Value: bson.D{{Key: "body_sha", Value: ""}}},
+	}
 	_, err = r.col.UpdateOne(ctx, filter, update, options.UpdateOne().SetUpsert(true))
 	if err != nil {
 		if mongo.IsDuplicateKeyError(err) {
@@ -310,7 +313,7 @@ func toMemoryDocument(raw memoryMetaBSON) memory.MemoryDocument {
 		Scope:      raw.Scope,
 		Importance: raw.Importance,
 		Revision:   raw.Revision,
-		BodySHA:    raw.BodySHA,
+		BodyPath:   raw.BodyPath,
 		CreatedAt:  raw.CreatedAt,
 		UpdatedAt:  raw.UpdatedAt,
 		ExpiresAt:  raw.ExpiresAt,
@@ -354,7 +357,7 @@ func fromMemoryDocument(doc memory.MemoryDocument) (memoryMetaBSON, error) {
 		Type:       doc.Type,
 		Importance: doc.Importance,
 		Revision:   revision,
-		BodySHA:    doc.BodySHA,
+		BodyPath:   doc.BodyPath,
 		CreatedAt:  doc.CreatedAt,
 		UpdatedAt:  updatedAt,
 		ExpiresAt:  doc.ExpiresAt,
@@ -375,7 +378,7 @@ func projectionSet(raw memoryMetaBSON) bson.D {
 		{Key: "type", Value: raw.Type},
 		{Key: "importance", Value: raw.Importance},
 		{Key: "revision", Value: raw.Revision},
-		{Key: "body_sha", Value: raw.BodySHA},
+		{Key: "body_path", Value: raw.BodyPath},
 		{Key: "created_at", Value: raw.CreatedAt},
 		{Key: "updated_at", Value: raw.UpdatedAt},
 		{Key: "expires_at", Value: raw.ExpiresAt},
