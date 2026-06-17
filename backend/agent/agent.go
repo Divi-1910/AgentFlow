@@ -35,6 +35,7 @@ type Agent struct {
 	SystemPrompt       string
 	Tools              []string
 	Delegates          []DelegateConfig
+	MCPServers         []MCPServerConfig
 	ModelContextLimit  int
 	ContextWindow      int
 	ContextKeepRatio   float64
@@ -55,6 +56,17 @@ type DelegateConfig struct {
 	ToolName     string
 	Description  string
 	Instructions string
+}
+
+// MCPServerConfig declares one remote MCP server this agent connects to. At run
+// start the runtime discovers the server's tools (tools/list) and exposes them
+// as mcp__<alias>__<tool>. Alias namespaces those tools; URL is the remote
+// Streamable-HTTP endpoint; BearerEnv names an OS env var holding a static
+// bearer token (empty for no-auth) — the token itself is never persisted.
+type MCPServerConfig struct {
+	Alias     string
+	URL       string
+	BearerEnv string
 }
 
 type RunContext struct {
@@ -95,6 +107,11 @@ type RunContext struct {
 	DelegationDepth int
 	InvocationKind  string
 	JobID           string
+
+	// MCPUnavailable lists the aliases of MCP servers that failed discovery at
+	// run start. The context builder renders these as a model-visible note so
+	// the agent knows those tools are absent this run. Set by the runtime.
+	MCPUnavailable []string
 }
 
 type RunResult struct {

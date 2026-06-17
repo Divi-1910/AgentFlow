@@ -327,7 +327,7 @@ func (s *Service) List(ctx context.Context, ws Workspace) (*ListResult, error) {
 	if err := ws.validate(); err != nil {
 		return nil, err
 	}
-	ids, err := s.listCommittedFileIDs(ws)
+	ids, err := s.listFileDirIDs(ws)
 	if err != nil {
 		return nil, err
 	}
@@ -343,6 +343,9 @@ func (s *Service) List(ctx context.Context, ws Workspace) (*ListResult, error) {
 		metas, err := s.listSectionMetas(ws, fid)
 		if err != nil {
 			return nil, err
+		}
+		if len(metas) == 0 {
+			continue
 		}
 		size := 0
 		for _, sm := range metas {

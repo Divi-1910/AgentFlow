@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -24,6 +25,7 @@ type AgentRuntime struct {
 	checkpointStore CheckpointStore
 	delegateInvoker DelegateInvoker
 	asyncJobs       AsyncJobStore
+	mcpManager      *tools.MCPManager
 }
 
 func NewAgentRuntime(
@@ -46,6 +48,7 @@ func (r *AgentRuntime) WithCheckpointStore(store CheckpointStore) *AgentRuntime 
 		checkpointStore: store,
 		delegateInvoker: r.delegateInvoker,
 		asyncJobs:       r.asyncJobs,
+		mcpManager:      r.mcpManager, // MUST copy — main.go calls this during construction
 	}
 }
 
@@ -59,6 +62,28 @@ func (r *AgentRuntime) SetDelegateInvoker(inv DelegateInvoker) {
 
 func (r *AgentRuntime) SetAsyncJobStore(store AsyncJobStore) {
 	r.asyncJobs = store
+}
+
+// SetMCPManager wires the MCP discovery manager after construction (optional).
+// When set, a run whose agent has MCPServers discovers their tools at run start
+// and merges them into the tool set. A nil manager disables MCP entirely.
+func (r *AgentRuntime) SetMCPManager(m *tools.MCPManager) {
+	r.mcpManager = m
+}
+
+// toMCPServerSpecs resolves each agent MCP config into a connection spec,
+// reading the static bearer token from its env var (empty for no-auth). The
+// token is never logged or persisted — only the env var name lives in config.
+func toMCPServerSpecs(cfgs []MCPServerConfig) []tools.MCPServerSpec {
+	specs := make([]tools.MCPServerSpec, 0, len(cfgs))
+	for _, c := range cfgs {
+		token := ""
+		if c.BearerEnv != "" {
+			token = os.Getenv(c.BearerEnv)
+		}
+		specs = append(specs, tools.MCPServerSpec{Alias: c.Alias, URL: c.URL, BearerToken: token})
+	}
+	return specs
 }
 
 func (r *AgentRuntime) Run(ctx context.Context, agent *Agent, runCtx RunContext) (*RunResult, error) {
@@ -195,6 +220,15 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 	toolSet, err := BuildToolSet(r.toolRegistry, r.delegateInvoker, agent, r.asyncJobs)
 	if err != nil {
 		return nil, err
+	}
+	// Discover remote MCP tools at run start (fresh AND resume) and merge them
+	// for definitions/execution. They are excluded from the resume identity
+	// (ToolSet.Refs/Version), so a down or drifted server never blocks a resume.
+	// Discovery never fails the run: an unreachable server degrades to a note.
+	if r.mcpManager != nil && len(agent.MCPServers) > 0 {
+		mcpTools, unavailable := r.mcpManager.Discover(ctx, toMCPServerSpecs(agent.MCPServers))
+		toolSet.AddMCPTools(mcpTools)
+		runCtx.MCPUnavailable = unavailable
 	}
 	toolDefs := toolSet.Definitions()
 
@@ -516,17 +550,37 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		}
 
 		planned, missing := validateToolBatch(toolSet, toolCalls)
+		var mcpMissingOutcomes []toolOutcome
 		if len(missing) > 0 {
+			var hardMissing []missingCall
 			for _, m := range missing {
-				logger.Error("tool not found, aborting", "tool", m.call.Name)
-				sink.Emit(StreamEvent{
-					Type:  EventToolFailed,
-					Tool:  &ToolMeta{ID: m.call.ID, Name: m.call.Name, Args: m.rawArgs},
-					Error: &ErrMeta{Code: "tool.not_found", Message: "tool not available"},
-					Step:  steps,
-				})
+				// A missing mcp__* call (server down / schema drift, e.g. a pending
+				// call restored on resume) degrades softly — synthesize an IsError
+				// tool result and continue — instead of hard-failing the run.
+				if strings.HasPrefix(m.call.Name, tools.MCPToolPrefix) {
+					logger.Warn("mcp tool unavailable, degrading", "tool", m.call.Name)
+					sink.Emit(StreamEvent{
+						Type: EventToolCompleted,
+						Tool: &ToolMeta{ID: m.call.ID, Name: m.call.Name, Args: m.rawArgs},
+						Step: steps,
+					})
+					mcpMissingOutcomes = append(mcpMissingOutcomes, softMissingMCPOutcome(m))
+					continue
+				}
+				hardMissing = append(hardMissing, m)
 			}
-			return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, missing[0].call.Name)
+			if len(hardMissing) > 0 {
+				for _, m := range hardMissing {
+					logger.Error("tool not found, aborting", "tool", m.call.Name)
+					sink.Emit(StreamEvent{
+						Type:  EventToolFailed,
+						Tool:  &ToolMeta{ID: m.call.ID, Name: m.call.Name, Args: m.rawArgs},
+						Error: &ErrMeta{Code: "tool.not_found", Message: "tool not available"},
+						Step:  steps,
+					})
+				}
+				return nil, fmt.Errorf("%w: %s", ErrToolNotAvailable, hardMissing[0].call.Name)
+			}
 		}
 		if ctx.Err() != nil {
 			state = stateCancelled
@@ -537,6 +591,12 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		if ctx.Err() != nil {
 			state = stateCancelled
 			return nil, ctx.Err()
+		}
+		// Merge soft MCP-degrade results and re-order by original call index so
+		// the transcript stays in LLM call order.
+		if len(mcpMissingOutcomes) > 0 {
+			outcomes = append(outcomes, mcpMissingOutcomes...)
+			sort.Slice(outcomes, func(i, j int) bool { return outcomes[i].index < outcomes[j].index })
 		}
 
 		if err := applyToolOutcomes(&messages, &newMessages, toolFailures, &runCtx, outcomes); err != nil {

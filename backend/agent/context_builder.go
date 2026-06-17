@@ -179,8 +179,29 @@ func (cb *ContextBuilder) buildSystemContent(ctx context.Context, agent *Agent, 
 	if block := cb.renderScratchpadPointer(runCtx); block != "" {
 		sb.WriteString(block)
 	}
+	if block := renderMCPStatus(runCtx); block != "" {
+		sb.WriteString(block)
+	}
 
 	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+// renderMCPStatus emits a model-visible <mcp_status> note (DYNAMIC suffix)
+// naming MCP servers that failed discovery this run, so the agent knows their
+// tools are absent and shouldn't be called. No-ops when all servers are healthy,
+// keeping the static prefix byte-identical. Pure function of RunContext.
+func renderMCPStatus(runCtx RunContext) string {
+	if len(runCtx.MCPUnavailable) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("<mcp_status>\n")
+	for _, alias := range runCtx.MCPUnavailable {
+		fmt.Fprintf(&sb, "  MCP server %q is unavailable this run; its tools cannot be called. Proceed without them.\n",
+			escapeXMLContent(alias))
+	}
+	sb.WriteString("</mcp_status>\n")
+	return sb.String()
 }
 
 // renderCollaboration emits <collaboration> for a subagent run (ParentRunID

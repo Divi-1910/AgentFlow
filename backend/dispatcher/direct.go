@@ -16,8 +16,8 @@ import (
 type DirectDispatcher struct {
 	Preparer *RunPreparer
 	Runtime  Runtime
-	Bus      bus.MessageBus  // for the cancel cascade; may be nil if the agent has no delegates
-	Pools    *PoolManager    // for CancelRegistry marking
+	Bus      bus.MessageBus // for the cancel cascade; may be nil if the agent has no delegates
+	Pools    *PoolManager   // for CancelRegistry marking
 }
 
 func (d *DirectDispatcher) Dispatch(ctx context.Context, req DispatchRequest, events chan<- agent.StreamEvent) (*agent.RunResult, error) {

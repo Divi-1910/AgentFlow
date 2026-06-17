@@ -10,7 +10,9 @@ import (
 // createThread creates a thread and returns its ID.
 func createThread(t *testing.T, e *testEnv, token, agentID, title string) string {
 	t.Helper()
-	var created struct{ ID string `json:"id"` }
+	var created struct {
+		ID string `json:"id"`
+	}
 	resp := e.do(t, "POST", "/api/agents/"+agentID+"/threads", map[string]any{"title": title}, token)
 	decodeBody(t, resp, &created)
 	if created.ID == "" {

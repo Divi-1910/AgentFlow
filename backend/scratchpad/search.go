@@ -48,13 +48,18 @@ func (s *Service) Search(ctx context.Context, ws Workspace, a SearchArgs) (*Sear
 		}
 	}
 
-	fileIDs, err := s.listCommittedFileIDs(ws)
+	fileIDs, err := s.listFileDirIDs(ws)
 	if err != nil {
 		return nil, err
 	}
 	byPath := make(map[string]SectionMeta)
 	var files []string
 	for _, fid := range fileIDs {
+		if _, found, err := s.loadFileMeta(ws, fid); err != nil {
+			return nil, err
+		} else if !found {
+			continue
+		}
 		metas, err := s.listSectionMetas(ws, fid)
 		if err != nil {
 			return nil, err

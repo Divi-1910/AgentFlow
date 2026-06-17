@@ -61,8 +61,8 @@ func TestValidateTokenRejectsMalformedJWT(t *testing.T) {
 	malformed := []string{
 		"",
 		"only.two",
-		"a.b.c.d.e", // too many segments
-		"eyJhbGciOiJub25lIn0.e30.",  // alg=none (should be rejected by HMAC check)
+		"a.b.c.d.e",                // too many segments
+		"eyJhbGciOiJub25lIn0.e30.", // alg=none (should be rejected by HMAC check)
 	}
 	for _, tok := range malformed {
 		_, err := auth.ValidateToken(tok)

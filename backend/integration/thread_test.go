@@ -8,7 +8,9 @@ import (
 // createAgent creates an agent and returns its ID.
 func createAgent(t *testing.T, e *testEnv, token, name string) string {
 	t.Helper()
-	var created struct{ ID string `json:"id"` }
+	var created struct {
+		ID string `json:"id"`
+	}
 	resp := e.do(t, "POST", "/api/agents", minimalAgent(name), token)
 	decodeBody(t, resp, &created)
 	if created.ID == "" {
@@ -57,7 +59,9 @@ func TestThreadListByAgentReturns200(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	var threads []struct{ ID string `json:"id"` }
+	var threads []struct {
+		ID string `json:"id"`
+	}
 	decodeBody(t, resp, &threads)
 	if len(threads) != 2 {
 		t.Errorf("expected 2 threads, got %d", len(threads))

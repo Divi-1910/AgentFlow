@@ -49,4 +49,3 @@ func ConnectMongoDB() *mongo.Client {
 func GetCollection(dbName, collectionName string) *mongo.Collection {
 	return ConnectMongoDB().Database(dbName).Collection(collectionName)
 }
-

@@ -136,6 +136,7 @@ func main() {
 	}
 
 	toolRegistry := tools.NewToolRegistry(db.GetRedis(), memorySvc, scratchpadSvc)
+	mcpManager := tools.NewMCPManager(&http.Client{Timeout: 60 * time.Second})
 
 	llmModelRepo := repository.NewLLMModelRepo(llmRegistryCol)
 	llmHandler := handlers.NewLLMHandler(llmModelRepo, llmRegistry)
@@ -176,6 +177,7 @@ func main() {
 	}
 	contextBuilder := agent.NewContextBuilder(platformCfg, memorySvc, memoryMetaRepo, scratchpadSvc)
 	agentRuntime := agent.NewAgentRuntime(llmRegistry, toolRegistry, contextBuilder).WithCheckpointStore(runRepo)
+	agentRuntime.SetMCPManager(mcpManager) // must follow WithCheckpointStore (which copies a still-nil manager)
 	agentRuntime.SetAsyncJobStore(jobRepo)
 	summarizer := agent.NewSummarizer(llmRegistry)
 

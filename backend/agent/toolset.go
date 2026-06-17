@@ -23,6 +23,7 @@ const (
 	toolKindRegular toolKind = iota
 	toolKindDelegate
 	toolKindAsync
+	toolKindMCP
 )
 
 // ToolRef is the per-tool identity recorded in a snapshot for resume checks.
@@ -120,6 +121,9 @@ func (ts *ToolSet) Definitions() []llm.ToolDefinition {
 func (ts *ToolSet) Refs() []ToolRef {
 	refs := make([]ToolRef, 0, len(ts.order))
 	for _, n := range ts.order {
+		if ts.kinds[n] == toolKindMCP {
+			continue // MCP tools are NOT part of the resume identity (see AddMCPTools)
+		}
 		refs = append(refs, ts.refFor(n))
 	}
 	return refs
@@ -131,6 +135,9 @@ func (ts *ToolSet) Refs() []ToolRef {
 func (ts *ToolSet) Version() string {
 	parts := make([]string, 0, len(ts.order))
 	for _, n := range ts.order {
+		if ts.kinds[n] == toolKindMCP {
+			continue // excluded from the resume identity, like Refs()
+		}
 		r := ts.refFor(n)
 		parts = append(parts, r.Name+":"+r.StructHash)
 	}
@@ -180,6 +187,20 @@ func BuildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, ag *Agent, async
 // names/params/identity, never execution.
 func BuildToolSetForValidation(reg *tools.ToolRegistry, ag *Agent) (*ToolSet, error) {
 	return buildToolSet(reg, nil, nil, ag, true)
+}
+
+// AddMCPTools merges discovered MCP tools into the set for LLM definitions and
+// execution ONLY. They are deliberately EXCLUDED from Refs()/Version() (the
+// resume identity), so an MCP server being down or schema-drifted on resume can
+// never block a resume — it just re-discovers fresh. Collisions are skipped,
+// never fatal (degrade, don't fail). Called after BuildToolSet at run start.
+func (ts *ToolSet) AddMCPTools(mcpTools []tools.Tool) {
+	for _, t := range mcpTools {
+		if t == nil || ts.Has(t.Name()) {
+			continue
+		}
+		ts.add(t.Name(), t, toolKindMCP)
+	}
 }
 
 func buildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, asyncStore AsyncJobStore, ag *Agent, validation bool) (*ToolSet, error) {

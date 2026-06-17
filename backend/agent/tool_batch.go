@@ -24,6 +24,7 @@ type plannedCall struct {
 }
 
 type missingCall struct {
+	index   int
 	call    llm.ToolCall
 	rawArgs json.RawMessage
 }
@@ -55,7 +56,7 @@ func validateToolBatch(toolSet *ToolSet, calls []llm.ToolCall) ([]plannedCall, [
 		rawArgs := sanitizeToolArgs(call.Arguments)
 		tool, ok := toolSet.Get(call.Name)
 		if !ok {
-			missing = append(missing, missingCall{call: call, rawArgs: rawArgs})
+			missing = append(missing, missingCall{index: i, call: call, rawArgs: rawArgs})
 			continue
 		}
 		target, isDelegate := toolSet.DelegateTarget(call.Name)
@@ -403,6 +404,31 @@ func failedToolOutcome(p plannedCall, latencyMs int64, errText string) toolOutco
 		thresholdErrorText: errText,
 		lastAction:         fmt.Sprintf("%s → error", call.Name),
 		ran:                true,
+	}
+}
+
+// softMissingMCPOutcome synthesizes a degraded tool result for an mcp__* call
+// whose server is unavailable (e.g. a pending call restored on resume after the
+// server went down). It is a SOFT error: the model sees it and can adapt, the
+// transcript stays consistent (every tool_call_id gets a result), and it does
+// NOT count toward the failure threshold (execFailed stays false).
+func softMissingMCPOutcome(m missingCall) toolOutcome {
+	call := m.call
+	return toolOutcome{
+		index:    m.index,
+		toolName: call.Name,
+		message: llm.ChatMessage{
+			Role:       "tool",
+			ToolCallID: call.ID,
+			Content:    fmt.Sprintf("[error] MCP tool %q is unavailable this run (its server could not be reached); it cannot be called now.", call.Name),
+			Metadata: map[string]any{
+				"tool_name": call.Name,
+				"arguments": string(call.Arguments),
+				"is_error":  true,
+			},
+		},
+		lastAction: fmt.Sprintf("%s → unavailable", call.Name),
+		ran:        true,
 	}
 }
 

@@ -183,10 +183,42 @@ func (s *Service) listFileDirIDs(ws Workspace) ([]string, error) {
 	return ids, nil
 }
 
+func (s *Service) hasAnyCommittedSection(ws Workspace, fileID string) (bool, error) {
+	fd, err := FileDir(s.cfg.Root, ws, fileID)
+	if err != nil {
+		return false, err
+	}
+	sectionsDir := filepath.Join(fd, "sections")
+	entries, err := os.ReadDir(sectionsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("scratchpad: read sections dir: %w", err)
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		info, err := os.Stat(filepath.Join(sectionsDir, e.Name(), "meta.json"))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return false, fmt.Errorf("scratchpad: stat section meta: %w", err)
+		}
+		if info.Mode().IsRegular() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // listCommittedFileIDs returns only files that have file metadata and at least
 // one committed section marker. A bare files/{id}/ directory, or a file whose
 // create crashed before the initial section meta.json landed, is not visible to
-// caps, list, search, or the context-builder pointer.
+// caps or the context-builder pointer. It checks marker existence only; callers
+// that need section details still use listSectionMetas.
 func (s *Service) listCommittedFileIDs(ws Workspace) ([]string, error) {
 	ids, err := s.listFileDirIDs(ws)
 	if err != nil {
@@ -199,11 +231,11 @@ func (s *Service) listCommittedFileIDs(ws Workspace) ([]string, error) {
 		} else if !found {
 			continue
 		}
-		metas, err := s.listSectionMetas(ws, fid)
+		hasSection, err := s.hasAnyCommittedSection(ws, fid)
 		if err != nil {
 			return nil, err
 		}
-		if len(metas) == 0 {
+		if !hasSection {
 			continue
 		}
 		out = append(out, fid)
@@ -215,12 +247,17 @@ func (s *Service) listCommittedFileIDs(ws Workspace) ([]string, error) {
 // workspaceContentBytes sums the byte size of every committed section's content
 // file across the workspace (used for the workspace-bytes cap).
 func (s *Service) workspaceContentBytes(ws Workspace) (int, error) {
-	ids, err := s.listCommittedFileIDs(ws)
+	ids, err := s.listFileDirIDs(ws)
 	if err != nil {
 		return 0, err
 	}
 	total := 0
 	for _, fid := range ids {
+		if _, found, err := s.loadFileMeta(ws, fid); err != nil {
+			return 0, err
+		} else if !found {
+			continue
+		}
 		metas, err := s.listSectionMetas(ws, fid)
 		if err != nil {
 			return 0, err

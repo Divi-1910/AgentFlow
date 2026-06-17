@@ -53,7 +53,9 @@ func TestAgentListReturnsCreatedAgents(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	var agents []struct{ ID string `json:"id"` }
+	var agents []struct {
+		ID string `json:"id"`
+	}
 	decodeBody(t, resp, &agents)
 	if len(agents) != 2 {
 		t.Errorf("expected 2 agents, got %d", len(agents))
@@ -65,7 +67,9 @@ func TestAgentGetReturns200(t *testing.T) {
 	token := e.mustSignup(t, "agent-get@example.com", "password123")
 
 	// Create agent.
-	var created struct{ ID string `json:"id"` }
+	var created struct {
+		ID string `json:"id"`
+	}
 	resp := e.do(t, "POST", "/api/agents", minimalAgent("Getter"), token)
 	decodeBody(t, resp, &created)
 
@@ -73,7 +77,9 @@ func TestAgentGetReturns200(t *testing.T) {
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp2.StatusCode)
 	}
-	var body struct{ Name string `json:"name"` }
+	var body struct {
+		Name string `json:"name"`
+	}
 	decodeBody(t, resp2, &body)
 	if body.Name != "Getter" {
 		t.Errorf("name: got %q, want %q", body.Name, "Getter")
@@ -85,7 +91,9 @@ func TestAgentGetOtherUserReturns404(t *testing.T) {
 	tokenA := e.mustSignup(t, "agent-owner@example.com", "password123")
 	tokenB := e.mustSignup(t, "agent-other@example.com", "password123")
 
-	var created struct{ ID string `json:"id"` }
+	var created struct {
+		ID string `json:"id"`
+	}
 	resp := e.do(t, "POST", "/api/agents", minimalAgent("Private"), tokenA)
 	decodeBody(t, resp, &created)
 
@@ -100,7 +108,9 @@ func TestAgentUpdateReturns200(t *testing.T) {
 	e := newTestEnv(t)
 	token := e.mustSignup(t, "agent-update@example.com", "password123")
 
-	var created struct{ ID string `json:"id"` }
+	var created struct {
+		ID string `json:"id"`
+	}
 	resp := e.do(t, "POST", "/api/agents", minimalAgent("OldName"), token)
 	decodeBody(t, resp, &created)
 
@@ -109,7 +119,9 @@ func TestAgentUpdateReturns200(t *testing.T) {
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp2.StatusCode)
 	}
-	var body struct{ Name string `json:"name"` }
+	var body struct {
+		Name string `json:"name"`
+	}
 	decodeBody(t, resp2, &body)
 	if body.Name != "NewName" {
 		t.Errorf("name: got %q, want %q", body.Name, "NewName")
@@ -120,7 +132,9 @@ func TestAgentDeleteReturns200(t *testing.T) {
 	e := newTestEnv(t)
 	token := e.mustSignup(t, "agent-delete@example.com", "password123")
 
-	var created struct{ ID string `json:"id"` }
+	var created struct {
+		ID string `json:"id"`
+	}
 	resp := e.do(t, "POST", "/api/agents", minimalAgent("Doomed"), token)
 	decodeBody(t, resp, &created)
 
