@@ -94,6 +94,9 @@ func (r *RunRepo) createRun(ctx context.Context, runID, threadID, agentID, userI
 	return nil
 }
 
+// Save appends a checkpoint for the run, keyed by step
+// (snapshot.State.StepsCompleted). Because LoadLatest selects by highest step,
+// re-saving an earlier step never shadows a later one.
 func (r *RunRepo) Save(ctx context.Context, snapshot agent.RunSnapshot) error {
 	gz, err := agent.CompressSnapshot(snapshot)
 	if err != nil {
@@ -124,6 +127,8 @@ func (r *RunRepo) Save(ctx context.Context, snapshot agent.RunSnapshot) error {
 	return nil
 }
 
+// LoadLatest returns the snapshot with the highest step (ties broken by newest
+// created_at), or an error when the run has no checkpoint.
 func (r *RunRepo) LoadLatest(ctx context.Context, runID string) (*agent.RunSnapshot, error) {
 	opts := options.FindOne().SetSort(bson.D{{Key: "step", Value: -1}, {Key: "created_at", Value: -1}})
 	var doc model.RunCheckpointDocument
@@ -142,6 +147,10 @@ func (r *RunRepo) LoadLatest(ctx context.Context, runID string) (*agent.RunSnaps
 	return snapshot, nil
 }
 
+// TransitionStatus is an atomic compare-and-set: it moves the run to `to` and
+// returns true ONLY if the run's current status was `from`. A racing or repeated
+// caller that observes a changed status gets false (not an error). This is the
+// primitive that lets exactly one resume win the claim.
 func (r *RunRepo) TransitionStatus(ctx context.Context, runID string, from, to string) (bool, error) {
 	res, err := r.runs.UpdateOne(ctx,
 		bson.M{"run_id": runID, "status": from},
@@ -153,6 +162,8 @@ func (r *RunRepo) TransitionStatus(ctx context.Context, runID string, from, to s
 	return res.MatchedCount > 0, nil
 }
 
+// TransitionStatusForUser is TransitionStatus additionally scoped to the owning
+// user: the CAS matches only when the status is `from` AND user_id matches.
 func (r *RunRepo) TransitionStatusForUser(ctx context.Context, runID, userID string, from, to string) (bool, error) {
 	res, err := r.runs.UpdateOne(ctx,
 		bson.M{"run_id": runID, "user_id": userID, "status": from},
@@ -194,6 +205,8 @@ func (r *RunRepo) UpdateStatus(ctx context.Context, runID string, status string,
 	return nil
 }
 
+// IncrementAttempt atomically increments the run's attempt counter and returns
+// the post-increment value (monotonic; values are never reused).
 func (r *RunRepo) IncrementAttempt(ctx context.Context, runID string) (int, error) {
 	after := options.After
 	opts := options.FindOneAndUpdate().SetReturnDocument(after)

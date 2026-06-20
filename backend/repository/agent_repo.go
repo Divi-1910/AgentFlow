@@ -126,24 +126,7 @@ func (r *AgentRepo) ListByUser(ctx context.Context, userID string) ([]*agent.Age
 	return agents, nil
 }
 
-type UpdateAgentInput struct {
-	Name               *string
-	Description        *string
-	SystemPrompt       *string
-	Tools              *[]string
-	Delegates          *[]agent.DelegateConfig
-	MCPServers         *[]agent.MCPServerConfig
-	Provider           *string
-	Model              *string
-	Temperature        *float64
-	MaxSteps           *int
-	MaxTokens          *int
-	MaxRuns            *int
-	ContextKeepRatio   *float64
-	SummarizationModel *string
-}
-
-func (r *AgentRepo) Update(ctx context.Context, agentID, userID string, input UpdateAgentInput) (*agent.Agent, error) {
+func (r *AgentRepo) Update(ctx context.Context, agentID, userID string, input agent.UpdateAgentInput) (*agent.Agent, error) {
 	aid, err := bson.ObjectIDFromHex(agentID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid agent_id: %w", err)

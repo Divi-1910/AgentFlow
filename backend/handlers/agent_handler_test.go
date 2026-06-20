@@ -13,7 +13,6 @@ import (
 	"backend/agent"
 	"backend/handlers"
 	"backend/middleware"
-	"backend/repository"
 	"backend/tools"
 )
 
@@ -34,7 +33,7 @@ type fakeAgentStore struct {
 	getByIDFn       func(context.Context, string, string) (*agent.Agent, error)
 	getByIDSystemFn func(context.Context, string) (*agent.Agent, error)
 	listFn          func(context.Context, string) ([]*agent.Agent, error)
-	updateFn        func(context.Context, string, string, repository.UpdateAgentInput) (*agent.Agent, error)
+	updateFn        func(context.Context, string, string, agent.UpdateAgentInput) (*agent.Agent, error)
 	deleteFn        func(context.Context, string, string) error
 }
 
@@ -68,7 +67,7 @@ func (f *fakeAgentStore) ListByUser(ctx context.Context, userID string) ([]*agen
 	return []*agent.Agent{}, nil
 }
 
-func (f *fakeAgentStore) Update(ctx context.Context, agentID, userID string, input repository.UpdateAgentInput) (*agent.Agent, error) {
+func (f *fakeAgentStore) Update(ctx context.Context, agentID, userID string, input agent.UpdateAgentInput) (*agent.Agent, error) {
 	if f.updateFn != nil {
 		return f.updateFn(ctx, agentID, userID, input)
 	}
@@ -399,7 +398,7 @@ func TestAgentHandlerUpdateReturns200WithPatchedName(t *testing.T) {
 	t.Parallel()
 	const newName = "updated-name"
 	store := &fakeAgentStore{
-		updateFn: func(_ context.Context, agentID, _ string, input repository.UpdateAgentInput) (*agent.Agent, error) {
+		updateFn: func(_ context.Context, agentID, _ string, input agent.UpdateAgentInput) (*agent.Agent, error) {
 			return &agent.Agent{ID: agentID, Name: *input.Name}, nil
 		},
 	}
@@ -424,7 +423,7 @@ func TestAgentHandlerUpdateAcceptsMaxRuns(t *testing.T) {
 	t.Parallel()
 	const maxRuns = 12
 	store := &fakeAgentStore{
-		updateFn: func(_ context.Context, agentID, _ string, input repository.UpdateAgentInput) (*agent.Agent, error) {
+		updateFn: func(_ context.Context, agentID, _ string, input agent.UpdateAgentInput) (*agent.Agent, error) {
 			if input.MaxRuns == nil || *input.MaxRuns != maxRuns {
 				t.Fatalf("MaxRuns input = %v, want %d", input.MaxRuns, maxRuns)
 			}
@@ -492,7 +491,7 @@ func TestAgentHandlerUpdateRejectsUnknownTool(t *testing.T) {
 func TestAgentHandlerUpdateReturns404WhenNotFound(t *testing.T) {
 	t.Parallel()
 	store := &fakeAgentStore{
-		updateFn: func(_ context.Context, _, _ string, _ repository.UpdateAgentInput) (*agent.Agent, error) {
+		updateFn: func(_ context.Context, _, _ string, _ agent.UpdateAgentInput) (*agent.Agent, error) {
 			return nil, errors.New("agent not found")
 		},
 	}

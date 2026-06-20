@@ -35,7 +35,7 @@ var (
 type BusDelegateInvoker struct {
 	bus           bus.MessageBus
 	pools         *PoolManager
-	agents        AgentStore
+	agents        AgentReader
 	threads       ThreadStore
 	runs          RunStore
 	messages      MessageStore
@@ -47,7 +47,7 @@ type BusDelegateInvoker struct {
 type BusDelegateInvokerConfig struct {
 	Bus           bus.MessageBus
 	Pools         *PoolManager
-	Agents        AgentStore
+	Agents        AgentReader
 	Threads       ThreadStore
 	Runs          RunStore
 	Messages      MessageStore

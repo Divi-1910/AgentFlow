@@ -5,23 +5,23 @@ import (
 	"net/http"
 	"time"
 
-	"backend/model"
+	"backend/agent"
 )
 
 // threadStore is the subset of repository.ThreadRepo used by handlers.
 type threadStore interface {
-	Create(ctx context.Context, userID, agentID, title string) (*model.ThreadDocument, error)
-	GetByID(ctx context.Context, threadID, userID string) (*model.ThreadDocument, error)
-	ListByAgent(ctx context.Context, agentID, userID string) ([]*model.ThreadDocument, error)
+	Create(ctx context.Context, userID, agentID, title string) (*agent.ThreadRecord, error)
+	GetByID(ctx context.Context, threadID, userID string) (*agent.ThreadRecord, error)
+	ListByAgent(ctx context.Context, agentID, userID string) ([]*agent.ThreadRecord, error)
 	UpdateSummary(ctx context.Context, threadID, userID, summary string) error
 }
 
 type ThreadHandler struct {
 	threadRepo threadStore
-	agentRepo  agentStore
+	agentRepo  agentReader
 }
 
-func NewThreadHandler(threadRepo threadStore, agentRepo agentStore) *ThreadHandler {
+func NewThreadHandler(threadRepo threadStore, agentRepo agentReader) *ThreadHandler {
 	return &ThreadHandler{
 		threadRepo: threadRepo,
 		agentRepo:  agentRepo,
@@ -40,10 +40,10 @@ type ThreadResponse struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
-func toThreadResponse(t *model.ThreadDocument) ThreadResponse {
+func toThreadResponse(t *agent.ThreadRecord) ThreadResponse {
 	return ThreadResponse{
-		ID:        t.ID.Hex(),
-		AgentID:   t.AgentID.Hex(),
+		ID:        t.ID,
+		AgentID:   t.AgentID,
 		Title:     t.Title,
 		CreatedAt: t.CreatedAt.UTC().Format(time.RFC3339Nano),
 		UpdatedAt: t.UpdatedAt.UTC().Format(time.RFC3339Nano),

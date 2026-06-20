@@ -15,7 +15,6 @@ import (
 	"backend/dispatcher"
 	"backend/handlers"
 	"backend/llm"
-	"backend/model"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
@@ -39,8 +38,8 @@ func newFlushable() *flushableRecorder {
 
 type fakeMessageStore struct {
 	listRecentFn func(context.Context, string, int) ([]llm.ChatMessage, error)
-	insertManyFn func(context.Context, string, string, string, []llm.ChatMessage) ([]model.MessageDocument, error)
-	listDocsFn   func(context.Context, string, int) ([]model.MessageDocument, error)
+	insertManyFn func(context.Context, string, string, string, []llm.ChatMessage) ([]agent.MessageRecord, error)
+	listDocsFn   func(context.Context, string, int) ([]agent.MessageRecord, error)
 }
 
 func (f *fakeMessageStore) ListRecentByThread(ctx context.Context, threadID string, limit int) ([]llm.ChatMessage, error) {
@@ -50,18 +49,18 @@ func (f *fakeMessageStore) ListRecentByThread(ctx context.Context, threadID stri
 	return []llm.ChatMessage{}, nil
 }
 
-func (f *fakeMessageStore) InsertMany(ctx context.Context, threadID, agentID, userID string, msgs []llm.ChatMessage) ([]model.MessageDocument, error) {
+func (f *fakeMessageStore) InsertMany(ctx context.Context, threadID, agentID, userID string, msgs []llm.ChatMessage) ([]agent.MessageRecord, error) {
 	if f.insertManyFn != nil {
 		return f.insertManyFn(ctx, threadID, agentID, userID, msgs)
 	}
-	return []model.MessageDocument{}, nil
+	return []agent.MessageRecord{}, nil
 }
 
-func (f *fakeMessageStore) ListDocsByThread(ctx context.Context, threadID string, limit int) ([]model.MessageDocument, error) {
+func (f *fakeMessageStore) ListDocsByThread(ctx context.Context, threadID string, limit int) ([]agent.MessageRecord, error) {
 	if f.listDocsFn != nil {
 		return f.listDocsFn(ctx, threadID, limit)
 	}
-	return []model.MessageDocument{}, nil
+	return []agent.MessageRecord{}, nil
 }
 
 // ── fakeDispatcher ────────────────────────────────────────────────────────────
@@ -144,14 +143,11 @@ func fakeAgentObj() *agent.Agent {
 	}
 }
 
-func fakeThreadDoc() *model.ThreadDocument {
-	agentOID, _ := bson.ObjectIDFromHex(testAgentID)
-	threadOID, _ := bson.ObjectIDFromHex(testThreadID)
-	userOID, _ := bson.ObjectIDFromHex(testUserID)
-	return &model.ThreadDocument{
-		ID:        threadOID,
-		AgentID:   agentOID,
-		UserID:    userOID,
+func fakeThreadDoc() *agent.ThreadRecord {
+	return &agent.ThreadRecord{
+		ID:        testThreadID,
+		AgentID:   testAgentID,
+		UserID:    testUserID,
 		Title:     "test thread",
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
@@ -177,7 +173,7 @@ func defaultStores() (*fakeAgentStore, *fakeThreadStore, *fakeMessageStore) {
 		getByIDFn: func(_ context.Context, _, _ string) (*agent.Agent, error) { return ag, nil },
 	}
 	ts := &fakeThreadStore{
-		getByIDFn: func(_ context.Context, _, _ string) (*model.ThreadDocument, error) { return thread, nil },
+		getByIDFn: func(_ context.Context, _, _ string) (*agent.ThreadRecord, error) { return thread, nil },
 	}
 	ms := &fakeMessageStore{}
 	return as, ts, ms
@@ -201,7 +197,7 @@ func TestMessageHandlerListRejectsUnauthorized(t *testing.T) {
 func TestMessageHandlerListReturns404WhenThreadNotFound(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
-	ts.getByIDFn = func(_ context.Context, _, _ string) (*model.ThreadDocument, error) {
+	ts.getByIDFn = func(_ context.Context, _, _ string) (*agent.ThreadRecord, error) {
 		return nil, errors.New("thread not found")
 	}
 	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
@@ -218,7 +214,7 @@ func TestMessageHandlerListReturns404WhenThreadNotFound(t *testing.T) {
 func TestMessageHandlerListForwardsThreadRepoError(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
-	ts.getByIDFn = func(_ context.Context, _, _ string) (*model.ThreadDocument, error) {
+	ts.getByIDFn = func(_ context.Context, _, _ string) (*agent.ThreadRecord, error) {
 		return nil, errors.New("db timeout") // not "thread not found"
 	}
 	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
@@ -235,7 +231,7 @@ func TestMessageHandlerListForwardsThreadRepoError(t *testing.T) {
 func TestMessageHandlerListForwardsMessageRepoError(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
-	ms.listDocsFn = func(_ context.Context, _ string, _ int) ([]model.MessageDocument, error) {
+	ms.listDocsFn = func(_ context.Context, _ string, _ int) ([]agent.MessageRecord, error) {
 		return nil, errors.New("db down")
 	}
 	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
@@ -272,10 +268,10 @@ func TestMessageHandlerListReturnsMessages(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
 	oid := bson.NewObjectID()
-	ms.listDocsFn = func(_ context.Context, _ string, _ int) ([]model.MessageDocument, error) {
-		return []model.MessageDocument{
-			{ID: oid, Role: "user", Content: "hello", CreatedAt: time.Now()},
-			{ID: bson.NewObjectID(), Role: "assistant", Content: "hi", CreatedAt: time.Now()},
+	ms.listDocsFn = func(_ context.Context, _ string, _ int) ([]agent.MessageRecord, error) {
+		return []agent.MessageRecord{
+			{ID: oid.Hex(), Role: "user", Content: "hello", CreatedAt: time.Now()},
+			{ID: bson.NewObjectID().Hex(), Role: "assistant", Content: "hi", CreatedAt: time.Now()},
 		}, nil
 	}
 	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
@@ -301,9 +297,9 @@ func TestMessageHandlerListParseLimitDefault(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
 	var capturedLimit int
-	ms.listDocsFn = func(_ context.Context, _ string, limit int) ([]model.MessageDocument, error) {
+	ms.listDocsFn = func(_ context.Context, _ string, limit int) ([]agent.MessageRecord, error) {
 		capturedLimit = limit
-		return []model.MessageDocument{}, nil
+		return []agent.MessageRecord{}, nil
 	}
 	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/messages", nil)
@@ -321,9 +317,9 @@ func TestMessageHandlerListParseLimitCustom(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
 	var capturedLimit int
-	ms.listDocsFn = func(_ context.Context, _ string, limit int) ([]model.MessageDocument, error) {
+	ms.listDocsFn = func(_ context.Context, _ string, limit int) ([]agent.MessageRecord, error) {
 		capturedLimit = limit
-		return []model.MessageDocument{}, nil
+		return []agent.MessageRecord{}, nil
 	}
 	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/messages?limit=10", nil)
@@ -340,9 +336,9 @@ func TestMessageHandlerListParseLimitCappedAtMax(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
 	var capturedLimit int
-	ms.listDocsFn = func(_ context.Context, _ string, limit int) ([]model.MessageDocument, error) {
+	ms.listDocsFn = func(_ context.Context, _ string, limit int) ([]agent.MessageRecord, error) {
 		capturedLimit = limit
-		return []model.MessageDocument{}, nil
+		return []agent.MessageRecord{}, nil
 	}
 	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
 	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/messages?limit=9999", nil)
@@ -411,7 +407,7 @@ func TestMessageHandlerSendRejectsEmptyContent(t *testing.T) {
 func TestMessageHandlerSendReturns404WhenThreadNotFound(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
-	ts.getByIDFn = func(_ context.Context, _, _ string) (*model.ThreadDocument, error) {
+	ts.getByIDFn = func(_ context.Context, _, _ string) (*agent.ThreadRecord, error) {
 		return nil, errors.New("thread not found")
 	}
 	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
@@ -428,7 +424,7 @@ func TestMessageHandlerSendReturns404WhenThreadNotFound(t *testing.T) {
 func TestMessageHandlerSendForwardsThreadRepoError(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
-	ts.getByIDFn = func(_ context.Context, _, _ string) (*model.ThreadDocument, error) {
+	ts.getByIDFn = func(_ context.Context, _, _ string) (*agent.ThreadRecord, error) {
 		return nil, errors.New("db timeout")
 	}
 	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)
@@ -540,7 +536,7 @@ func TestMessageHandlerSendStreamsRunCompletedEvent(t *testing.T) {
 func TestMessageHandlerSendEmitsPersistFailEventOnInsertError(t *testing.T) {
 	t.Parallel()
 	as, ts, ms := defaultStores()
-	ms.insertManyFn = func(_ context.Context, _, _, _ string, _ []llm.ChatMessage) ([]model.MessageDocument, error) {
+	ms.insertManyFn = func(_ context.Context, _, _, _ string, _ []llm.ChatMessage) ([]agent.MessageRecord, error) {
 		return nil, errors.New("insert failed")
 	}
 	h := newMessageHandler(as, ts, ms, &fakeDispatcher{}, nil)

@@ -13,7 +13,7 @@ import (
 )
 
 type RunPreparerConfig struct {
-	Agents       AgentStore
+	Agents       AgentReader
 	Threads      ThreadStore
 	Messages     MessageStore
 	Runs         agent.CheckpointStore
@@ -25,7 +25,7 @@ type RunPreparerConfig struct {
 }
 
 type RunPreparer struct {
-	agents       AgentStore
+	agents       AgentReader
 	threads      ThreadStore
 	messages     MessageStore
 	runs         agent.CheckpointStore
@@ -97,7 +97,7 @@ func (p *RunPreparer) prepareFresh(ctx context.Context, req DispatchRequest) (Pr
 	if err != nil {
 		return PreparedRun{}, fmt.Errorf("dispatcher: load thread: %w", err)
 	}
-	threadAgentID := thread.AgentID.Hex()
+	threadAgentID := thread.AgentID
 	if req.AgentID != "" && req.AgentID != threadAgentID {
 		return PreparedRun{}, fmt.Errorf("dispatcher: request agent %s does not own thread %s", req.AgentID, req.ThreadID)
 	}

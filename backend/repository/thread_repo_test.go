@@ -25,11 +25,11 @@ func TestThreadRepoCreateAndGetByID(t *testing.T) {
 	if thread.Title != "my thread" {
 		t.Errorf("Title: got %q, want %q", thread.Title, "my thread")
 	}
-	if thread.ID.IsZero() {
+	if thread.ID == "" {
 		t.Fatal("expected non-zero ID")
 	}
 
-	got, err := r.GetByID(ctx, thread.ID.Hex(), threadUserID)
+	got, err := r.GetByID(ctx, thread.ID, threadUserID)
 	if err != nil {
 		t.Fatalf("GetByID: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestThreadRepoGetByIDWrongUserReturnsNotFound(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	_, err = r.GetByID(ctx, thread.ID.Hex(), threadOtherID)
+	_, err = r.GetByID(ctx, thread.ID, threadOtherID)
 	if err == nil {
 		t.Fatal("expected error for wrong user, got nil")
 	}
@@ -108,11 +108,11 @@ func TestThreadRepoUpdateSummaryPersists(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	if err := r.UpdateSummary(ctx, thread.ID.Hex(), threadUserID, "this is the summary"); err != nil {
+	if err := r.UpdateSummary(ctx, thread.ID, threadUserID, "this is the summary"); err != nil {
 		t.Fatalf("UpdateSummary: %v", err)
 	}
 
-	got, err := r.GetByID(ctx, thread.ID.Hex(), threadUserID)
+	got, err := r.GetByID(ctx, thread.ID, threadUserID)
 	if err != nil {
 		t.Fatalf("GetByID: %v", err)
 	}

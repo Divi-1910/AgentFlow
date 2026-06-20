@@ -70,6 +70,10 @@ func (r *MemoryRevisionRepo) EnsureIndexes(ctx context.Context) error {
 	return nil
 }
 
+// Append writes a new revision. It is idempotent by mutation_id: replaying the
+// same mutation on the same lineage returns the existing revision with the bool
+// set true (no duplicate row). Reusing a mutation_id on a DIFFERENT lineage is
+// rejected with ErrRevisionConflict. A fresh insert returns the bool false.
 func (r *MemoryRevisionRepo) Append(ctx context.Context, rev memory.MemoryRevision) (*memory.MemoryRevision, bool, error) {
 	raw := fromMemoryRevision(rev)
 	if _, err := r.col.InsertOne(ctx, raw); err != nil {

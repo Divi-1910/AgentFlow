@@ -14,7 +14,7 @@ import (
 )
 
 type RunHandler struct {
-	agentRepo    agentStore
+	agentRepo    agentReader
 	messageRepo  messageStore
 	runRepo      agent.CheckpointStore
 	dispatcher   dispatcher.Dispatcher
@@ -22,7 +22,7 @@ type RunHandler struct {
 }
 
 func NewRunHandler(
-	agentRepo agentStore,
+	agentRepo agentReader,
 	messageRepo messageStore,
 	runRepo agent.CheckpointStore,
 	disp dispatcher.Dispatcher,

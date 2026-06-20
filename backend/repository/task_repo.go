@@ -39,6 +39,11 @@ func (r *TaskRepo) EnsureIndexes(ctx context.Context) error {
 	return nil
 }
 
+// EnsureTask idempotently creates the run-budget ledger for an originator run.
+// The FIRST creation owns max_runs: a later EnsureTask with a different max_runs
+// does NOT overwrite it (setOnInsert). Only missing or non-positive budget
+// fields are repaired afterward (backfill), so an existing ledger's cap and
+// usage are never reset.
 func (r *TaskRepo) EnsureTask(ctx context.Context, originatorRunID, userID string, maxRuns int) error {
 	if originatorRunID == "" {
 		return nil
@@ -130,6 +135,11 @@ func (r *TaskRepo) BudgetStatus(ctx context.Context, originatorRunID string) (ag
 	return taskBudgetStatus(doc), nil
 }
 
+// TryConsumeRun atomically consumes one run from the budget and reports whether
+// it was granted. It is idempotent by budgetKey: replaying the same key returns
+// true WITHOUT charging a second run (keys are recorded in run_budget_keys).
+// When runs_used has reached max_runs the call returns (status, false) with
+// status.Exhausted set — never an error.
 func (r *TaskRepo) TryConsumeRun(ctx context.Context, originatorRunID, userID, budgetKey string) (agent.RunBudgetStatus, bool, error) {
 	if originatorRunID == "" {
 		return budgetStatus(originatorRunID, agent.DefaultMaxTaskRuns, 0), true, nil

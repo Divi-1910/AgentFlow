@@ -57,6 +57,11 @@ func (r *JobRepo) EnsureIndexes(ctx context.Context) error {
 	return nil
 }
 
+// DispatchAgent idempotently creates the job for (parent_run_id, tool_call_id)
+// and returns its dispatch result. A replay of the same key returns the EXISTING
+// job unchanged — even if the request payload (task, mode, …) differs, the new
+// payload is ignored rather than treated as a conflict. The run budget is
+// consumed at most once, on first creation.
 func (r *JobRepo) DispatchAgent(ctx context.Context, req agent.DispatchAgentRequest) (agent.DispatchAgentResult, error) {
 	if req.ParentRunID == "" || req.ToolCallID == "" {
 		return agent.DispatchAgentResult{}, errors.New("job_repo: parent_run_id and tool_call_id are required")
@@ -145,6 +150,8 @@ func dispatchResultFromJob(doc model.JobDocument) agent.DispatchAgentResult {
 	}
 }
 
+// AwaitJob returns the current state of an owned job. Pending is true iff the
+// job has not reached a terminal status; a terminal job carries its Output/Error.
 func (r *JobRepo) AwaitJob(ctx context.Context, req agent.AwaitJobRequest) (agent.AwaitJobResult, error) {
 	doc, err := r.getOwnedJob(ctx, req.JobID, req.UserID, req.OriginatorRunID)
 	if err != nil {

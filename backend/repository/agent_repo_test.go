@@ -135,7 +135,7 @@ func TestAgentRepoUpdate(t *testing.T) {
 	}
 
 	newName := "updated-name"
-	updated, err := r.Update(ctx, created.ID, userA, repository.UpdateAgentInput{Name: &newName})
+	updated, err := r.Update(ctx, created.ID, userA, agent.UpdateAgentInput{Name: &newName})
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestAgentRepoUpdateNotFound(t *testing.T) {
 	}
 
 	newName := "hacked"
-	_, err = r.Update(ctx, created.ID, userB, repository.UpdateAgentInput{Name: &newName})
+	_, err = r.Update(ctx, created.ID, userB, agent.UpdateAgentInput{Name: &newName})
 	if err == nil {
 		t.Fatal("expected error for wrong user, got nil")
 	}

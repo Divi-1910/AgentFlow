@@ -11,7 +11,6 @@ import (
 	"backend/agent"
 	"backend/bus"
 	"backend/llm"
-	"backend/model"
 	"backend/runtimectx"
 )
 
@@ -32,14 +31,14 @@ type capturingMessageStore struct {
 func (c *capturingMessageStore) ListRecentByThread(context.Context, string, int) ([]llm.ChatMessage, error) {
 	return nil, nil
 }
-func (c *capturingMessageStore) InsertMany(_ context.Context, threadID, _, _ string, msgs []llm.ChatMessage) ([]model.MessageDocument, error) {
+func (c *capturingMessageStore) InsertMany(_ context.Context, threadID, _, _ string, msgs []llm.ChatMessage) ([]agent.MessageRecord, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.threadID = threadID
 	c.msgs = append(c.msgs, msgs...)
 	return nil, nil
 }
-func (c *capturingMessageStore) ListDocsByThread(context.Context, string, int) ([]model.MessageDocument, error) {
+func (c *capturingMessageStore) ListDocsByThread(context.Context, string, int) ([]agent.MessageRecord, error) {
 	return nil, nil
 }
 
@@ -426,7 +425,7 @@ func TestInvoker_CallerCancelAfterDispatchLeavesStatusToWorker(t *testing.T) {
 	}
 }
 
-func testThreadDoc() *model.ThreadDocument {
+func testThreadDoc() *agent.ThreadRecord {
 	// Reuse the preparer's thread shape so prepareFresh's agent-ownership
 	// check passes when the delegate target is testAgentID.
 	preparer := newTestPreparer(&fakeRuntime{})

@@ -250,7 +250,7 @@ func TestSameTargetDelegateBatchUsesMongoSubThreadHistory(t *testing.T) {
 		t.Fatalf("create thread: %v", err)
 	}
 	runID := uuid.NewString()
-	if err := runRepo.CreateRun(ctx, runID, thread.ID.Hex(), supervisor.ID, userID); err != nil {
+	if err := runRepo.CreateRun(ctx, runID, thread.ID, supervisor.ID, userID); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 
@@ -272,7 +272,7 @@ func TestSameTargetDelegateBatchUsesMongoSubThreadHistory(t *testing.T) {
 		RunID:    runID,
 		AgentID:  supervisor.ID,
 		UserID:   userID,
-		ThreadID: thread.ID.Hex(),
+		ThreadID: thread.ID,
 		Input:    "store and recall pineapple",
 	}, events)
 	if err != nil {
@@ -419,7 +419,7 @@ func TestSyncDelegateRunBudgetLimitsSupervisorFanout(t *testing.T) {
 		t.Fatalf("create thread: %v", err)
 	}
 	runID := uuid.NewString()
-	if err := runRepo.CreateRun(ctx, runID, thread.ID.Hex(), supervisor.ID, userID); err != nil {
+	if err := runRepo.CreateRun(ctx, runID, thread.ID, supervisor.ID, userID); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 
@@ -441,7 +441,7 @@ func TestSyncDelegateRunBudgetLimitsSupervisorFanout(t *testing.T) {
 		RunID:    runID,
 		AgentID:  supervisor.ID,
 		UserID:   userID,
-		ThreadID: thread.ID.Hex(),
+		ThreadID: thread.ID,
 		Input:    "delegate twice",
 	}, events)
 	if err != nil {

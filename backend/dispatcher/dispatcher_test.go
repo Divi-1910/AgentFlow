@@ -11,11 +11,7 @@ import (
 	"backend/agent"
 	"backend/bus"
 	"backend/llm"
-	"backend/model"
-	"backend/repository"
 	"backend/tools"
-
-	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 const (
@@ -222,10 +218,7 @@ func TestRunPreparerFreshTopLevelEnsuresTaskBudgetFromRootAgent(t *testing.T) {
 
 	rt := &fakeRuntime{}
 	agentObj := &agent.Agent{ID: testAgentID, Provider: "fake", Model: "fake", MaxSteps: 5, MaxRuns: 13}
-	agentOID, _ := bson.ObjectIDFromHex(testAgentID)
-	threadOID, _ := bson.ObjectIDFromHex(testThreadID)
-	userOID, _ := bson.ObjectIDFromHex(testUserID)
-	thread := &model.ThreadDocument{ID: threadOID, AgentID: agentOID, UserID: userOID}
+	thread := &agent.ThreadRecord{ID: testThreadID, AgentID: testAgentID, UserID: testUserID}
 	tasks := &fakeBudgetStore{}
 	preparer := NewRunPreparer(RunPreparerConfig{
 		Agents:       &fakeAgentStore{agent: agentObj},
@@ -365,10 +358,7 @@ func TestAgentPool_CancelDuringPrepareAbortsRun(t *testing.T) {
 	}
 
 	agentObj := &agent.Agent{ID: testAgentID, Provider: "fake", Model: "fake", MaxSteps: 5}
-	agentOID, _ := bson.ObjectIDFromHex(testAgentID)
-	threadOID, _ := bson.ObjectIDFromHex(testThreadID)
-	userOID, _ := bson.ObjectIDFromHex(testUserID)
-	thread := &model.ThreadDocument{ID: threadOID, AgentID: agentOID, UserID: userOID, Summary: "summary"}
+	thread := &agent.ThreadRecord{ID: testThreadID, AgentID: testAgentID, UserID: testUserID, Summary: "summary"}
 
 	preparer := NewRunPreparer(RunPreparerConfig{
 		Agents:       &fakeAgentStore{agent: agentObj},
@@ -463,23 +453,23 @@ func (f *fakeAgentStore) GetByIDSystem(context.Context, string) (*agent.Agent, e
 func (f *fakeAgentStore) ListByUser(context.Context, string) ([]*agent.Agent, error) {
 	return []*agent.Agent{f.agent}, nil
 }
-func (f *fakeAgentStore) Update(context.Context, string, string, repository.UpdateAgentInput) (*agent.Agent, error) {
+func (f *fakeAgentStore) Update(context.Context, string, string, agent.UpdateAgentInput) (*agent.Agent, error) {
 	return f.agent, nil
 }
 func (f *fakeAgentStore) Delete(context.Context, string, string) error { return nil }
 
 type fakeThreadStore struct {
-	thread *model.ThreadDocument
+	thread *agent.ThreadRecord
 }
 
-func (f *fakeThreadStore) Create(context.Context, string, string, string) (*model.ThreadDocument, error) {
+func (f *fakeThreadStore) Create(context.Context, string, string, string) (*agent.ThreadRecord, error) {
 	return f.thread, nil
 }
-func (f *fakeThreadStore) GetByID(context.Context, string, string) (*model.ThreadDocument, error) {
+func (f *fakeThreadStore) GetByID(context.Context, string, string) (*agent.ThreadRecord, error) {
 	return f.thread, nil
 }
-func (f *fakeThreadStore) ListByAgent(context.Context, string, string) ([]*model.ThreadDocument, error) {
-	return []*model.ThreadDocument{f.thread}, nil
+func (f *fakeThreadStore) ListByAgent(context.Context, string, string) ([]*agent.ThreadRecord, error) {
+	return []*agent.ThreadRecord{f.thread}, nil
 }
 func (f *fakeThreadStore) UpdateSummary(context.Context, string, string, string) error { return nil }
 func (f *fakeThreadStore) FindOrCreateSubThread(_ context.Context, _, originatorRunID, agentID string) (string, error) {
@@ -493,10 +483,10 @@ type fakeMessageStore struct {
 func (f *fakeMessageStore) ListRecentByThread(context.Context, string, int) ([]llm.ChatMessage, error) {
 	return f.messages, nil
 }
-func (f *fakeMessageStore) InsertMany(context.Context, string, string, string, []llm.ChatMessage) ([]model.MessageDocument, error) {
+func (f *fakeMessageStore) InsertMany(context.Context, string, string, string, []llm.ChatMessage) ([]agent.MessageRecord, error) {
 	return nil, nil
 }
-func (f *fakeMessageStore) ListDocsByThread(context.Context, string, int) ([]model.MessageDocument, error) {
+func (f *fakeMessageStore) ListDocsByThread(context.Context, string, int) ([]agent.MessageRecord, error) {
 	return nil, nil
 }
 
@@ -515,10 +505,10 @@ func (g *gatedMessageStore) ListRecentByThread(context.Context, string, int) ([]
 	<-g.release
 	return g.messages, nil
 }
-func (g *gatedMessageStore) InsertMany(context.Context, string, string, string, []llm.ChatMessage) ([]model.MessageDocument, error) {
+func (g *gatedMessageStore) InsertMany(context.Context, string, string, string, []llm.ChatMessage) ([]agent.MessageRecord, error) {
 	return nil, nil
 }
-func (g *gatedMessageStore) ListDocsByThread(context.Context, string, int) ([]model.MessageDocument, error) {
+func (g *gatedMessageStore) ListDocsByThread(context.Context, string, int) ([]agent.MessageRecord, error) {
 	return nil, nil
 }
 
@@ -554,15 +544,7 @@ func (f *fakeRunStore) GetRunForUser(context.Context, string, string) (*agent.Ru
 
 func newTestPreparer(rt *fakeRuntime) *RunPreparer {
 	agentObj := &agent.Agent{ID: testAgentID, Provider: "fake", Model: "fake", MaxSteps: 5}
-	agentOID, _ := bson.ObjectIDFromHex(testAgentID)
-	threadOID, _ := bson.ObjectIDFromHex(testThreadID)
-	userOID, _ := bson.ObjectIDFromHex(testUserID)
-	thread := &model.ThreadDocument{
-		ID:      threadOID,
-		AgentID: agentOID,
-		UserID:  userOID,
-		Summary: "summary",
-	}
+	thread := &agent.ThreadRecord{ID: testThreadID, AgentID: testAgentID, UserID: testUserID, Summary: "summary"}
 	return NewRunPreparer(RunPreparerConfig{
 		Agents:       &fakeAgentStore{agent: agentObj},
 		Threads:      &fakeThreadStore{thread: thread},

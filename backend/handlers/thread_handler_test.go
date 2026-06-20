@@ -12,7 +12,6 @@ import (
 
 	"backend/agent"
 	"backend/handlers"
-	"backend/model"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
@@ -20,31 +19,31 @@ import (
 // ── fakeThreadStore ───────────────────────────────────────────────────────────
 
 type fakeThreadStore struct {
-	createFn        func(context.Context, string, string, string) (*model.ThreadDocument, error)
-	getByIDFn       func(context.Context, string, string) (*model.ThreadDocument, error)
-	listByAgentFn   func(context.Context, string, string) ([]*model.ThreadDocument, error)
+	createFn        func(context.Context, string, string, string) (*agent.ThreadRecord, error)
+	getByIDFn       func(context.Context, string, string) (*agent.ThreadRecord, error)
+	listByAgentFn   func(context.Context, string, string) ([]*agent.ThreadRecord, error)
 	updateSummaryFn func(context.Context, string, string, string) error
 }
 
-func (f *fakeThreadStore) Create(ctx context.Context, userID, agentID, title string) (*model.ThreadDocument, error) {
+func (f *fakeThreadStore) Create(ctx context.Context, userID, agentID, title string) (*agent.ThreadRecord, error) {
 	if f.createFn != nil {
 		return f.createFn(ctx, userID, agentID, title)
 	}
 	return fakeThread(title), nil
 }
 
-func (f *fakeThreadStore) GetByID(ctx context.Context, threadID, userID string) (*model.ThreadDocument, error) {
+func (f *fakeThreadStore) GetByID(ctx context.Context, threadID, userID string) (*agent.ThreadRecord, error) {
 	if f.getByIDFn != nil {
 		return f.getByIDFn(ctx, threadID, userID)
 	}
 	return fakeThread("thread"), nil
 }
 
-func (f *fakeThreadStore) ListByAgent(ctx context.Context, agentID, userID string) ([]*model.ThreadDocument, error) {
+func (f *fakeThreadStore) ListByAgent(ctx context.Context, agentID, userID string) ([]*agent.ThreadRecord, error) {
 	if f.listByAgentFn != nil {
 		return f.listByAgentFn(ctx, agentID, userID)
 	}
-	return []*model.ThreadDocument{}, nil
+	return []*agent.ThreadRecord{}, nil
 }
 
 func (f *fakeThreadStore) UpdateSummary(ctx context.Context, threadID, userID, summary string) error {
@@ -56,11 +55,11 @@ func (f *fakeThreadStore) UpdateSummary(ctx context.Context, threadID, userID, s
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-func fakeThread(title string) *model.ThreadDocument {
-	return &model.ThreadDocument{
-		ID:        bson.NewObjectID(),
-		AgentID:   bson.NewObjectID(),
-		UserID:    bson.NewObjectID(),
+func fakeThread(title string) *agent.ThreadRecord {
+	return &agent.ThreadRecord{
+		ID:        bson.NewObjectID().Hex(),
+		AgentID:   bson.NewObjectID().Hex(),
+		UserID:    bson.NewObjectID().Hex(),
 		Title:     title,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
@@ -151,7 +150,7 @@ func TestThreadHandlerCreateReturns201(t *testing.T) {
 func TestThreadHandlerCreateForwardsThreadRepoError(t *testing.T) {
 	t.Parallel()
 	threadStore := &fakeThreadStore{
-		createFn: func(_ context.Context, _, _, _ string) (*model.ThreadDocument, error) {
+		createFn: func(_ context.Context, _, _, _ string) (*agent.ThreadRecord, error) {
 			return nil, errors.New("insert failed")
 		},
 	}
@@ -190,8 +189,8 @@ func TestThreadHandlerListByAgentReturns404WhenAgentNotFound(t *testing.T) {
 func TestThreadHandlerListByAgentReturnsThreads(t *testing.T) {
 	t.Parallel()
 	threadStore := &fakeThreadStore{
-		listByAgentFn: func(_ context.Context, _, _ string) ([]*model.ThreadDocument, error) {
-			return []*model.ThreadDocument{fakeThread("t1"), fakeThread("t2")}, nil
+		listByAgentFn: func(_ context.Context, _, _ string) ([]*agent.ThreadRecord, error) {
+			return []*agent.ThreadRecord{fakeThread("t1"), fakeThread("t2")}, nil
 		},
 	}
 	h := newThreadHandler(&fakeAgentStore{}, threadStore)

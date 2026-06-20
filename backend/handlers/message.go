@@ -11,7 +11,6 @@ import (
 	"backend/agent"
 	"backend/dispatcher"
 	"backend/llm"
-	"backend/model"
 
 	"github.com/google/uuid"
 )
@@ -19,12 +18,12 @@ import (
 // messageStore is the subset of repository.MessageRepo used by MessageHandler.
 type messageStore interface {
 	ListRecentByThread(ctx context.Context, threadID string, limit int) ([]llm.ChatMessage, error)
-	InsertMany(ctx context.Context, threadID, agentID, userID string, messages []llm.ChatMessage) ([]model.MessageDocument, error)
-	ListDocsByThread(ctx context.Context, threadID string, limit int) ([]model.MessageDocument, error)
+	InsertMany(ctx context.Context, threadID, agentID, userID string, messages []llm.ChatMessage) ([]agent.MessageRecord, error)
+	ListDocsByThread(ctx context.Context, threadID string, limit int) ([]agent.MessageRecord, error)
 }
 
 type MessageHandler struct {
-	agentRepo   agentStore
+	agentRepo   agentReader
 	threadRepo  threadStore
 	messageRepo messageStore
 	dispatcher  dispatcher.Dispatcher
@@ -32,7 +31,7 @@ type MessageHandler struct {
 }
 
 func NewMessageHandler(
-	agentRepo agentStore,
+	agentRepo agentReader,
 	threadRepo threadStore,
 	messageRepo messageStore,
 	disp dispatcher.Dispatcher,
@@ -100,7 +99,7 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ag, err := h.agentRepo.GetByID(ctx, thread.AgentID.Hex(), userID)
+	ag, err := h.agentRepo.GetByID(ctx, thread.AgentID, userID)
 	if err != nil {
 		if err.Error() == "agent not found" {
 			writeError(w, http.StatusNotFound, "agent not found")
@@ -175,7 +174,7 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 	if sr.clientDisconnected {
 		if out.res != nil {
 			allMessages := append([]llm.ChatMessage{{Role: "user", Content: req.Content}}, out.res.NewMessages...)
-			_, _ = h.messageRepo.InsertMany(persistCtx, threadID, thread.AgentID.Hex(), userID, allMessages)
+			_, _ = h.messageRepo.InsertMany(persistCtx, threadID, thread.AgentID, userID, allMessages)
 		}
 		return
 	}
@@ -185,7 +184,7 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 			[]llm.ChatMessage{{Role: "user", Content: req.Content}},
 			out.res.NewMessages...,
 		)
-		docs, err := h.messageRepo.InsertMany(persistCtx, threadID, thread.AgentID.Hex(), userID, allMessages)
+		docs, err := h.messageRepo.InsertMany(persistCtx, threadID, thread.AgentID, userID, allMessages)
 		if err != nil {
 			runLogger.Error("message persist failed", "error", err)
 			emitEvent(w, flusher, agent.StreamEvent{
@@ -204,9 +203,9 @@ func (h *MessageHandler) Send(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func toMessageResponse(doc model.MessageDocument) MessageResponse {
+func toMessageResponse(doc agent.MessageRecord) MessageResponse {
 	return MessageResponse{
-		ID:         doc.ID.Hex(),
+		ID:         doc.ID,
 		Role:       doc.Role,
 		Content:    doc.Content,
 		ToolCallID: doc.ToolCallID,

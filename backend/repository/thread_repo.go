@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"backend/agent"
 	"backend/model"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -20,7 +21,7 @@ func NewThreadRepo(col *mongo.Collection) *ThreadRepo {
 	return &ThreadRepo{col: col}
 }
 
-func (r *ThreadRepo) Create(ctx context.Context, userID, agentID, title string) (*model.ThreadDocument, error) {
+func (r *ThreadRepo) Create(ctx context.Context, userID, agentID, title string) (*agent.ThreadRecord, error) {
 	uid, err := bson.ObjectIDFromHex(userID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid user_id: %w", err)
@@ -48,10 +49,10 @@ func (r *ThreadRepo) Create(ctx context.Context, userID, agentID, title string) 
 		return nil, fmt.Errorf("thread_repo: insert failed: %w", err)
 	}
 
-	return &doc, nil
+	return toThreadRecord(doc), nil
 }
 
-func (r *ThreadRepo) GetByID(ctx context.Context, threadID, userID string) (*model.ThreadDocument, error) {
+func (r *ThreadRepo) GetByID(ctx context.Context, threadID, userID string) (*agent.ThreadRecord, error) {
 	tid, err := bson.ObjectIDFromHex(threadID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid thread_id: %w", err)
@@ -70,10 +71,10 @@ func (r *ThreadRepo) GetByID(ctx context.Context, threadID, userID string) (*mod
 		return nil, fmt.Errorf("thread_repo: find failed: %w", err)
 	}
 
-	return &doc, nil
+	return toThreadRecord(doc), nil
 }
 
-func (r *ThreadRepo) ListByAgent(ctx context.Context, agentID, userID string) ([]*model.ThreadDocument, error) {
+func (r *ThreadRepo) ListByAgent(ctx context.Context, agentID, userID string) ([]*agent.ThreadRecord, error) {
 	aid, err := bson.ObjectIDFromHex(agentID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid agent_id: %w", err)
@@ -95,12 +96,16 @@ func (r *ThreadRepo) ListByAgent(ctx context.Context, agentID, userID string) ([
 	}
 	defer cursor.Close(ctx)
 
-	var docs []*model.ThreadDocument
+	var docs []model.ThreadDocument
 	if err := cursor.All(ctx, &docs); err != nil {
 		return nil, fmt.Errorf("thread_repo: decode failed: %w", err)
 	}
 
-	return docs, nil
+	records := make([]*agent.ThreadRecord, len(docs))
+	for i, doc := range docs {
+		records[i] = toThreadRecord(doc)
+	}
+	return records, nil
 }
 
 // FindOrCreateSubThread returns the sub-thread for (userID, originatorRunID,
@@ -193,4 +198,21 @@ func (r *ThreadRepo) UpdateSummary(ctx context.Context, threadID, userID, summar
 	}
 
 	return nil
+}
+
+// toThreadRecord translates a stored BSON document into the storage-neutral
+// domain record, rendering ObjectIDs as hex strings.
+func toThreadRecord(doc model.ThreadDocument) *agent.ThreadRecord {
+	return &agent.ThreadRecord{
+		ID:              doc.ID.Hex(),
+		UserID:          doc.UserID.Hex(),
+		AgentID:         doc.AgentID.Hex(),
+		Kind:            doc.Kind,
+		OriginatorRunID: doc.OriginatorRunID,
+		Title:           doc.Title,
+		Summary:         doc.Summary,
+		Metadata:        doc.Metadata,
+		CreatedAt:       doc.CreatedAt,
+		UpdatedAt:       doc.UpdatedAt,
+	}
 }

@@ -389,13 +389,13 @@ func (f *coordinatorFakeRuns) GetRun(_ context.Context, runID string) (*agent.Ru
 
 type coordinatorFakeThreads struct{}
 
-func (f *coordinatorFakeThreads) Create(context.Context, string, string, string) (*model.ThreadDocument, error) {
+func (f *coordinatorFakeThreads) Create(context.Context, string, string, string) (*agent.ThreadRecord, error) {
 	return nil, nil
 }
-func (f *coordinatorFakeThreads) GetByID(context.Context, string, string) (*model.ThreadDocument, error) {
+func (f *coordinatorFakeThreads) GetByID(context.Context, string, string) (*agent.ThreadRecord, error) {
 	return nil, nil
 }
-func (f *coordinatorFakeThreads) ListByAgent(context.Context, string, string) ([]*model.ThreadDocument, error) {
+func (f *coordinatorFakeThreads) ListByAgent(context.Context, string, string) ([]*agent.ThreadRecord, error) {
 	return nil, nil
 }
 func (f *coordinatorFakeThreads) UpdateSummary(context.Context, string, string, string) error {

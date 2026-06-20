@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"backend/agent"
-	"backend/repository"
 	"backend/tools"
 )
 
@@ -35,13 +34,21 @@ type MCPServerConfigJSON struct {
 	BearerEnv string `json:"bearer_env,omitempty"`
 }
 
-// agentStore is the subset of repository.AgentRepo used by handlers.
-type agentStore interface {
-	Create(ctx context.Context, userID string, a *agent.Agent) (*agent.Agent, error)
+// agentReader is the read-only subset used by the thread/message/run handlers,
+// which only ever load agents (never mutate them).
+type agentReader interface {
 	GetByID(ctx context.Context, agentID, userID string) (*agent.Agent, error)
 	GetByIDSystem(ctx context.Context, agentID string) (*agent.Agent, error)
+}
+
+// agentStore is the full read/write agent store used by AgentHandler (the
+// Studio's agent CRUD). The runtime/dispatcher never depend on this — they use
+// the narrower dispatcher.AgentReader.
+type agentStore interface {
+	agentReader
+	Create(ctx context.Context, userID string, a *agent.Agent) (*agent.Agent, error)
 	ListByUser(ctx context.Context, userID string) ([]*agent.Agent, error)
-	Update(ctx context.Context, agentID, userID string, input repository.UpdateAgentInput) (*agent.Agent, error)
+	Update(ctx context.Context, agentID, userID string, input agent.UpdateAgentInput) (*agent.Agent, error)
 	Delete(ctx context.Context, agentID, userID string) error
 }
 
@@ -283,7 +290,7 @@ func (h *AgentHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	agentID := r.PathValue("id")
-	input := repository.UpdateAgentInput{
+	input := agent.UpdateAgentInput{
 		Name:               req.Name,
 		Description:        req.Description,
 		Provider:           req.Provider,

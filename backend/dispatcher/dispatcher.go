@@ -6,8 +6,6 @@ import (
 
 	"backend/agent"
 	"backend/llm"
-	"backend/model"
-	"backend/repository"
 )
 
 type Dispatcher interface {
@@ -81,19 +79,19 @@ type Runtime interface {
 	EstimateSystemPromptTokens(ctx context.Context, ag *agent.Agent, runCtx agent.RunContext) int
 }
 
-type AgentStore interface {
-	Create(ctx context.Context, userID string, a *agent.Agent) (*agent.Agent, error)
+// AgentReader is the read-only agent port the run/delegate path depends on:
+// loading an agent to prepare or resume a run. The Studio's full read/write
+// store lives in the handlers package; the runtime never needs agent writes,
+// so depending on the reader keeps this package free of the repository layer.
+type AgentReader interface {
 	GetByID(ctx context.Context, agentID, userID string) (*agent.Agent, error)
 	GetByIDSystem(ctx context.Context, agentID string) (*agent.Agent, error)
-	ListByUser(ctx context.Context, userID string) ([]*agent.Agent, error)
-	Update(ctx context.Context, agentID, userID string, input repository.UpdateAgentInput) (*agent.Agent, error)
-	Delete(ctx context.Context, agentID, userID string) error
 }
 
 type ThreadStore interface {
-	Create(ctx context.Context, userID, agentID, title string) (*model.ThreadDocument, error)
-	GetByID(ctx context.Context, threadID, userID string) (*model.ThreadDocument, error)
-	ListByAgent(ctx context.Context, agentID, userID string) ([]*model.ThreadDocument, error)
+	Create(ctx context.Context, userID, agentID, title string) (*agent.ThreadRecord, error)
+	GetByID(ctx context.Context, threadID, userID string) (*agent.ThreadRecord, error)
+	ListByAgent(ctx context.Context, agentID, userID string) ([]*agent.ThreadRecord, error)
 	UpdateSummary(ctx context.Context, threadID, userID, summary string) error
 	FindOrCreateSubThread(ctx context.Context, userID, originatorRunID, agentID string) (string, error)
 }
@@ -108,8 +106,8 @@ type RunStore interface {
 
 type MessageStore interface {
 	ListRecentByThread(ctx context.Context, threadID string, limit int) ([]llm.ChatMessage, error)
-	InsertMany(ctx context.Context, threadID, agentID, userID string, messages []llm.ChatMessage) ([]model.MessageDocument, error)
-	ListDocsByThread(ctx context.Context, threadID string, limit int) ([]model.MessageDocument, error)
+	InsertMany(ctx context.Context, threadID, agentID, userID string, messages []llm.ChatMessage) ([]agent.MessageRecord, error)
+	ListDocsByThread(ctx context.Context, threadID string, limit int) ([]agent.MessageRecord, error)
 }
 
 type Summarizer interface {

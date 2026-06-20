@@ -69,6 +69,27 @@ type MCPServerConfig struct {
 	BearerEnv string
 }
 
+// UpdateAgentInput is the storage-neutral patch contract for an agent update: a
+// nil field is left unchanged, a non-nil field is applied. It lives in the agent
+// domain (not a storage package) so every consumer of the agent-write store —
+// and every backend that implements it — speaks the same domain type.
+type UpdateAgentInput struct {
+	Name               *string
+	Description        *string
+	SystemPrompt       *string
+	Tools              *[]string
+	Delegates          *[]DelegateConfig
+	MCPServers         *[]MCPServerConfig
+	Provider           *string
+	Model              *string
+	Temperature        *float64
+	MaxSteps           *int
+	MaxTokens          *int
+	MaxRuns            *int
+	ContextKeepRatio   *float64
+	SummarizationModel *string
+}
+
 type RunContext struct {
 	RunID         string
 	ThreadID      string

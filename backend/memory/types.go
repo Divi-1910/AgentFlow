@@ -114,9 +114,12 @@ const (
 // memory metadata.
 const SummaryMaxChars = 200
 
-// MetaStore is the persistence interface for memory metadata.
-// The concrete implementation stores records in MongoDB.
-// A lightweight in-memory fake is used in unit tests.
+// MetaStore is the storage-neutral persistence port for memory metadata. Index
+// creation / migrations are a concrete-adapter concern (the Mongo repo exposes
+// EnsureIndexes, called at Studio startup) and are deliberately NOT part of this
+// contract, so an alternate backend (e.g. SQLite for the Runtime) need not fake
+// DDL it doesn't have. The concrete Mongo impl runs in production; a lightweight
+// in-memory fake is used in unit tests.
 type MetaStore interface {
 	// Upsert creates or updates the metadata record for a memory document.
 	// It must NOT overwrite last_read_at — that field is managed exclusively
@@ -141,18 +144,17 @@ type MetaStore interface {
 	// SoftDelete is retained for legacy repository tests and older callers.
 	// Versioned memories are retired by appending a revision instead.
 	SoftDelete(ctx context.Context, agentID, scope, memoryID string) error
-
-	// EnsureIndexes creates the required MongoDB indexes (idempotent).
-	EnsureIndexes(ctx context.Context) error
 }
 
+// RevisionStore is the storage-neutral persistence port for the append-only
+// memory revision log. As with MetaStore, index/DDL lifecycle is a
+// concrete-adapter concern and is intentionally excluded from the port.
 type RevisionStore interface {
 	Append(ctx context.Context, rev MemoryRevision) (*MemoryRevision, bool, error)
 	FindByMutation(ctx context.Context, mutationID string) (*MemoryRevision, error)
 	Latest(ctx context.Context, lineageKey string) (*MemoryRevision, error)
 	FindRevision(ctx context.Context, lineageKey string, revision int) (*MemoryRevision, error)
 	List(ctx context.Context, lineageKey string) ([]MemoryRevision, error)
-	EnsureIndexes(ctx context.Context) error
 }
 
 // ── Args / Results ────────────────────────────────────────────────────────────
