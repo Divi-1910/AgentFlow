@@ -5,7 +5,7 @@
 // Each suite is a Run*Conformance(t, factory) function: the factory returns a
 // fresh, ready-to-use store (indexes ensured, collection isolated) per call, so
 // the suite is independent of any concrete backend. Today the Mongo repositories
-// are wired to these suites (see repository/conformance_test.go); when the
+// are wired to these suites (see repo/mongorepo/conformance_test.go); when the
 // SQLite backend lands for the Runtime, wiring it to the SAME suites is the
 // operational definition of "it behaves like the Studio's store."
 //

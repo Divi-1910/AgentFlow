@@ -9,7 +9,7 @@ import (
 	"backend/llm"
 	"backend/memory"
 	"backend/middleware"
-	"backend/repository"
+	"backend/repo/mongorepo"
 	"backend/scratchpad"
 	"backend/tools"
 	"context"
@@ -104,19 +104,19 @@ func main() {
 	jobLocksCol := db.GetCollection(dbName, "job_locks")
 	tasksCol := db.GetCollection(dbName, "tasks")
 
-	userRepo := repository.NewUserRepo(usersCol)
+	userRepo := mongorepo.NewUserRepo(usersCol)
 	authHandler := handlers.NewAuthHandler(userRepo, nil) // nil → defaults to auth.GenerateToken
 
 	llmRegistry := llm.NewLLMRegistry()
 
 	memoryMetaCol := db.GetCollection(dbName, "memory_meta")
 	memoryRevisionCol := db.GetCollection(dbName, "memory_revisions")
-	memoryMetaRepo := repository.NewMemoryMetaRepo(memoryMetaCol)
+	memoryMetaRepo := mongorepo.NewMemoryMetaRepo(memoryMetaCol)
 	if err := memoryMetaRepo.EnsureIndexes(context.Background()); err != nil {
 		slog.Error("failed to create memory meta indexes", "error", err)
 		os.Exit(1)
 	}
-	memoryRevisionRepo := repository.NewMemoryRevisionRepo(memoryRevisionCol)
+	memoryRevisionRepo := mongorepo.NewMemoryRevisionRepo(memoryRevisionCol)
 	if err := memoryRevisionRepo.EnsureIndexes(context.Background()); err != nil {
 		slog.Error("failed to create memory revision indexes", "error", err)
 		os.Exit(1)
@@ -138,15 +138,15 @@ func main() {
 	toolRegistry := tools.NewToolRegistry(db.GetRedis(), memorySvc, scratchpadSvc)
 	mcpManager := tools.NewMCPManager(&http.Client{Timeout: 60 * time.Second})
 
-	llmModelRepo := repository.NewLLMModelRepo(llmRegistryCol)
+	llmModelRepo := mongorepo.NewLLMModelRepo(llmRegistryCol)
 	llmHandler := handlers.NewLLMHandler(llmModelRepo, llmRegistry)
 
-	agentRepo := repository.NewAgentRepo(agentsCol, llmRegistryCol)
-	threadRepo := repository.NewThreadRepo(threadsCol)
-	messageRepo := repository.NewMessageRepo(messagesCol)
-	runRepo := repository.NewRunRepo(runsCol, checkpointsCol)
-	jobRepo := repository.NewJobRepo(jobsCol, jobLocksCol)
-	taskRepo := repository.NewTaskRepo(tasksCol)
+	agentRepo := mongorepo.NewAgentRepo(agentsCol, llmRegistryCol)
+	threadRepo := mongorepo.NewThreadRepo(threadsCol)
+	messageRepo := mongorepo.NewMessageRepo(messagesCol)
+	runRepo := mongorepo.NewRunRepo(runsCol, checkpointsCol)
+	jobRepo := mongorepo.NewJobRepo(jobsCol, jobLocksCol)
+	taskRepo := mongorepo.NewTaskRepo(tasksCol)
 	jobRepo.SetTaskBudgetStore(taskRepo)
 
 	if err := runRepo.EnsureIndexes(context.Background()); err != nil {

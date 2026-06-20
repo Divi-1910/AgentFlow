@@ -1,11 +1,11 @@
-package repository_test
+package mongorepo_test
 
 import (
 	"context"
 	"testing"
 
 	"backend/agent"
-	"backend/repository"
+	"backend/repo/mongorepo"
 )
 
 // testAgent returns a minimal valid agent.Agent for insertion.
@@ -24,9 +24,9 @@ func testAgent(name string) *agent.Agent {
 
 // agentRepo returns an AgentRepo with isolated collections for the calling test.
 // The second (model) collection is empty; resolveContextLimit falls back gracefully.
-func agentRepo(t *testing.T) *repository.AgentRepo {
+func agentRepo(t *testing.T) *mongorepo.AgentRepo {
 	t.Helper()
-	return repository.NewAgentRepo(col(t, "agents"), col(t, "models"))
+	return mongorepo.NewAgentRepo(col(t, "agents"), col(t, "models"))
 }
 
 const (

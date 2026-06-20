@@ -1,4 +1,4 @@
-package repository_test
+package mongorepo_test
 
 import (
 	"context"
@@ -8,15 +8,15 @@ import (
 	"backend/agent"
 	"backend/llm"
 	"backend/model"
-	"backend/repository"
+	"backend/repo/mongorepo"
 
 	"github.com/google/uuid"
 )
 
 // newRunRepo creates a RunRepo with isolated collections and ensures indexes.
-func newRunRepo(t *testing.T) *repository.RunRepo {
+func newRunRepo(t *testing.T) *mongorepo.RunRepo {
 	t.Helper()
-	r := repository.NewRunRepo(col(t, "runs"), col(t, "checkpoints"))
+	r := mongorepo.NewRunRepo(col(t, "runs"), col(t, "checkpoints"))
 	if err := r.EnsureIndexes(context.Background()); err != nil {
 		t.Fatalf("EnsureIndexes: %v", err)
 	}

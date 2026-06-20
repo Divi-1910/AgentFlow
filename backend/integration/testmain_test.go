@@ -19,7 +19,7 @@ import (
 	"backend/handlers"
 	"backend/llm"
 	"backend/middleware"
-	"backend/repository"
+	"backend/repo/mongorepo"
 	"backend/tools"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -61,8 +61,8 @@ func TestMain(m *testing.M) {
 // test-side data setup (e.g. pre-seeding a run document).
 type testEnv struct {
 	srv         *httptest.Server
-	runRepo     *repository.RunRepo // exposed for run tests
-	llmModelCol *mongo.Collection   // exposed for LLM model seeding
+	runRepo     *mongorepo.RunRepo // exposed for run tests
+	llmModelCol *mongo.Collection  // exposed for LLM model seeding
 }
 
 // runtimeFn mirrors the dispatcher.Dispatcher interface.
@@ -91,13 +91,13 @@ func newTestEnvWithRuntime(t *testing.T, rt runtimeFn) *testEnv {
 	}
 
 	// Real repos ──────────────────────────────────────────────────────────────
-	userRepo := repository.NewUserRepo(col("users"))
-	agentRepo := repository.NewAgentRepo(col("agents"), col("models"))
-	threadRepo := repository.NewThreadRepo(col("threads"))
-	messageRepo := repository.NewMessageRepo(col("messages"))
+	userRepo := mongorepo.NewUserRepo(col("users"))
+	agentRepo := mongorepo.NewAgentRepo(col("agents"), col("models"))
+	threadRepo := mongorepo.NewThreadRepo(col("threads"))
+	messageRepo := mongorepo.NewMessageRepo(col("messages"))
 	llmModelCol := col("llm_models")
-	llmModelRepo := repository.NewLLMModelRepo(llmModelCol)
-	runRepo := repository.NewRunRepo(col("runs"), col("checkpoints"))
+	llmModelRepo := mongorepo.NewLLMModelRepo(llmModelCol)
+	runRepo := mongorepo.NewRunRepo(col("runs"), col("checkpoints"))
 	if err := runRepo.EnsureIndexes(context.Background()); err != nil {
 		t.Fatalf("EnsureIndexes: %v", err)
 	}

@@ -1,11 +1,11 @@
-package repository_test
+package mongorepo_test
 
 import (
 	"context"
 	"testing"
 
 	"backend/model"
-	"backend/repository"
+	"backend/repo/mongorepo"
 )
 
 func TestLLMModelRepoListAll(t *testing.T) {
@@ -21,7 +21,7 @@ func TestLLMModelRepoListAll(t *testing.T) {
 		t.Fatalf("seed InsertMany: %v", err)
 	}
 
-	r := repository.NewLLMModelRepo(c)
+	r := mongorepo.NewLLMModelRepo(c)
 	models, err := r.ListAll(ctx)
 	if err != nil {
 		t.Fatalf("ListAll: %v", err)
@@ -32,7 +32,7 @@ func TestLLMModelRepoListAll(t *testing.T) {
 }
 
 func TestLLMModelRepoListAllEmptyReturnsEmptySlice(t *testing.T) {
-	r := repository.NewLLMModelRepo(col(t, "llm_models"))
+	r := mongorepo.NewLLMModelRepo(col(t, "llm_models"))
 	ctx := context.Background()
 
 	models, err := r.ListAll(ctx)

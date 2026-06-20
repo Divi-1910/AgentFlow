@@ -15,7 +15,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// messageStore is the subset of repository.MessageRepo used by MessageHandler.
+// messageStore is the subset of mongorepo.MessageRepo used by MessageHandler.
 type messageStore interface {
 	ListRecentByThread(ctx context.Context, threadID string, limit int) ([]llm.ChatMessage, error)
 	InsertMany(ctx context.Context, threadID, agentID, userID string, messages []llm.ChatMessage) ([]agent.MessageRecord, error)

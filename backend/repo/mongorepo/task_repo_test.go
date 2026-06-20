@@ -1,4 +1,4 @@
-package repository_test
+package mongorepo_test
 
 import (
 	"context"
@@ -7,16 +7,16 @@ import (
 
 	"backend/agent"
 	"backend/model"
-	"backend/repository"
+	"backend/repo/mongorepo"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
-func newTaskRepo(t *testing.T) (*repository.TaskRepo, *mongo.Collection) {
+func newTaskRepo(t *testing.T) (*mongorepo.TaskRepo, *mongo.Collection) {
 	t.Helper()
 	tasks := col(t, "tasks")
-	r := repository.NewTaskRepo(tasks)
+	r := mongorepo.NewTaskRepo(tasks)
 	if err := r.EnsureIndexes(context.Background()); err != nil {
 		t.Fatalf("EnsureIndexes: %v", err)
 	}

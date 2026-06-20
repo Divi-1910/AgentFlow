@@ -1,4 +1,4 @@
-package repository_test
+package mongorepo_test
 
 import (
 	"context"
@@ -9,29 +9,29 @@ import (
 
 	"backend/agent"
 	"backend/model"
-	"backend/repository"
+	"backend/repo/mongorepo"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
-func newJobRepo(t *testing.T) (*repository.JobRepo, *mongo.Collection, *mongo.Collection) {
+func newJobRepo(t *testing.T) (*mongorepo.JobRepo, *mongo.Collection, *mongo.Collection) {
 	t.Helper()
 	jobs := col(t, "jobs")
 	locks := col(t, "job_locks")
-	r := repository.NewJobRepo(jobs, locks)
+	r := mongorepo.NewJobRepo(jobs, locks)
 	if err := r.EnsureIndexes(context.Background()); err != nil {
 		t.Fatalf("EnsureIndexes: %v", err)
 	}
 	return r, jobs, locks
 }
 
-func dispatchRequiredJob(t *testing.T, r *repository.JobRepo) agent.DispatchAgentResult {
+func dispatchRequiredJob(t *testing.T, r *mongorepo.JobRepo) agent.DispatchAgentResult {
 	t.Helper()
 	return dispatchRequiredJobWithToolCall(t, r, "dispatch-1")
 }
 
-func dispatchRequiredJobWithToolCall(t *testing.T, r *repository.JobRepo, toolCallID string) agent.DispatchAgentResult {
+func dispatchRequiredJobWithToolCall(t *testing.T, r *mongorepo.JobRepo, toolCallID string) agent.DispatchAgentResult {
 	t.Helper()
 	res, err := r.DispatchAgent(context.Background(), agent.DispatchAgentRequest{
 		ParentRunID:     "parent-run",

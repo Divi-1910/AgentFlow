@@ -1,4 +1,4 @@
-package repository_test
+package mongorepo_test
 
 import (
 	"context"
@@ -6,14 +6,14 @@ import (
 	"time"
 
 	"backend/memory"
-	"backend/repository"
+	"backend/repo/mongorepo"
 	"backend/runtimectx"
 )
 
-func newMetaRepo(t *testing.T) *repository.MemoryMetaRepo {
+func newMetaRepo(t *testing.T) *mongorepo.MemoryMetaRepo {
 	t.Helper()
 	c := col(t, "memory_meta")
-	repo := repository.NewMemoryMetaRepo(c)
+	repo := mongorepo.NewMemoryMetaRepo(c)
 	if err := repo.EnsureIndexes(context.Background()); err != nil {
 		t.Fatalf("EnsureIndexes: %v", err)
 	}
@@ -44,7 +44,7 @@ func bodyPathForDoc(t *testing.T, doc memory.MemoryDocument) string {
 	return bodyPath
 }
 
-func findProjected(t *testing.T, repo *repository.MemoryMetaRepo, execScope runtimectx.MemoryScope, docScope, memoryID string) *memory.MemoryDocument {
+func findProjected(t *testing.T, repo *mongorepo.MemoryMetaRepo, execScope runtimectx.MemoryScope, docScope, memoryID string) *memory.MemoryDocument {
 	t.Helper()
 	docs, err := repo.FindActive(context.Background(), execScope, docScope, nil, true, time.Now().UTC())
 	if err != nil {

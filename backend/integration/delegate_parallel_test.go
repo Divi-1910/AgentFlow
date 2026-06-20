@@ -13,7 +13,7 @@ import (
 	"backend/bus"
 	"backend/dispatcher"
 	"backend/llm"
-	"backend/repository"
+	"backend/repo/mongorepo"
 	"backend/tools"
 
 	"github.com/google/uuid"
@@ -165,14 +165,14 @@ func TestSameTargetDelegateBatchUsesMongoSubThreadHistory(t *testing.T) {
 		return c
 	}
 
-	agentRepo := repository.NewAgentRepo(col("agents"), col("models"))
+	agentRepo := mongorepo.NewAgentRepo(col("agents"), col("models"))
 	threadCol := col("threads")
-	threadRepo := repository.NewThreadRepo(threadCol)
+	threadRepo := mongorepo.NewThreadRepo(threadCol)
 	if err := threadRepo.EnsureIndexes(ctx); err != nil {
 		t.Fatalf("Thread EnsureIndexes: %v", err)
 	}
-	messageRepo := repository.NewMessageRepo(col("messages"))
-	runRepo := repository.NewRunRepo(col("runs"), col("checkpoints"))
+	messageRepo := mongorepo.NewMessageRepo(col("messages"))
+	runRepo := mongorepo.NewRunRepo(col("runs"), col("checkpoints"))
 	if err := runRepo.EnsureIndexes(ctx); err != nil {
 		t.Fatalf("Run EnsureIndexes: %v", err)
 	}
@@ -324,20 +324,20 @@ func TestSyncDelegateRunBudgetLimitsSupervisorFanout(t *testing.T) {
 		return c
 	}
 
-	agentRepo := repository.NewAgentRepo(col("agents"), col("models"))
+	agentRepo := mongorepo.NewAgentRepo(col("agents"), col("models"))
 	threadCol := col("threads")
-	threadRepo := repository.NewThreadRepo(threadCol)
+	threadRepo := mongorepo.NewThreadRepo(threadCol)
 	if err := threadRepo.EnsureIndexes(ctx); err != nil {
 		t.Fatalf("Thread EnsureIndexes: %v", err)
 	}
-	messageRepo := repository.NewMessageRepo(col("messages"))
+	messageRepo := mongorepo.NewMessageRepo(col("messages"))
 	runsCol := col("runs")
-	runRepo := repository.NewRunRepo(runsCol, col("checkpoints"))
+	runRepo := mongorepo.NewRunRepo(runsCol, col("checkpoints"))
 	if err := runRepo.EnsureIndexes(ctx); err != nil {
 		t.Fatalf("Run EnsureIndexes: %v", err)
 	}
 	taskCol := col("tasks")
-	taskRepo := repository.NewTaskRepo(taskCol)
+	taskRepo := mongorepo.NewTaskRepo(taskCol)
 	if err := taskRepo.EnsureIndexes(ctx); err != nil {
 		t.Fatalf("Task EnsureIndexes: %v", err)
 	}

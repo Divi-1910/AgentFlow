@@ -1,10 +1,10 @@
-package repository_test
+package mongorepo_test
 
 import (
 	"context"
 	"testing"
 
-	"backend/repository"
+	"backend/repo/mongorepo"
 )
 
 const (
@@ -15,7 +15,7 @@ const (
 )
 
 func TestThreadRepoCreateAndGetByID(t *testing.T) {
-	r := repository.NewThreadRepo(col(t, "threads"))
+	r := mongorepo.NewThreadRepo(col(t, "threads"))
 	ctx := context.Background()
 
 	thread, err := r.Create(ctx, threadUserID, agentAID, "my thread")
@@ -39,7 +39,7 @@ func TestThreadRepoCreateAndGetByID(t *testing.T) {
 }
 
 func TestThreadRepoCreateDefaultsEmptyTitle(t *testing.T) {
-	r := repository.NewThreadRepo(col(t, "threads"))
+	r := mongorepo.NewThreadRepo(col(t, "threads"))
 	ctx := context.Background()
 
 	thread, err := r.Create(ctx, threadUserID, agentAID, "")
@@ -52,7 +52,7 @@ func TestThreadRepoCreateDefaultsEmptyTitle(t *testing.T) {
 }
 
 func TestThreadRepoGetByIDWrongUserReturnsNotFound(t *testing.T) {
-	r := repository.NewThreadRepo(col(t, "threads"))
+	r := mongorepo.NewThreadRepo(col(t, "threads"))
 	ctx := context.Background()
 
 	thread, err := r.Create(ctx, threadUserID, agentAID, "private")
@@ -70,7 +70,7 @@ func TestThreadRepoGetByIDWrongUserReturnsNotFound(t *testing.T) {
 }
 
 func TestThreadRepoListByAgentScoped(t *testing.T) {
-	r := repository.NewThreadRepo(col(t, "threads"))
+	r := mongorepo.NewThreadRepo(col(t, "threads"))
 	ctx := context.Background()
 
 	for _, title := range []string{"t1", "t2"} {
@@ -100,7 +100,7 @@ func TestThreadRepoListByAgentScoped(t *testing.T) {
 }
 
 func TestThreadRepoUpdateSummaryPersists(t *testing.T) {
-	r := repository.NewThreadRepo(col(t, "threads"))
+	r := mongorepo.NewThreadRepo(col(t, "threads"))
 	ctx := context.Background()
 
 	thread, err := r.Create(ctx, threadUserID, agentAID, "summarize me")

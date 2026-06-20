@@ -1,4 +1,4 @@
-package repository_test
+package mongorepo_test
 
 import (
 	"context"
@@ -7,13 +7,13 @@ import (
 	"time"
 
 	"backend/memory"
-	"backend/repository"
+	"backend/repo/mongorepo"
 	"backend/runtimectx"
 )
 
-func newRevisionRepo(t *testing.T) *repository.MemoryRevisionRepo {
+func newRevisionRepo(t *testing.T) *mongorepo.MemoryRevisionRepo {
 	t.Helper()
-	repo := repository.NewMemoryRevisionRepo(col(t, "memory_revisions"))
+	repo := mongorepo.NewMemoryRevisionRepo(col(t, "memory_revisions"))
 	if err := repo.EnsureIndexes(context.Background()); err != nil {
 		t.Fatalf("EnsureIndexes: %v", err)
 	}

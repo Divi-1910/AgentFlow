@@ -8,7 +8,7 @@ import (
 	"backend/agent"
 )
 
-// threadStore is the subset of repository.ThreadRepo used by handlers.
+// threadStore is the subset of mongorepo.ThreadRepo used by handlers.
 type threadStore interface {
 	Create(ctx context.Context, userID, agentID, title string) (*agent.ThreadRecord, error)
 	GetByID(ctx context.Context, threadID, userID string) (*agent.ThreadRecord, error)

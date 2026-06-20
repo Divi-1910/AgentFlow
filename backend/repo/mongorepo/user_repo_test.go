@@ -1,4 +1,4 @@
-package repository_test
+package mongorepo_test
 
 import (
 	"context"
@@ -6,13 +6,13 @@ import (
 	"time"
 
 	"backend/model"
-	"backend/repository"
+	"backend/repo/mongorepo"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 func TestUserRepoInsertAndFindByEmail(t *testing.T) {
-	r := repository.NewUserRepo(col(t, "users"))
+	r := mongorepo.NewUserRepo(col(t, "users"))
 	ctx := context.Background()
 
 	u := &model.User{
@@ -49,7 +49,7 @@ func TestUserRepoInsertAndFindByEmail(t *testing.T) {
 }
 
 func TestUserRepoFindByEmailReturnsNilForMissing(t *testing.T) {
-	r := repository.NewUserRepo(col(t, "users"))
+	r := mongorepo.NewUserRepo(col(t, "users"))
 	ctx := context.Background()
 
 	got, err := r.FindByEmail(ctx, "nobody@example.com")
@@ -62,7 +62,7 @@ func TestUserRepoFindByEmailReturnsNilForMissing(t *testing.T) {
 }
 
 func TestUserRepoFindByIDRoundTrip(t *testing.T) {
-	r := repository.NewUserRepo(col(t, "users"))
+	r := mongorepo.NewUserRepo(col(t, "users"))
 	ctx := context.Background()
 
 	u := &model.User{
@@ -95,7 +95,7 @@ func TestUserRepoFindByIDRoundTrip(t *testing.T) {
 }
 
 func TestUserRepoFindByIDReturnsNilForMissing(t *testing.T) {
-	r := repository.NewUserRepo(col(t, "users"))
+	r := mongorepo.NewUserRepo(col(t, "users"))
 	ctx := context.Background()
 
 	got, err := r.FindByID(ctx, "507f1f77bcf86cd799439099")

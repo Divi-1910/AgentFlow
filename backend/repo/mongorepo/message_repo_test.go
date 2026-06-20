@@ -1,4 +1,4 @@
-package repository_test
+package mongorepo_test
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"backend/llm"
-	"backend/repository"
+	"backend/repo/mongorepo"
 )
 
 const (
@@ -16,7 +16,7 @@ const (
 )
 
 func TestMessageRepoInsertManyAndListInOrder(t *testing.T) {
-	r := repository.NewMessageRepo(col(t, "messages"))
+	r := mongorepo.NewMessageRepo(col(t, "messages"))
 	ctx := context.Background()
 
 	// Insert in two separate calls with a gap so MongoDB's millisecond-precision
@@ -48,7 +48,7 @@ func TestMessageRepoInsertManyAndListInOrder(t *testing.T) {
 }
 
 func TestMessageRepoListDocsByThreadRespectsLimit(t *testing.T) {
-	r := repository.NewMessageRepo(col(t, "messages"))
+	r := mongorepo.NewMessageRepo(col(t, "messages"))
 	ctx := context.Background()
 
 	msgs := make([]llm.ChatMessage, 5)
@@ -69,7 +69,7 @@ func TestMessageRepoListDocsByThreadRespectsLimit(t *testing.T) {
 }
 
 func TestMessageRepoListRecentByThreadReturnsChatMessages(t *testing.T) {
-	r := repository.NewMessageRepo(col(t, "messages"))
+	r := mongorepo.NewMessageRepo(col(t, "messages"))
 	ctx := context.Background()
 
 	// Separate inserts with a gap to ensure distinct millisecond timestamps.
@@ -99,7 +99,7 @@ func TestMessageRepoListRecentByThreadReturnsChatMessages(t *testing.T) {
 }
 
 func TestMessageRepoEmptyThreadReturnsEmptySlice(t *testing.T) {
-	r := repository.NewMessageRepo(col(t, "messages"))
+	r := mongorepo.NewMessageRepo(col(t, "messages"))
 	ctx := context.Background()
 
 	docs, err := r.ListDocsByThread(ctx, msgThreadID, 50)
@@ -112,7 +112,7 @@ func TestMessageRepoEmptyThreadReturnsEmptySlice(t *testing.T) {
 }
 
 func TestMessageRepoInsertManyPreservesToolCallID(t *testing.T) {
-	r := repository.NewMessageRepo(col(t, "messages"))
+	r := mongorepo.NewMessageRepo(col(t, "messages"))
 	ctx := context.Background()
 
 	msgs := []llm.ChatMessage{
