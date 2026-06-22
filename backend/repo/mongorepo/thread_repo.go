@@ -148,7 +148,15 @@ func (r *ThreadRepo) FindOrCreateSubThread(ctx context.Context, userID, originat
 
 	var doc model.ThreadDocument
 	if err := r.col.FindOneAndUpdate(ctx, filter, update, opts).Decode(&doc); err != nil {
-		return "", fmt.Errorf("thread_repo: find-or-create sub-thread: %w", err)
+		if !mongo.IsDuplicateKeyError(err) {
+			return "", fmt.Errorf("thread_repo: find-or-create sub-thread: %w", err)
+		}
+		// Two upserts can both miss before the unique index admits one. The
+		// loser reads the winner instead of leaking a transient duplicate-key
+		// error through the storage-neutral port.
+		if findErr := r.col.FindOne(ctx, filter).Decode(&doc); findErr != nil {
+			return "", fmt.Errorf("thread_repo: recover raced sub-thread: %w", findErr)
+		}
 	}
 	return doc.ID.Hex(), nil
 }

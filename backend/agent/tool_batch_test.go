@@ -87,6 +87,7 @@ func newRuntimeWithTools(lm llm.LLMClient, store CheckpointStore, testTools ...t
 		toolRegistry:    toolReg,
 		contextBuilder:  newTestContextBuilder(),
 		checkpointStore: store,
+		capabilities:    ToolCapabilities{AsyncJobs: true},
 	}
 	ag := &Agent{
 		ID:           "agent-a",
@@ -618,6 +619,7 @@ func newRuntimeWithDelegates(lm llm.LLMClient, inv DelegateInvoker, delegates []
 		llmRegistry:    llmReg,
 		toolRegistry:   tools.NewEmptyRegistry(),
 		contextBuilder: newTestContextBuilder(),
+		capabilities:   ToolCapabilities{AsyncJobs: true},
 	}
 	rt.SetDelegateInvoker(inv)
 	ag := &Agent{

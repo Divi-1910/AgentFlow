@@ -114,7 +114,7 @@ func newTestEnvWithRuntime(t *testing.T, rt runtimeFn) *testEnv {
 		agentRepo, threadRepo, messageRepo, rt, runRepo,
 	)
 	llmHandler := handlers.NewLLMHandler(llmModelRepo, llmReg)
-	runHandler := handlers.NewRunHandler(agentRepo, messageRepo, runRepo, rt, toolReg)
+	runHandler := handlers.NewRunHandler(agentRepo, messageRepo, runRepo, rt, toolReg, agent.ToolCapabilities{AsyncJobs: true})
 
 	// Routing — mirrors main.go ────────────────────────────────────────────────
 	mux := http.NewServeMux()

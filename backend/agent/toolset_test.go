@@ -45,7 +45,7 @@ func TestBuildToolSet_IncludesDelegatesInDefinitionsAndLookup(t *testing.T) {
 			{AgentID: "agent-b", ToolName: "ask_researcher", Description: "delegate research", Instructions: "use sparingly"},
 		},
 	}
-	ts, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag)
+	ts, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag, ToolCapabilities{AsyncJobs: true}, nil)
 	if err != nil {
 		t.Fatalf("BuildToolSet: %v", err)
 	}
@@ -74,14 +74,45 @@ func TestBuildToolSet_IncludesDelegatesInDefinitionsAndLookup(t *testing.T) {
 	}
 }
 
+func TestBuildToolSet_AsyncCapabilityDisabledOmitsAsyncTools(t *testing.T) {
+	t.Parallel()
+	ag := &Agent{ID: "agent-a", Delegates: []DelegateConfig{{AgentID: "agent-b", ToolName: "ask_b"}}}
+	ts, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag, ToolCapabilities{AsyncJobs: false}, nil)
+	if err != nil {
+		t.Fatalf("BuildToolSet: %v", err)
+	}
+	for _, name := range []string{AsyncToolDispatchAgent, AsyncToolAwaitJob} {
+		if ts.Has(name) {
+			t.Fatalf("%s present in lookup with async jobs disabled", name)
+		}
+		for _, def := range ts.Definitions() {
+			if def.Name == name {
+				t.Fatalf("%s present in definitions with async jobs disabled", name)
+			}
+		}
+		for _, ref := range ts.Refs() {
+			if ref.Name == name {
+				t.Fatalf("%s present in resume refs with async jobs disabled", name)
+			}
+		}
+	}
+	asyncSet, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag, ToolCapabilities{AsyncJobs: true}, nil)
+	if err != nil {
+		t.Fatalf("BuildToolSet(async): %v", err)
+	}
+	if ts.Version() == asyncSet.Version() {
+		t.Fatal("toolset version must change when async tools are disabled")
+	}
+}
+
 func TestBuildToolSet_NilInvokerWithDelegatesFails(t *testing.T) {
 	t.Parallel()
 	ag := &Agent{ID: "agent-a", Delegates: []DelegateConfig{{AgentID: "b", ToolName: "ask_b"}}}
 
-	if _, err := BuildToolSet(toolsetTestRegistry(), nil, ag); !errors.Is(err, ErrToolConfig) {
+	if _, err := BuildToolSet(toolsetTestRegistry(), nil, ag, ToolCapabilities{AsyncJobs: true}, nil); !errors.Is(err, ErrToolConfig) {
 		t.Fatalf("execution build with nil invoker: got %v, want ErrToolConfig", err)
 	}
-	if _, err := BuildToolSetForValidation(toolsetTestRegistry(), ag); err != nil {
+	if _, err := BuildToolSetForValidation(toolsetTestRegistry(), ag, ToolCapabilities{AsyncJobs: true}); err != nil {
 		t.Fatalf("validation build with nil invoker should succeed, got %v", err)
 	}
 }
@@ -93,7 +124,7 @@ func TestBuildToolSet_CollisionDelegateVsRegistry(t *testing.T) {
 		Tools:     []string{"calculator"},
 		Delegates: []DelegateConfig{{AgentID: "b", ToolName: "calculator"}},
 	}
-	if _, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag); !errors.Is(err, ErrToolConfig) {
+	if _, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag, ToolCapabilities{AsyncJobs: true}, nil); !errors.Is(err, ErrToolConfig) {
 		t.Fatalf("got %v, want ErrToolConfig for delegate-vs-tool collision", err)
 	}
 }
@@ -106,7 +137,7 @@ func TestBuildToolSet_CollisionDelegateVsGlobalRegistry(t *testing.T) {
 		ID:        "agent-a",
 		Delegates: []DelegateConfig{{AgentID: "b", ToolName: "calculator"}},
 	}
-	if _, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag); !errors.Is(err, ErrToolConfig) {
+	if _, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag, ToolCapabilities{AsyncJobs: true}, nil); !errors.Is(err, ErrToolConfig) {
 		t.Fatalf("got %v, want ErrToolConfig for delegate-vs-global-registry collision", err)
 	}
 }
@@ -120,7 +151,7 @@ func TestBuildToolSet_CollisionDelegateVsDelegate(t *testing.T) {
 			{AgentID: "c", ToolName: "ask_x"},
 		},
 	}
-	if _, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag); !errors.Is(err, ErrToolConfig) {
+	if _, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag, ToolCapabilities{AsyncJobs: true}, nil); !errors.Is(err, ErrToolConfig) {
 		t.Fatalf("got %v, want ErrToolConfig for delegate-vs-delegate collision", err)
 	}
 }
@@ -128,7 +159,7 @@ func TestBuildToolSet_CollisionDelegateVsDelegate(t *testing.T) {
 func TestBuildToolSet_DuplicateTool(t *testing.T) {
 	t.Parallel()
 	ag := &Agent{ID: "agent-a", Tools: []string{"calculator", "calculator"}}
-	if _, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag); !errors.Is(err, ErrToolConfig) {
+	if _, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag, ToolCapabilities{AsyncJobs: true}, nil); !errors.Is(err, ErrToolConfig) {
 		t.Fatalf("got %v, want ErrToolConfig for duplicate tool", err)
 	}
 }
@@ -137,7 +168,7 @@ func TestToolSet_StructHashTracksDelegateTarget(t *testing.T) {
 	t.Parallel()
 	mk := func(target string) ToolRef {
 		ag := &Agent{ID: "agent-a", Delegates: []DelegateConfig{{AgentID: target, ToolName: "ask_x", Description: "d"}}}
-		ts, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag)
+		ts, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag, ToolCapabilities{AsyncJobs: true}, nil)
 		if err != nil {
 			t.Fatalf("BuildToolSet: %v", err)
 		}
@@ -160,7 +191,7 @@ func TestToolSet_CosmeticHashTracksDescriptionNotStructural(t *testing.T) {
 	t.Parallel()
 	mk := func(desc string) ToolRef {
 		ag := &Agent{ID: "agent-a", Delegates: []DelegateConfig{{AgentID: "b", ToolName: "ask_x", Description: desc}}}
-		ts, _ := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag)
+		ts, _ := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag, ToolCapabilities{AsyncJobs: true}, nil)
 		for _, r := range ts.Refs() {
 			if r.Name == "ask_x" {
 				return r

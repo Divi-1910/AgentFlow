@@ -39,7 +39,7 @@ func vToolSet(names ...string) *ToolSet {
 	reg := tools.NewEmptyRegistry()
 	reg.Register(tools.NewCalculatorTool())
 	reg.Register(tools.NewHTTPTool(0, nil))
-	ts, err := BuildToolSetForValidation(reg, &Agent{ID: "agent-x", Tools: names})
+	ts, err := BuildToolSetForValidation(reg, &Agent{ID: "agent-x", Tools: names}, ToolCapabilities{AsyncJobs: true})
 	if err != nil {
 		panic(err)
 	}

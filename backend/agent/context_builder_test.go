@@ -133,7 +133,7 @@ func defsFor(ag *Agent) []llm.ToolDefinition {
 	reg := tools.NewEmptyRegistry()
 	reg.Register(tools.NewCalculatorTool())
 	reg.Register(tools.NewHTTPTool(0, nil))
-	ts, err := BuildToolSetForValidation(reg, ag)
+	ts, err := BuildToolSetForValidation(reg, ag, ToolCapabilities{AsyncJobs: true})
 	if err != nil {
 		panic(err)
 	}

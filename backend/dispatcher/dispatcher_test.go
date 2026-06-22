@@ -227,6 +227,7 @@ func TestRunPreparerFreshTopLevelEnsuresTaskBudgetFromRootAgent(t *testing.T) {
 		Runtime:      rt,
 		ToolRegistry: tools.NewEmptyRegistry(),
 		Tasks:        tasks,
+		Capabilities: agent.ToolCapabilities{AsyncJobs: true},
 	})
 
 	prepared, err := preparer.Prepare(context.Background(), freshDispatchRequest())
@@ -368,6 +369,7 @@ func TestAgentPool_CancelDuringPrepareAbortsRun(t *testing.T) {
 		Runtime:      rt,
 		ToolRegistry: tools.NewEmptyRegistry(),
 		Background:   context.Background(),
+		Capabilities: agent.ToolCapabilities{AsyncJobs: true},
 	})
 
 	pool := NewAgentPool(context.Background(), testAgentID, b, preparer, rt, nil, nil, nil, nil, nil, 1, NewCancelRegistry(0))
@@ -553,6 +555,7 @@ func newTestPreparer(rt *fakeRuntime) *RunPreparer {
 		Runtime:      rt,
 		ToolRegistry: tools.NewEmptyRegistry(),
 		Background:   context.Background(),
+		Capabilities: agent.ToolCapabilities{AsyncJobs: true},
 	})
 }
 

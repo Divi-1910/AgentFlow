@@ -22,6 +22,7 @@ type RunPreparerConfig struct {
 	ToolRegistry *tools.ToolRegistry
 	Tasks        taskBudgetStore
 	Background   context.Context
+	Capabilities agent.ToolCapabilities
 }
 
 type RunPreparer struct {
@@ -34,6 +35,7 @@ type RunPreparer struct {
 	toolRegistry *tools.ToolRegistry
 	tasks        taskBudgetStore
 	background   context.Context
+	capabilities agent.ToolCapabilities
 
 	summarizing sync.Map
 }
@@ -58,6 +60,7 @@ func NewRunPreparer(cfg RunPreparerConfig) *RunPreparer {
 		toolRegistry: cfg.ToolRegistry,
 		tasks:        cfg.Tasks,
 		background:   background,
+		capabilities: cfg.Capabilities,
 	}
 }
 
@@ -224,7 +227,7 @@ func (p *RunPreparer) prepareResume(ctx context.Context, req DispatchRequest) (P
 	}
 
 	if p.toolRegistry != nil {
-		toolSet, err := agent.BuildToolSetForValidation(p.toolRegistry, ag)
+		toolSet, err := agent.BuildToolSetForValidation(p.toolRegistry, ag, p.capabilities)
 		if err != nil {
 			return PreparedRun{}, fmt.Errorf("dispatcher: build tool set for resume: %w", err)
 		}

@@ -36,7 +36,7 @@ func hasMCPName(refs []ToolRef) bool {
 func TestToolSet_MCPExcludedFromResumeIdentity(t *testing.T) {
 	t.Parallel()
 	ag := &Agent{ID: "a", Tools: []string{"calculator"}}
-	ts, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag)
+	ts, err := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag, ToolCapabilities{AsyncJobs: true}, nil)
 	if err != nil {
 		t.Fatalf("BuildToolSet: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestBuildToolSetForValidation_IgnoresMCPServers(t *testing.T) {
 		Tools:      []string{"calculator"},
 		MCPServers: []MCPServerConfig{{Alias: "demo", URL: "https://example.com/mcp"}},
 	}
-	ts, err := BuildToolSetForValidation(toolsetTestRegistry(), ag)
+	ts, err := BuildToolSetForValidation(toolsetTestRegistry(), ag, ToolCapabilities{AsyncJobs: true})
 	if err != nil {
 		t.Fatalf("BuildToolSetForValidation: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestCanResume_SucceedsWithMCPServerDownOnResume(t *testing.T) {
 	t.Parallel()
 	ag := &Agent{ID: "a", Tools: []string{"calculator"}}
 
-	runSet, _ := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag)
+	runSet, _ := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag, ToolCapabilities{AsyncJobs: true}, nil)
 	runSet.AddMCPTools([]tools.Tool{fakeMCPTool{name: "mcp__demo__echo"}})
 	meta := SnapshotMeta{EffectiveTools: runSet.Refs(), ToolsetVersion: runSet.Version()}
 
@@ -151,7 +151,7 @@ func TestCanResume_SucceedsWithMCPServerDownOnResume(t *testing.T) {
 		t.Fatalf("snapshot EffectiveTools leaked an MCP tool: %+v", meta.EffectiveTools)
 	}
 
-	resumeSet, _ := BuildToolSetForValidation(toolsetTestRegistry(), ag) // no MCP
+	resumeSet, _ := BuildToolSetForValidation(toolsetTestRegistry(), ag, ToolCapabilities{AsyncJobs: true}) // no MCP
 	if err := CanResume(meta, resumeSet); err != nil {
 		t.Fatalf("resume must succeed despite MCP server being unavailable: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestResumeContinuity_PriorMCPMessagesServerDown(t *testing.T) {
 	t.Parallel()
 	ag := &Agent{ID: "a", Tools: []string{"calculator"}}
 
-	runSet, _ := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag)
+	runSet, _ := BuildToolSet(toolsetTestRegistry(), &stubInvoker{}, ag, ToolCapabilities{AsyncJobs: true}, nil)
 	runSet.AddMCPTools([]tools.Tool{fakeMCPTool{name: "mcp__demo__echo"}})
 
 	snap := &RunSnapshot{
@@ -182,7 +182,7 @@ func TestResumeContinuity_PriorMCPMessagesServerDown(t *testing.T) {
 		Meta: SnapshotMeta{EffectiveTools: runSet.Refs(), ToolsetVersion: runSet.Version()},
 	}
 
-	resumeSet, _ := BuildToolSetForValidation(toolsetTestRegistry(), ag) // server down → no MCP
+	resumeSet, _ := BuildToolSetForValidation(toolsetTestRegistry(), ag, ToolCapabilities{AsyncJobs: true}) // server down → no MCP
 	if err := ValidateSnapshot(snap, resumeSet); err != nil {
 		t.Fatalf("resume must proceed with prior MCP messages + server down: %v", err)
 	}

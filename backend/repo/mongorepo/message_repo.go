@@ -93,7 +93,7 @@ func (r *MessageRepo) ListDocsByThread(ctx context.Context, threadID string, lim
 	}
 
 	opts := options.Find().
-		SetSort(bson.D{{Key: "created_at", Value: -1}}).
+		SetSort(bson.D{{Key: "created_at", Value: -1}, {Key: "_id", Value: -1}}).
 		SetLimit(int64(limit))
 
 	cursor, err := r.col.Find(ctx, bson.M{"thread_id": tid}, opts)

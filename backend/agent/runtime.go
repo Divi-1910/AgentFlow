@@ -26,17 +26,20 @@ type AgentRuntime struct {
 	delegateInvoker DelegateInvoker
 	asyncJobs       AsyncJobStore
 	mcpManager      *tools.MCPManager
+	capabilities    ToolCapabilities
 }
 
 func NewAgentRuntime(
 	llmRegistry *llm.LLMRegistry,
 	toolRegistry *tools.ToolRegistry,
 	contextBuilder *ContextBuilder,
+	capabilities ToolCapabilities,
 ) *AgentRuntime {
 	return &AgentRuntime{
 		llmRegistry:    llmRegistry,
 		toolRegistry:   toolRegistry,
 		contextBuilder: contextBuilder,
+		capabilities:   capabilities,
 	}
 }
 
@@ -49,6 +52,7 @@ func (r *AgentRuntime) WithCheckpointStore(store CheckpointStore) *AgentRuntime 
 		delegateInvoker: r.delegateInvoker,
 		asyncJobs:       r.asyncJobs,
 		mcpManager:      r.mcpManager, // MUST copy — main.go calls this during construction
+		capabilities:    r.capabilities,
 	}
 }
 
@@ -99,7 +103,7 @@ func (r *AgentRuntime) EstimateSystemPromptTokens(ctx context.Context, agent *Ag
 	if r.contextBuilder == nil {
 		return 0
 	}
-	toolSet, err := BuildToolSetForValidation(r.toolRegistry, agent)
+	toolSet, err := BuildToolSetForValidation(r.toolRegistry, agent, r.capabilities)
 	if err != nil {
 		return 0
 	}
@@ -217,7 +221,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 		return nil, err
 	}
 
-	toolSet, err := BuildToolSet(r.toolRegistry, r.delegateInvoker, agent, r.asyncJobs)
+	toolSet, err := BuildToolSet(r.toolRegistry, r.delegateInvoker, agent, r.capabilities, r.asyncJobs)
 	if err != nil {
 		return nil, err
 	}

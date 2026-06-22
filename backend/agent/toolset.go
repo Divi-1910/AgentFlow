@@ -171,22 +171,25 @@ func hashParts(parts ...string) string {
 	return hex.EncodeToString(h[:8])
 }
 
+// ToolCapabilities describes optional runtime surfaces that affect the
+// effective tool set. Callers pass it explicitly so resume validation and
+// execution cannot silently disagree about which tools exist.
+type ToolCapabilities struct {
+	AsyncJobs bool
+}
+
 // BuildToolSet constructs the execution-mode tool set: registry tools + live
 // delegate tools. Fails if a delegate is configured but no invoker is supplied,
 // or on any name collision across the effective set.
-func BuildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, ag *Agent, asyncStores ...AsyncJobStore) (*ToolSet, error) {
-	var asyncStore AsyncJobStore
-	if len(asyncStores) > 0 {
-		asyncStore = asyncStores[0]
-	}
-	return buildToolSet(reg, inv, asyncStore, ag, false)
+func BuildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, ag *Agent, capabilities ToolCapabilities, asyncStore AsyncJobStore) (*ToolSet, error) {
+	return buildToolSet(reg, inv, asyncStore, ag, capabilities, false)
 }
 
 // BuildToolSetForValidation constructs a definition-only tool set (delegate
 // tools carry a nil invoker). Used by resume preflight, which only needs
 // names/params/identity, never execution.
-func BuildToolSetForValidation(reg *tools.ToolRegistry, ag *Agent) (*ToolSet, error) {
-	return buildToolSet(reg, nil, nil, ag, true)
+func BuildToolSetForValidation(reg *tools.ToolRegistry, ag *Agent, capabilities ToolCapabilities) (*ToolSet, error) {
+	return buildToolSet(reg, nil, nil, ag, capabilities, true)
 }
 
 // AddMCPTools merges discovered MCP tools into the set for LLM definitions and
@@ -203,7 +206,7 @@ func (ts *ToolSet) AddMCPTools(mcpTools []tools.Tool) {
 	}
 }
 
-func buildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, asyncStore AsyncJobStore, ag *Agent, validation bool) (*ToolSet, error) {
+func buildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, asyncStore AsyncJobStore, ag *Agent, capabilities ToolCapabilities, validation bool) (*ToolSet, error) {
 	ts := newToolSet()
 
 	for _, name := range ag.Tools {
@@ -238,7 +241,7 @@ func buildToolSet(reg *tools.ToolRegistry, inv DelegateInvoker, asyncStore Async
 		ts.add(d.ToolName, newDelegateTool(d, inv), toolKindDelegate)
 	}
 
-	if len(ag.Delegates) > 0 {
+	if len(ag.Delegates) > 0 && capabilities.AsyncJobs {
 		if ts.Has(AsyncToolDispatchAgent) || reg.Has(AsyncToolDispatchAgent) {
 			return nil, fmt.Errorf("%w: async tool name %q collides with another tool", ErrToolConfig, AsyncToolDispatchAgent)
 		}

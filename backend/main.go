@@ -176,7 +176,8 @@ func main() {
 		os.Exit(1)
 	}
 	contextBuilder := agent.NewContextBuilder(platformCfg, memorySvc, memoryMetaRepo, scratchpadSvc)
-	agentRuntime := agent.NewAgentRuntime(llmRegistry, toolRegistry, contextBuilder).WithCheckpointStore(runRepo)
+	capabilities := agent.ToolCapabilities{AsyncJobs: true}
+	agentRuntime := agent.NewAgentRuntime(llmRegistry, toolRegistry, contextBuilder, capabilities).WithCheckpointStore(runRepo)
 	agentRuntime.SetMCPManager(mcpManager) // must follow WithCheckpointStore (which copies a still-nil manager)
 	agentRuntime.SetAsyncJobStore(jobRepo)
 	summarizer := agent.NewSummarizer(llmRegistry)
@@ -193,6 +194,7 @@ func main() {
 		ToolRegistry: toolRegistry,
 		Tasks:        taskRepo,
 		Background:   appCtx,
+		Capabilities: capabilities,
 	})
 	pools := dispatcher.NewPoolManager(dispatcher.PoolManagerConfig{
 		RootCtx:  appCtx,
@@ -263,6 +265,7 @@ func main() {
 		runRepo,
 		disp,
 		toolRegistry,
+		capabilities,
 	)
 
 	mux.HandleFunc("POST /api/auth/signup", authHandler.SignUp)

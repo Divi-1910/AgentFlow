@@ -31,7 +31,7 @@ var (
 )
 
 func TestRunRepoConformance(t *testing.T) {
-	conformancetest.RunCheckpointConformance(t, func(t *testing.T) agent.CheckpointStore {
+	conformancetest.RunCheckpointConformance(t, func(t *testing.T) conformancetest.RunStore {
 		r := mongorepo.NewRunRepo(col(t, "conf_runs"), col(t, "conf_ckpts"))
 		if err := r.EnsureIndexes(context.Background()); err != nil {
 			t.Fatalf("EnsureIndexes: %v", err)

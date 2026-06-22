@@ -187,7 +187,8 @@ func TestSameTargetDelegateBatchUsesMongoSubThreadHistory(t *testing.T) {
 		nil,
 		nil,
 	)
-	runtime := agent.NewAgentRuntime(llmReg, toolReg, contextBuilder).WithCheckpointStore(runRepo)
+	capabilities := agent.ToolCapabilities{AsyncJobs: true}
+	runtime := agent.NewAgentRuntime(llmReg, toolReg, contextBuilder, capabilities).WithCheckpointStore(runRepo)
 
 	theBus := bus.NewInProc()
 	t.Cleanup(func() { _ = theBus.Close() })
@@ -199,6 +200,7 @@ func TestSameTargetDelegateBatchUsesMongoSubThreadHistory(t *testing.T) {
 		Runtime:      runtime,
 		ToolRegistry: toolReg,
 		Background:   ctx,
+		Capabilities: capabilities,
 	})
 	pools := dispatcher.NewPoolManager(dispatcher.PoolManagerConfig{
 		RootCtx:  ctx,
@@ -352,7 +354,8 @@ func TestSyncDelegateRunBudgetLimitsSupervisorFanout(t *testing.T) {
 		nil,
 		nil,
 	)
-	runtime := agent.NewAgentRuntime(llmReg, toolReg, contextBuilder).WithCheckpointStore(runRepo)
+	capabilities := agent.ToolCapabilities{AsyncJobs: true}
+	runtime := agent.NewAgentRuntime(llmReg, toolReg, contextBuilder, capabilities).WithCheckpointStore(runRepo)
 
 	theBus := bus.NewInProc()
 	t.Cleanup(func() { _ = theBus.Close() })
@@ -365,6 +368,7 @@ func TestSyncDelegateRunBudgetLimitsSupervisorFanout(t *testing.T) {
 		ToolRegistry: toolReg,
 		Tasks:        taskRepo,
 		Background:   ctx,
+		Capabilities: capabilities,
 	})
 	pools := dispatcher.NewPoolManager(dispatcher.PoolManagerConfig{
 		RootCtx:  ctx,

@@ -18,6 +18,7 @@ package conformancetest
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -44,10 +45,15 @@ const (
 
 // ── Run / checkpoint ────────────────────────────────────────────────────────
 
+type RunStore interface {
+	agent.CheckpointStore
+	CreateChildRun(ctx context.Context, runID, threadID, agentID, userID, originatorRunID, parentRunID string) error
+}
+
 // RunCheckpointConformance pins agent.CheckpointStore: status transitions are an
 // atomic compare-and-set, attempt counting is monotonic, and LoadLatest returns
 // the highest-step snapshot (not merely the last written).
-func RunCheckpointConformance(t *testing.T, newStore func(t *testing.T) agent.CheckpointStore) {
+func RunCheckpointConformance(t *testing.T, newStore func(t *testing.T) RunStore) {
 	ctx := context.Background()
 
 	t.Run("create_then_get_roundtrip", func(t *testing.T) {
@@ -64,6 +70,53 @@ func RunCheckpointConformance(t *testing.T, newStore func(t *testing.T) agent.Ch
 		}
 		if info.Attempt != 1 {
 			t.Errorf("fresh run Attempt = %d, want 1", info.Attempt)
+		}
+	})
+
+	t.Run("child_lineage_roundtrip", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.CreateChildRun(ctx, "child-1", "thread-child", "agent-child", "owner", "root-1", "parent-1"); err != nil {
+			t.Fatalf("CreateChildRun: %v", err)
+		}
+		info, err := s.GetRun(ctx, "child-1")
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if info.OriginatorRunID != "root-1" || info.ParentRunID != "parent-1" || info.InvocationKind != agent.InvocationSyncDelegate {
+			t.Fatalf("child lineage not preserved: %+v", info)
+		}
+	})
+
+	t.Run("owner_scoped_read", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.CreateRun(ctx, "run-owner", "t", "a", "owner"); err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		if _, err := s.GetRunForUser(ctx, "run-owner", "intruder"); err == nil {
+			t.Fatal("GetRunForUser for non-owner must fail")
+		}
+		if _, err := s.GetRunForUser(ctx, "run-owner", "owner"); err != nil {
+			t.Fatalf("GetRunForUser(owner): %v", err)
+		}
+	})
+
+	t.Run("status_error_updates_preserve_existing_error_on_empty", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.CreateRun(ctx, "run-status", "t", "a", "u"); err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		if err := s.UpdateStatus(ctx, "run-status", "failed", "first error"); err != nil {
+			t.Fatalf("UpdateStatus(error): %v", err)
+		}
+		if err := s.UpdateStatus(ctx, "run-status", "resumable", ""); err != nil {
+			t.Fatalf("UpdateStatus(empty): %v", err)
+		}
+		info, err := s.GetRun(ctx, "run-status")
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if info.Status != "resumable" || info.LastError != "first error" {
+			t.Fatalf("status/error = %q/%q, want resumable/first error", info.Status, info.LastError)
 		}
 	})
 
@@ -299,6 +352,46 @@ func RunTaskBudgetConformance(t *testing.T, newStore func(t *testing.T) TaskStor
 		}
 		if !st.Exhausted {
 			t.Fatalf("status should be Exhausted at the cap: %+v", st)
+		}
+	})
+
+	t.Run("consume_creates_absent_task", func(t *testing.T) {
+		s := newStore(t)
+		status, ok, err := s.TryConsumeRun(ctx, "orig-absent", "u", "first")
+		if err != nil {
+			t.Fatalf("TryConsumeRun: %v", err)
+		}
+		if !ok || status.RunsUsed != 1 || status.MaxRuns != agent.DefaultMaxTaskRuns {
+			t.Fatalf("absent task consume = (%+v, %v), want admitted default ledger", status, ok)
+		}
+	})
+
+	t.Run("accepted_key_replays_after_exhaustion", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.EnsureTask(ctx, "orig-replay", "u", 1); err != nil {
+			t.Fatalf("EnsureTask: %v", err)
+		}
+		if _, ok, err := s.TryConsumeRun(ctx, "orig-replay", "u", "accepted"); err != nil || !ok {
+			t.Fatalf("first consume: ok=%v err=%v", ok, err)
+		}
+		if status, ok, err := s.TryConsumeRun(ctx, "orig-replay", "u", "accepted"); err != nil || !ok || status.RunsUsed != 1 {
+			t.Fatalf("accepted replay after exhaustion: status=%+v ok=%v err=%v", status, ok, err)
+		}
+	})
+
+	t.Run("rejected_key_replays_as_rejected", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.EnsureTask(ctx, "orig-rejected", "u", 1); err != nil {
+			t.Fatalf("EnsureTask: %v", err)
+		}
+		if _, ok, err := s.TryConsumeRun(ctx, "orig-rejected", "u", "accepted"); err != nil || !ok {
+			t.Fatalf("accepted consume: ok=%v err=%v", ok, err)
+		}
+		for i := 0; i < 2; i++ {
+			status, ok, err := s.TryConsumeRun(ctx, "orig-rejected", "u", "rejected")
+			if err != nil || ok || !status.Exhausted || status.RunsUsed != 1 {
+				t.Fatalf("rejected replay %d: status=%+v ok=%v err=%v", i, status, ok, err)
+			}
 		}
 	})
 
@@ -607,6 +700,34 @@ func RunMemoryMetaConformance(t *testing.T, newStore func(t *testing.T) memory.M
 		// Exactly the fact record — the preference is filtered out by identity.
 		assertIDs(t, findIDs(t, s, memory.ScopeAgent, &factType, false), "agent/mem-fact")
 	})
+
+	t.Run("find_expired_discovers_only_due_live_rows", func(t *testing.T) {
+		s := newStore(t)
+		past := now.Add(-time.Minute)
+		future := now.Add(time.Minute)
+		due := mk(memory.ScopeAgent, "due", memory.TypeFact)
+		due.ExpiresAt = &past
+		later := mk(memory.ScopeAgent, "later", memory.TypeFact)
+		later.ExpiresAt = &future
+		upsert(t, s, due)
+		upsert(t, s, later)
+		expired, err := s.FindExpired(ctx, now)
+		if err != nil {
+			t.Fatalf("FindExpired: %v", err)
+		}
+		if len(expired) != 1 || expired[0].ID != "due" {
+			t.Fatalf("FindExpired = %+v, want only due", expired)
+		}
+	})
+
+	t.Run("stamp_read_missing_row_is_noop", func(t *testing.T) {
+		s := newStore(t)
+		missing := mk(memory.ScopeAgent, "missing", memory.TypeFact)
+		if err := s.StampRead(ctx, missing); err != nil {
+			t.Fatalf("StampRead(missing): %v", err)
+		}
+		assertIDs(t, findIDs(t, s, memory.ScopeAgent, nil, false))
+	})
 }
 
 // ── Memory revisions ────────────────────────────────────────────────────────
@@ -616,7 +737,7 @@ func RunMemoryMetaConformance(t *testing.T, newStore func(t *testing.T) memory.M
 // rejects the same mutation_id reused across a different lineage.
 func RunMemoryRevisionConformance(t *testing.T, newStore func(t *testing.T) memory.RevisionStore) {
 	ctx := context.Background()
-	now := time.Now()
+	now := time.Now().UTC().Truncate(time.Millisecond)
 
 	rev := func(lineage string, n int, mutationID string) memory.MemoryRevision {
 		return memory.MemoryRevision{
@@ -693,6 +814,45 @@ func RunMemoryRevisionConformance(t *testing.T, newStore func(t *testing.T) memo
 			t.Fatal("a true conflict must not be reported as an idempotent replay")
 		}
 	})
+
+	t.Run("complete_revision_roundtrip", func(t *testing.T) {
+		s := newStore(t)
+		restoredFrom := 3
+		expires := now.Add(24 * time.Hour)
+		retired := now.Add(48 * time.Hour)
+		want := memory.MemoryRevision{
+			LineageKey: "lin-full", Revision: 4, MutationID: "mut-full",
+			RunID: "run-full", ToolCallID: "call-full", Operation: memory.OperationRestore,
+			Reason: "restore it", RestoredFrom: &restoredFrom,
+			UserID: "user-full", AgentID: "agent-full", ThreadID: "thread-full",
+			MemoryID: "memory-full", Scope: memory.ScopeThread, Type: memory.TypeProcedure,
+			Importance: 0.75, BodyPath: "body/full.md", CreatedAt: now, UpdatedAt: now.Add(time.Second),
+			ExpiresAt: &expires, RetiredAt: &retired,
+		}
+		if _, _, err := s.Append(ctx, want); err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+		got, err := s.FindRevision(ctx, want.LineageKey, want.Revision)
+		if err != nil {
+			t.Fatalf("FindRevision: %v", err)
+		}
+		if got == nil || got.MutationID != want.MutationID || got.RunID != want.RunID || got.ToolCallID != want.ToolCallID ||
+			got.Operation != want.Operation || got.Reason != want.Reason || got.RestoredFrom == nil || *got.RestoredFrom != restoredFrom ||
+			got.UserID != want.UserID || got.AgentID != want.AgentID || got.ThreadID != want.ThreadID || got.MemoryID != want.MemoryID ||
+			got.Scope != want.Scope || got.Type != want.Type || got.Importance != want.Importance || got.BodyPath != want.BodyPath ||
+			!got.CreatedAt.Equal(want.CreatedAt) || !got.UpdatedAt.Equal(want.UpdatedAt) || got.ExpiresAt == nil || !got.ExpiresAt.Equal(expires) ||
+			got.RetiredAt == nil || !got.RetiredAt.Equal(retired) {
+			t.Fatalf("revision round-trip mismatch:\n got: %+v\nwant: %+v", got, want)
+		}
+		byMutation, err := s.FindByMutation(ctx, want.MutationID)
+		if err != nil || byMutation == nil || byMutation.LineageKey != want.LineageKey {
+			t.Fatalf("FindByMutation = %+v, %v", byMutation, err)
+		}
+		list, err := s.List(ctx, want.LineageKey)
+		if err != nil || len(list) != 1 || list[0].Revision != want.Revision {
+			t.Fatalf("List = %+v, %v", list, err)
+		}
+	})
 }
 
 // ── Thread (thin round-trip) ────────────────────────────────────────────────
@@ -703,6 +863,7 @@ type ThreadStore interface {
 	GetByID(ctx context.Context, threadID, userID string) (*agent.ThreadRecord, error)
 	ListByAgent(ctx context.Context, agentID, userID string) ([]*agent.ThreadRecord, error)
 	UpdateSummary(ctx context.Context, threadID, userID, summary string) error
+	FindOrCreateSubThread(ctx context.Context, userID, originatorRunID, agentID string) (string, error)
 }
 
 // RunThreadConformance pins the neutral thread record round-trip: ids come back
@@ -757,6 +918,73 @@ func RunThreadConformance(t *testing.T, newStore func(t *testing.T) ThreadStore)
 		}
 		if got.Summary != "the summary" {
 			t.Fatalf("Summary = %q, want %q", got.Summary, "the summary")
+		}
+	})
+
+	t.Run("concurrent_sub_thread_creation_converges_and_preserves_timestamps", func(t *testing.T) {
+		s := newStore(t)
+		const n = 40
+		start := make(chan struct{})
+		ids := make(chan string, n)
+		var wg sync.WaitGroup
+		wg.Add(n)
+		for range n {
+			go func() {
+				defer wg.Done()
+				<-start
+				id, err := s.FindOrCreateSubThread(ctx, hexUser, "origin-concurrent", hexAgentA)
+				if err != nil {
+					t.Errorf("FindOrCreateSubThread: %v", err)
+					return
+				}
+				ids <- id
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(ids)
+		var only string
+		for id := range ids {
+			if only == "" {
+				only = id
+			}
+			if id != only {
+				t.Fatalf("sub-thread ids diverged: %q and %q", only, id)
+			}
+		}
+		first, err := s.GetByID(ctx, only, hexUser)
+		if err != nil {
+			t.Fatalf("GetByID: %v", err)
+		}
+		time.Sleep(2 * time.Millisecond)
+		againID, err := s.FindOrCreateSubThread(ctx, hexUser, "origin-concurrent", hexAgentA)
+		if err != nil || againID != only {
+			t.Fatalf("repeat FindOrCreateSubThread = %q, %v; want %q", againID, err, only)
+		}
+		again, err := s.GetByID(ctx, only, hexUser)
+		if err != nil {
+			t.Fatalf("GetByID(repeat): %v", err)
+		}
+		if !again.CreatedAt.Equal(first.CreatedAt) || !again.UpdatedAt.Equal(first.UpdatedAt) {
+			t.Fatalf("repeat changed timestamps: first=%+v again=%+v", first, again)
+		}
+	})
+
+	t.Run("user_list_excludes_sub_threads", func(t *testing.T) {
+		s := newStore(t)
+		regular, err := s.Create(ctx, hexUser, hexAgentA, "visible")
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if _, err := s.FindOrCreateSubThread(ctx, hexUser, "origin-hidden", hexAgentA); err != nil {
+			t.Fatalf("FindOrCreateSubThread: %v", err)
+		}
+		listed, err := s.ListByAgent(ctx, hexAgentA, hexUser)
+		if err != nil {
+			t.Fatalf("ListByAgent: %v", err)
+		}
+		if len(listed) != 1 || listed[0].ID != regular.ID {
+			t.Fatalf("ListByAgent = %+v, want only regular thread %s", listed, regular.ID)
 		}
 	})
 }
@@ -841,6 +1069,49 @@ func RunMessageConformance(t *testing.T, newStore func(t *testing.T) MessageStor
 		}
 		if len(recent) != 1 || recent[0].Content != "q" {
 			t.Fatalf("recent = %+v, want one message with content q", recent)
+		}
+	})
+
+	t.Run("newest_window_is_returned_chronologically", func(t *testing.T) {
+		s := newStore(t)
+		batch := make([]llm.ChatMessage, 5)
+		for i := range batch {
+			batch[i] = llm.ChatMessage{Role: "user", Content: fmt.Sprintf("m%d", i)}
+		}
+		if _, err := s.InsertMany(ctx, hexThread, hexAgentA, hexUser, batch); err != nil {
+			t.Fatalf("InsertMany: %v", err)
+		}
+		docs, err := s.ListDocsByThread(ctx, hexThread, 2)
+		if err != nil {
+			t.Fatalf("ListDocsByThread: %v", err)
+		}
+		if len(docs) != 2 || docs[0].Content != "m3" || docs[1].Content != "m4" {
+			t.Fatalf("newest window = %+v, want [m3, m4]", docs)
+		}
+	})
+
+	t.Run("tool_calls_and_metadata_roundtrip", func(t *testing.T) {
+		s := newStore(t)
+		message := llm.ChatMessage{
+			Role: "assistant", Content: "calling", ToolCallID: "parent-call",
+			ToolCalls: []llm.ToolCall{{ID: "call-1", Name: "calculator", Arguments: json.RawMessage(`{"x":2}`)}},
+			Metadata:  map[string]any{"tool_name": "calculator", "is_error": false, "source": "conformance"},
+		}
+		inserted, err := s.InsertMany(ctx, hexThread, hexAgentA, hexUser, []llm.ChatMessage{message})
+		if err != nil {
+			t.Fatalf("InsertMany: %v", err)
+		}
+		if len(inserted) != 1 || inserted[0].ToolName != "calculator" {
+			t.Fatalf("inserted record = %+v", inserted)
+		}
+		docs, err := s.ListDocsByThread(ctx, hexThread, 1)
+		if err != nil {
+			t.Fatalf("ListDocsByThread: %v", err)
+		}
+		if len(docs) != 1 || docs[0].ToolCallID != "parent-call" || docs[0].ToolName != "calculator" ||
+			len(docs[0].ToolCalls) != 1 || docs[0].ToolCalls[0].ID != "call-1" || docs[0].ToolCalls[0].Name != "calculator" ||
+			string(docs[0].ToolCalls[0].Arguments) != `{"x":2}` || docs[0].Metadata["source"] != "conformance" || docs[0].Metadata["is_error"] != false {
+			t.Fatalf("complete message round-trip mismatch: %+v", docs)
 		}
 	})
 }

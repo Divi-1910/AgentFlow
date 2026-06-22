@@ -19,6 +19,7 @@ type RunHandler struct {
 	runRepo      agent.CheckpointStore
 	dispatcher   dispatcher.Dispatcher
 	toolRegistry *tools.ToolRegistry
+	capabilities agent.ToolCapabilities
 }
 
 func NewRunHandler(
@@ -27,6 +28,7 @@ func NewRunHandler(
 	runRepo agent.CheckpointStore,
 	disp dispatcher.Dispatcher,
 	toolRegistry *tools.ToolRegistry,
+	capabilities agent.ToolCapabilities,
 ) *RunHandler {
 	return &RunHandler{
 		agentRepo:    agentRepo,
@@ -34,6 +36,7 @@ func NewRunHandler(
 		runRepo:      runRepo,
 		dispatcher:   disp,
 		toolRegistry: toolRegistry,
+		capabilities: capabilities,
 	}
 }
 
@@ -125,7 +128,7 @@ func (h *RunHandler) ResumeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	toolSet, err := agent.BuildToolSetForValidation(h.toolRegistry, resumeAgent)
+	toolSet, err := agent.BuildToolSetForValidation(h.toolRegistry, resumeAgent, h.capabilities)
 	if err != nil {
 		_ = h.runRepo.UpdateStatus(ctx, runID, string(model.RunStatusFailed), fmt.Sprintf("tool set invalid: %v", err))
 		writeError(w, http.StatusUnprocessableEntity, fmt.Sprintf("Tool set build failed: %v", err))

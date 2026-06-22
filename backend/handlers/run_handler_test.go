@@ -26,6 +26,7 @@ func newRunHandler(runRepo agent.CheckpointStore) *handlers.RunHandler {
 		runRepo,
 		&fakeDispatcher{},
 		tools.NewEmptyRegistry(),
+		agent.ToolCapabilities{AsyncJobs: true},
 	)
 }
 
@@ -42,6 +43,7 @@ func newResumeRunHandler(
 		repo,
 		rt,
 		tools.NewEmptyRegistry(),
+		agent.ToolCapabilities{AsyncJobs: true},
 	)
 }
 

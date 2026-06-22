@@ -170,6 +170,7 @@ func newTestRuntime(lm llm.LLMClient, store CheckpointStore) (*AgentRuntime, *Ag
 		toolRegistry:    toolReg,
 		contextBuilder:  newTestContextBuilder(),
 		checkpointStore: store,
+		capabilities:    ToolCapabilities{AsyncJobs: true},
 	}
 	ag := &Agent{
 		Provider:     "fake",
