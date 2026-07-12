@@ -98,6 +98,7 @@ func main() {
 	llmRegistryCol := db.GetCollection(dbName, "llm_registry")
 	agentsCol := db.GetCollection(dbName, "agents")
 	deploymentRevisionsCol := db.GetCollection(dbName, "deployment_revisions")
+	deploymentStatesCol := db.GetCollection(dbName, "deployment_states")
 	threadsCol := db.GetCollection(dbName, "threads")
 	messagesCol := db.GetCollection(dbName, "messages")
 	runsCol := db.GetCollection(dbName, "runs")
@@ -145,6 +146,7 @@ func main() {
 
 	agentRepo := mongorepo.NewAgentRepo(agentsCol, llmRegistryCol)
 	deploymentRevisionRepo := mongorepo.NewDeploymentRevisionRepo(deploymentRevisionsCol)
+	deploymentStateRepo := mongorepo.NewDeploymentStateRepo(deploymentStatesCol, deploymentRevisionsCol)
 	threadRepo := mongorepo.NewThreadRepo(threadsCol)
 	messageRepo := mongorepo.NewMessageRepo(messagesCol)
 	runRepo := mongorepo.NewRunRepo(runsCol, checkpointsCol)
@@ -170,6 +172,10 @@ func main() {
 	}
 	if err := deploymentRevisionRepo.EnsureIndexes(context.Background()); err != nil {
 		slog.Error("failed to create deployment revision indexes", "error", err)
+		os.Exit(1)
+	}
+	if err := deploymentStateRepo.EnsureIndexes(context.Background()); err != nil {
+		slog.Error("failed to create deployment state indexes", "error", err)
 		os.Exit(1)
 	}
 
@@ -294,6 +300,7 @@ func main() {
 	mux.HandleFunc("PUT /api/agents/{id}", middleware.RequireAuth(agentHandler.Update))
 	mux.HandleFunc("DELETE /api/agents/{id}", middleware.RequireAuth(agentHandler.Delete))
 	mux.HandleFunc("POST /api/agents/{id}/publish", middleware.RequireAuth(publicationHandler.Publish))
+	mux.HandleFunc("GET /api/agents/{id}/publications", middleware.RequireAuth(publicationHandler.List))
 	mux.HandleFunc("GET /api/agents/{id}/publications/{revision}/bundle", middleware.RequireAuth(publicationHandler.GetBundle))
 	mux.HandleFunc("POST /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.Create))
 	mux.HandleFunc("GET /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.ListByAgent))

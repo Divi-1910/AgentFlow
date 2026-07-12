@@ -16,6 +16,7 @@ import (
 type publicationService interface {
 	Publish(ctx context.Context, userID, rootAgentID string) (*publisher.Result, error)
 	GetBundle(ctx context.Context, userID, deploymentID string, revision int) (*deployment.Revision, error)
+	ListRevisions(ctx context.Context, userID, deploymentID string, limit int) ([]deployment.Revision, error)
 }
 
 type PublicationHandler struct{ service publicationService }
@@ -31,6 +32,20 @@ type PublishAgentResponse struct {
 	WasExisting  bool   `json:"was_existing"`
 	CreatedAt    string `json:"created_at"`
 	BundleURL    string `json:"bundle_url"`
+}
+
+type PublicationSummary struct {
+	DeploymentID  string `json:"deployment_id"`
+	RootAgentID   string `json:"root_agent_id"`
+	Revision      int    `json:"revision"`
+	ConfigHash    string `json:"config_hash"`
+	SchemaVersion int    `json:"schema_version"`
+	CreatedAt     string `json:"created_at"`
+	BundleURL     string `json:"bundle_url"`
+}
+
+type ListPublicationsResponse struct {
+	Publications []PublicationSummary `json:"publications"`
 }
 
 func (h *PublicationHandler) Publish(w http.ResponseWriter, r *http.Request) {
@@ -100,8 +115,49 @@ func (h *PublicationHandler) GetBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="deployment-%s-r%d.json"`, deploymentID, revisionNumber))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	w.Header().Set("Cache-Control", "private, no-store")
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write(revision.BundleJSON); err != nil {
 		slog.Error("write deployment bundle failed", "deployment_id", deploymentID, "revision", revisionNumber, "error", err)
 	}
+}
+
+func (h *PublicationHandler) List(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserID(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	limit := 50
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > 200 {
+			writeError(w, http.StatusBadRequest, "limit must be between 1 and 200")
+			return
+		}
+		limit = parsed
+	}
+	deploymentID := r.PathValue("id")
+	revisions, err := h.service.ListRevisions(r.Context(), userID, deploymentID, limit)
+	if err != nil {
+		slog.Error("list deployment revisions failed", "deployment_id", deploymentID, "user_id", userID, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to list deployment revisions")
+		return
+	}
+	response := ListPublicationsResponse{Publications: make([]PublicationSummary, len(revisions))}
+	for i, revision := range revisions {
+		response.Publications[i] = PublicationSummary{
+			DeploymentID:  revision.DeploymentID,
+			RootAgentID:   revision.RootAgentID,
+			Revision:      revision.Revision,
+			ConfigHash:    revision.ConfigHash,
+			SchemaVersion: revision.SchemaVersion,
+			CreatedAt:     revision.CreatedAt.UTC().Format(time.RFC3339Nano),
+			BundleURL:     fmt.Sprintf("/api/agents/%s/publications/%d/bundle", deploymentID, revision.Revision),
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
 }

@@ -14,6 +14,8 @@ import (
 	"backend/repo/mongorepo"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 func deploymentRevisionRepo(t *testing.T) *mongorepo.DeploymentRevisionRepo {
@@ -52,6 +54,10 @@ func TestDeploymentRevisionAppendReplayAndIncrement(t *testing.T) {
 	second, existing, err := r.Append(ctx, revisionInput(revisionHash("second"), `{"revision":2}`))
 	if err != nil || existing || second.Revision != 2 {
 		t.Fatalf("second = %+v existing=%v err=%v", second, existing, err)
+	}
+	listed, err := r.List(ctx, userA, first.DeploymentID, 1)
+	if err != nil || len(listed) != 1 || listed[0].Revision != 2 || listed[0].BundleJSON != nil {
+		t.Fatalf("List = %+v err=%v", listed, err)
 	}
 
 	first.BundleJSON[0] = 'x'
@@ -169,6 +175,14 @@ func TestDeploymentRevisionOwnerScopeAndValidation(t *testing.T) {
 	if _, err := r.Get(context.Background(), userA, input.DeploymentID, 0); !errors.Is(err, deployment.ErrRevisionNotFound) {
 		t.Fatalf("invalid revision Get = %v", err)
 	}
+	otherOwner := input
+	otherOwner.UserID = userB
+	if revision, existing, err := r.Append(context.Background(), otherOwner); err != nil || existing || revision.Revision != 1 {
+		t.Fatalf("same deployment id for another owner = %+v existing=%v err=%v", revision, existing, err)
+	}
+	if listed, err := r.List(context.Background(), userB, input.DeploymentID, 10); err != nil || len(listed) != 1 || listed[0].UserID != userB {
+		t.Fatalf("owner-scoped List = %+v err=%v", listed, err)
+	}
 
 	cases := []deployment.RevisionInput{
 		{},
@@ -187,6 +201,12 @@ func TestDeploymentRevisionIndexes(t *testing.T) {
 	collection := col(t, "deployment_revisions")
 	r := mongorepo.NewDeploymentRevisionRepo(collection)
 	ctx := context.Background()
+	if _, err := collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "deployment_id", Value: 1}, {Key: "revision", Value: 1}}, Options: options.Index().SetUnique(true).SetName("deployment_revisions_revision_unique")},
+		{Keys: bson.D{{Key: "deployment_id", Value: 1}, {Key: "config_hash", Value: 1}}, Options: options.Index().SetUnique(true).SetName("deployment_revisions_hash_unique")},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.EnsureIndexes(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -195,19 +215,36 @@ func TestDeploymentRevisionIndexes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cursor.Close(ctx)
-	var indexes []bson.M
+	var indexes []struct {
+		Name   string `bson:"name"`
+		Key    bson.D `bson:"key"`
+		Unique bool   `bson:"unique"`
+	}
 	if err := cursor.All(ctx, &indexes); err != nil {
 		t.Fatal(err)
 	}
-	names := make(map[string]bool, len(indexes))
+	byName := make(map[string]struct {
+		keys   bson.D
+		unique bool
+	}, len(indexes))
 	for _, index := range indexes {
-		if name, ok := index["name"].(string); ok {
-			names[name] = true
+		byName[index.Name] = struct {
+			keys   bson.D
+			unique bool
+		}{index.Key, index.Unique}
+	}
+	for _, name := range []string{"deployment_revisions_owner_revision_unique", "deployment_revisions_owner_hash_unique"} {
+		index, ok := byName[name]
+		if !ok {
+			t.Fatalf("missing index %q in %v", name, byName)
+		}
+		if !index.unique || len(index.keys) != 3 || index.keys[0].Key != "user_id" || index.keys[1].Key != "deployment_id" {
+			t.Fatalf("index %q = %+v", name, index)
 		}
 	}
-	for _, name := range []string{"deployment_revisions_revision_unique", "deployment_revisions_hash_unique"} {
-		if !names[name] {
-			t.Fatalf("missing index %q in %v", name, names)
+	for _, legacy := range []string{"deployment_revisions_revision_unique", "deployment_revisions_hash_unique"} {
+		if _, ok := byName[legacy]; ok {
+			t.Fatalf("legacy deployment-global index %q remains", legacy)
 		}
 	}
 }

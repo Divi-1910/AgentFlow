@@ -2,6 +2,7 @@ package mongorepo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"time"
@@ -36,20 +37,32 @@ type deploymentRevisionBSON struct {
 }
 
 func (r *DeploymentRevisionRepo) EnsureIndexes(ctx context.Context) error {
+	// Phase 4 initially shipped deployment-global unique indexes. Remove those
+	// named definitions before installing the tenant-qualified replacements.
+	for _, name := range []string{"deployment_revisions_revision_unique", "deployment_revisions_hash_unique"} {
+		if err := r.col.Indexes().DropOne(ctx, name); err != nil && !isIndexNotFound(err) {
+			return fmt.Errorf("deployment_revision_repo: drop legacy index %s: %w", name, err)
+		}
+	}
 	indexes := []mongo.IndexModel{
 		{
-			Keys:    bson.D{{Key: "deployment_id", Value: 1}, {Key: "revision", Value: 1}},
-			Options: options.Index().SetUnique(true).SetName("deployment_revisions_revision_unique"),
+			Keys:    bson.D{{Key: "user_id", Value: 1}, {Key: "deployment_id", Value: 1}, {Key: "revision", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("deployment_revisions_owner_revision_unique"),
 		},
 		{
-			Keys:    bson.D{{Key: "deployment_id", Value: 1}, {Key: "config_hash", Value: 1}},
-			Options: options.Index().SetUnique(true).SetName("deployment_revisions_hash_unique"),
+			Keys:    bson.D{{Key: "user_id", Value: 1}, {Key: "deployment_id", Value: 1}, {Key: "config_hash", Value: 1}},
+			Options: options.Index().SetUnique(true).SetName("deployment_revisions_owner_hash_unique"),
 		},
 	}
 	if _, err := r.col.Indexes().CreateMany(ctx, indexes); err != nil {
 		return fmt.Errorf("deployment_revision_repo: indexes: %w", err)
 	}
 	return nil
+}
+
+func isIndexNotFound(err error) bool {
+	var commandErr mongo.CommandError
+	return errors.As(err, &commandErr) && (commandErr.Code == 26 || commandErr.Code == 27)
 }
 
 func (r *DeploymentRevisionRepo) Append(ctx context.Context, input deployment.RevisionInput) (*deployment.Revision, bool, error) {
@@ -112,6 +125,34 @@ func (r *DeploymentRevisionRepo) Get(ctx context.Context, userID, deploymentID s
 		return nil, fmt.Errorf("deployment_revision_repo: get: %w", err)
 	}
 	return toDeploymentRevision(raw), nil
+}
+
+func (r *DeploymentRevisionRepo) List(ctx context.Context, userID, deploymentID string, limit int) ([]deployment.Revision, error) {
+	uid, err := bson.ObjectIDFromHex(userID)
+	if err != nil {
+		return nil, fmt.Errorf("deployment_revision_repo: invalid user_id: %w", err)
+	}
+	if deploymentID == "" || limit <= 0 {
+		return []deployment.Revision{}, nil
+	}
+	cursor, err := r.col.Find(
+		ctx,
+		bson.D{{Key: "user_id", Value: uid}, {Key: "deployment_id", Value: deploymentID}},
+		options.Find().SetSort(bson.D{{Key: "revision", Value: -1}}).SetLimit(int64(limit)).SetProjection(bson.D{{Key: "bundle_json", Value: 0}}),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("deployment_revision_repo: list: %w", err)
+	}
+	defer cursor.Close(ctx)
+	var raw []deploymentRevisionBSON
+	if err := cursor.All(ctx, &raw); err != nil {
+		return nil, fmt.Errorf("deployment_revision_repo: list decode: %w", err)
+	}
+	revisions := make([]deployment.Revision, len(raw))
+	for i := range raw {
+		revisions[i] = *toDeploymentRevision(raw[i])
+	}
+	return revisions, nil
 }
 
 func validateRevisionInput(input deployment.RevisionInput) (bson.ObjectID, error) {

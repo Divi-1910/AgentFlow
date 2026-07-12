@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"backend/agent"
 	"backend/llm"
@@ -185,6 +186,32 @@ func TestCanonicalHashIncludesDeploymentID(t *testing.T) {
 	}
 	if before == after {
 		t.Fatal("changing deployment_id did not change the canonical hash")
+	}
+}
+
+func TestStudioOnlyEditsDoNotChangeHash(t *testing.T) {
+	source := &agent.Agent{
+		ID: "supervisor", Name: "Supervisor", Provider: "openai", Model: "gpt-4o", SystemPrompt: "prompt",
+		ModelContextLimit: 128000, ContextWindow: 6, ContextKeepRatio: .5,
+		MaxSteps: 25, Temperature: .7, MaxTokens: 100, MaxRuns: 10,
+		CreatedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	first, err := BundleAgentFromAgent(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.CreatedAt = time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
+	second, err := BundleAgentFromAgent(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := validBundle()
+	bundle.Agents = []BundleAgent{first}
+	firstHash, _ := bundle.CanonicalHash()
+	bundle.Agents = []BundleAgent{second}
+	secondHash, _ := bundle.CanonicalHash()
+	if firstHash != secondHash {
+		t.Fatalf("Studio-only CreatedAt edit changed hash: %s != %s", firstHash, secondHash)
 	}
 }
 

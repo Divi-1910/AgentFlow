@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"backend/agent"
 	"backend/deployment"
@@ -12,6 +13,8 @@ import (
 	"backend/publisher"
 	"backend/repo/mongorepo"
 	"backend/tools"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 func TestPublisherRoundTripThroughRuntimeBundleLoader(t *testing.T) {
@@ -55,11 +58,21 @@ func TestPublisherRoundTripThroughRuntimeBundleLoader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rootObjectID, err := bson.ObjectIDFromHex(root.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agentsCol.UpdateOne(ctx, bson.D{{Key: "_id", Value: rootObjectID}}, bson.D{{Key: "$set", Value: bson.D{
+		{Key: "updated_at", Value: time.Now().UTC().Add(time.Hour)},
+		{Key: "studio_layout", Value: bson.D{{Key: "x", Value: 120}, {Key: "y", Value: 80}}},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
 	second, err := svc.Publish(ctx, userA, root.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.WasExisting || !second.WasExisting || first.Revision.Revision != second.Revision.Revision {
+	if first.WasExisting || !second.WasExisting || first.Revision.Revision != second.Revision.Revision || first.Revision.ConfigHash != second.Revision.ConfigHash {
 		t.Fatalf("first/second = %+v/%+v", first, second)
 	}
 	stored, err := svc.GetBundle(ctx, userA, root.ID, first.Revision.Revision)

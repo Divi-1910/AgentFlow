@@ -84,6 +84,13 @@ func (s *fakeRevisionStore) Get(context.Context, string, string, int) (*deployme
 	return &copy, nil
 }
 
+func (s *fakeRevisionStore) List(context.Context, string, string, int) ([]deployment.Revision, error) {
+	if s.revision == nil {
+		return []deployment.Revision{}, nil
+	}
+	return []deployment.Revision{*s.revision}, nil
+}
+
 func validAgent(id string) *agent.Agent {
 	return &agent.Agent{
 		ID: id, Name: id, Provider: "openai", Model: "gpt-4o", SystemPrompt: "prompt",
@@ -243,5 +250,28 @@ func TestPublishPropagatesReplayAndCancellation(t *testing.T) {
 	_, err = newTestService(t, &fakeAgentReader{agents: map[string]*agent.Agent{"root": validAgent("root")}}, &fakeRevisionStore{}, 0).Publish(ctx, "user", "root")
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancel error = %v", err)
+	}
+}
+
+func TestSameDeployableGraphProducesSameHash(t *testing.T) {
+	rootA, childA := validAgent("root"), validAgent("child")
+	rootA.Delegates = []agent.DelegateConfig{{AgentID: "child", ToolName: "ask_child"}}
+	rootA.CreatedAt = time.Unix(1, 0)
+	childA.CreatedAt = time.Unix(2, 0)
+	rootB, childB := cloneTestAgent(rootA), cloneTestAgent(childA)
+	rootB.CreatedAt = time.Unix(100, 0)
+	childB.CreatedAt = time.Unix(200, 0)
+
+	firstStore, secondStore := &fakeRevisionStore{}, &fakeRevisionStore{}
+	first, err := newTestService(t, &fakeAgentReader{agents: map[string]*agent.Agent{"child": childA, "root": rootA}}, firstStore, 0).Publish(context.Background(), "user", "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newTestService(t, &fakeAgentReader{agents: map[string]*agent.Agent{"root": rootB, "child": childB}}, secondStore, 0).Publish(context.Background(), "user", "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Revision.ConfigHash != second.Revision.ConfigHash || string(first.Revision.BundleJSON) != string(second.Revision.BundleJSON) {
+		t.Fatalf("equivalent graphs differ: %s/%s", first.Revision.ConfigHash, second.Revision.ConfigHash)
 	}
 }

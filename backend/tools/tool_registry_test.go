@@ -2,10 +2,14 @@ package tools_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 
 	"backend/llm"
+	"backend/memory"
+	"backend/scratchpad"
 	"backend/tools"
 )
 
@@ -13,6 +17,39 @@ import (
 
 type fakeTool struct {
 	name string
+}
+
+func TestCatalogRegistryIncludesConditionalToolsWithoutEnvironment(t *testing.T) {
+	t.Setenv("TAVILY_API_KEY", "")
+	catalog := tools.NewCatalogRegistry()
+	for _, name := range []string{"calculator", "http_request", "web_search", "memory_write", "scratchpad_create"} {
+		if !catalog.Has(name) {
+			t.Fatalf("catalog missing %q", name)
+		}
+	}
+	if tools.NewValidationRegistry().Has("web_search") {
+		t.Fatal("boot validation registry included web_search without TAVILY_API_KEY")
+	}
+}
+
+func TestCatalogDefinitionsMatchExecutableRegistry(t *testing.T) {
+	t.Setenv("TAVILY_API_KEY", "test")
+	catalog := tools.NewCatalogRegistry()
+	executable := tools.NewToolRegistry(nil, &memory.Service{}, &scratchpad.Service{})
+	definitionMap := func(reg *tools.ToolRegistry) map[string]json.RawMessage {
+		out := make(map[string]json.RawMessage)
+		for _, def := range reg.Definitions() {
+			raw, err := json.Marshal(def)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out[def.Name] = raw
+		}
+		return out
+	}
+	if !reflect.DeepEqual(definitionMap(catalog), definitionMap(executable)) {
+		t.Fatal("catalog definitions drifted from executable definitions")
+	}
 }
 
 func (f *fakeTool) Name() string { return f.name }

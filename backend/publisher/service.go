@@ -31,6 +31,7 @@ type AgentReader interface {
 type RevisionStore interface {
 	Append(ctx context.Context, input deployment.RevisionInput) (*deployment.Revision, bool, error)
 	Get(ctx context.Context, userID, deploymentID string, revision int) (*deployment.Revision, error)
+	List(ctx context.Context, userID, deploymentID string, limit int) ([]deployment.Revision, error)
 }
 
 type Config struct {
@@ -77,6 +78,10 @@ func (s *Service) Publish(ctx context.Context, userID, rootAgentID string) (*Res
 	}
 	var frozen map[string]deployment.BundleAgent
 	stable := false
+	// Publishing is an optimistic two-pass snapshot, not a locked transaction:
+	// pass one walks and freezes the reachable graph; pass two reloads every
+	// observed agent and compares its deployable projection. A mismatch retries
+	// the whole operation, and no revision is written unless one pass converges.
 	for attempt := 0; attempt < s.snapshotAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -144,6 +149,10 @@ func (s *Service) Publish(ctx context.Context, userID, rootAgentID string) (*Res
 
 func (s *Service) GetBundle(ctx context.Context, userID, deploymentID string, revision int) (*deployment.Revision, error) {
 	return s.revisions.Get(ctx, userID, deploymentID, revision)
+}
+
+func (s *Service) ListRevisions(ctx context.Context, userID, deploymentID string, limit int) ([]deployment.Revision, error) {
+	return s.revisions.List(ctx, userID, deploymentID, limit)
 }
 
 func (s *Service) walkGraph(ctx context.Context, userID, rootAgentID string) (map[string]deployment.BundleAgent, error) {
