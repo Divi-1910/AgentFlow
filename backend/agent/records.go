@@ -44,3 +44,53 @@ type MessageRecord struct {
 	Metadata   map[string]any
 	CreatedAt  time.Time
 }
+
+// JobRecord is the storage-neutral representation of an async job. IDs are
+// opaque strings; a backend translates its own document/row shape into this at
+// the edge (the Mongo adapter's model.JobDocument is one such shape). Status
+// and CallbackStatus track two independent lifecycles — the delegated job
+// itself, and (for background jobs) the callback run that notifies the user —
+// so CallbackError is a distinct field from Error: a callback failure must
+// never overwrite the job's own outcome.
+type JobRecord struct {
+	JobID           string
+	ParentRunID     string
+	OriginatorRunID string
+	ParentThreadID  string
+	ParentAgentID   string
+	UserID          string
+
+	ToolCallID          string
+	DelegateTool        string
+	TargetAgentID       string
+	Task                string
+	Mode                string
+	CallbackInstruction string
+	DelegationChain     []string
+	DelegationDepth     int
+
+	Status string
+	Output string
+	Error  string
+
+	ChildRunID    string
+	ChildThreadID string
+
+	AwaitingParentRunID string
+	AwaitToolCallID     string
+	AwaitingSince       *time.Time
+	DeliveredAt         *time.Time
+	DeliveredToolCallID string
+
+	CallbackStatus string
+	CallbackRunID  string
+	CallbackError  string
+
+	LeaseOwner     string
+	LeaseExpiresAt *time.Time
+
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	StartedAt  time.Time
+	FinishedAt time.Time
+}

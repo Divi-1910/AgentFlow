@@ -18,8 +18,8 @@ type PoolManager struct {
 	runtime  Runtime
 	status   runStatusUpdater
 	messages MessageStore
-	jobs     asyncJobStatusStore
-	tasks    durableCancelStore
+	jobs     WorkerJobStore
+	tasks    DurableCancelStore
 	hub      *JobHub
 	workers  int
 	cancels  *CancelRegistry
@@ -35,8 +35,8 @@ type PoolManagerConfig struct {
 	Runtime   Runtime
 	Status    runStatusUpdater // run-status store for worker pre-RunStream bail paths
 	Messages  MessageStore
-	Jobs      asyncJobStatusStore
-	Tasks     durableCancelStore
+	Jobs      WorkerJobStore
+	Tasks     DurableCancelStore
 	Hub       *JobHub
 	Workers   int
 	CancelTTL time.Duration // 0 → DefaultCancelTTL

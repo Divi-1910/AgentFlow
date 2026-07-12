@@ -9,7 +9,7 @@ import (
 	backenddb "backend/db"
 )
 
-const schemaVersion = 1
+const schemaVersion = 3
 
 type Options = backenddb.SQLiteOptions
 
@@ -29,7 +29,7 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	return migrate(ctx, db, migrations)
 }
 
-var migrations = []string{migrationV1}
+var migrations = []string{migrationV1, migrationV2, migrationV3}
 
 func migrate(ctx context.Context, db *sql.DB, steps []string) error {
 	var current int
@@ -189,4 +189,75 @@ CREATE TABLE messages (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX messages_thread_window_idx ON messages(thread_id, created_at DESC, id DESC);
+`
+
+// migrationV2 adds the async job store: jobs (state-only, mirrors the
+// dispatch/claim/run/deliver lifecycle) and job_locks (target-agent and
+// callback-thread serialization). No agents table, no cross-repository
+// foreign keys — jobs reference runs/threads only by opaque id.
+const migrationV2 = `
+CREATE TABLE jobs (
+    job_id TEXT PRIMARY KEY,
+    parent_run_id TEXT NOT NULL,
+    originator_run_id TEXT NOT NULL DEFAULT '',
+    parent_thread_id TEXT NOT NULL DEFAULT '',
+    parent_agent_id TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '',
+    tool_call_id TEXT NOT NULL DEFAULT '',
+    delegate_tool TEXT NOT NULL DEFAULT '',
+    target_agent_id TEXT NOT NULL DEFAULT '',
+    task TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL DEFAULT '',
+    callback_instruction TEXT NOT NULL DEFAULT '',
+    delegation_chain_json TEXT,
+    delegation_depth INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    output TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    child_run_id TEXT NOT NULL DEFAULT '',
+    child_thread_id TEXT NOT NULL DEFAULT '',
+    awaiting_parent_run_id TEXT NOT NULL DEFAULT '',
+    await_tool_call_id TEXT NOT NULL DEFAULT '',
+    awaiting_since INTEGER,
+    delivered_at INTEGER,
+    delivered_tool_call_id TEXT NOT NULL DEFAULT '',
+    callback_status TEXT NOT NULL DEFAULT 'none',
+    callback_run_id TEXT NOT NULL DEFAULT '',
+    callback_error TEXT NOT NULL DEFAULT '',
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    started_at INTEGER,
+    finished_at INTEGER
+);
+CREATE UNIQUE INDEX jobs_dispatch_key_unique ON jobs(parent_run_id, tool_call_id);
+CREATE INDEX jobs_queue_idx ON jobs(status, lease_expires_at, created_at);
+CREATE INDEX jobs_originator_status_idx ON jobs(originator_run_id, status);
+CREATE INDEX jobs_awaiting_idx ON jobs(awaiting_parent_run_id, delivered_at);
+CREATE INDEX jobs_callback_queue_idx ON jobs(mode, status, callback_status, finished_at);
+
+CREATE TABLE job_locks (
+    lock_key TEXT PRIMARY KEY,
+    lock_type TEXT NOT NULL,
+    active_job_id TEXT NOT NULL,
+    active_run_id TEXT NOT NULL DEFAULT '',
+    lease_owner TEXT NOT NULL,
+    lease_expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+`
+
+// migrationV3 binds a state database to exactly one immutable deployment
+// bundle. The singleton row is inserted by DeploymentIdentityRepo on first
+// boot; subsequent boots may only verify it, never update it.
+const migrationV3 = `
+CREATE TABLE deployment_identity (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    deployment_id TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    synthetic_user_id TEXT NOT NULL,
+    bound_at INTEGER NOT NULL
+);
 `

@@ -118,7 +118,16 @@ type MCPManager struct {
 }
 
 func NewMCPManager(httpClient *http.Client) *MCPManager {
-	blocked := defaultBlockedCIDRs()
+	return NewMCPManagerWithURLValidator(httpClient, ValidateMCPServerURL)
+}
+
+// NewMCPManagerWithURLValidator permits composition tests to use local MCP
+// servers while production continues to call NewMCPManager's HTTPS/SSRF
+// policy. A nil validator falls back to the production policy.
+func NewMCPManagerWithURLValidator(httpClient *http.Client, validate func(string) error) *MCPManager {
+	if validate == nil {
+		validate = ValidateMCPServerURL
+	}
 	return &MCPManager{
 		httpClient: httpClient,
 		// validate requires https + the shared SSRF guard. NOTE: like the HTTP
@@ -126,17 +135,22 @@ func NewMCPManager(httpClient *http.Client) *MCPManager {
 		// DNS-rebinding host could pass here and resolve to a private IP at the
 		// actual request. Accepted inherited risk for v1 (the operator controls
 		// these URLs); a dial-time IP guard would close it later.
-		validate: func(rawURL string) error {
-			parsed, err := url.Parse(rawURL)
-			if err != nil {
-				return fmt.Errorf("invalid MCP url: %w", err)
-			}
-			if parsed.Scheme != "https" {
-				return fmt.Errorf("MCP url must be https, got %q", parsed.Scheme)
-			}
-			return checkSSRF(rawURL, blocked)
-		},
+		validate: validate,
 	}
+}
+
+// ValidateMCPServerURL applies the same transport and SSRF policy used by live
+// MCP discovery. Deployment loaders call it at boot so a frozen bundle cannot
+// contain a URL the runtime will deterministically refuse later.
+func ValidateMCPServerURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid MCP url: %w", err)
+	}
+	if parsed.Scheme != "https" {
+		return fmt.Errorf("MCP url must be https, got %q", parsed.Scheme)
+	}
+	return checkSSRF(rawURL, defaultBlockedCIDRs())
 }
 
 // Discover connects to each server in parallel (per-server timeout), lists its

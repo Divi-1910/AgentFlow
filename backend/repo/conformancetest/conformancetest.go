@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"backend/agent"
+	"backend/dispatcher"
 	"backend/llm"
 	"backend/memory"
 	"backend/runtimectx"
@@ -498,6 +499,646 @@ func RunAsyncJobConformance(t *testing.T, newStore func(t *testing.T) agent.Asyn
 		}
 		if !res.Pending {
 			t.Fatalf("a freshly queued job must be Pending: %+v", res)
+		}
+	})
+
+	t.Run("pending_required_jobs_lists_undelivered", func(t *testing.T) {
+		s := newStore(t)
+		required1, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-3", OriginatorRunID: "orig-3", UserID: "u",
+			ToolCallID: "call-3a", TargetAgentID: "target", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent required1: %v", err)
+		}
+		required2, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-3", OriginatorRunID: "orig-3", UserID: "u",
+			ToolCallID: "call-3b", TargetAgentID: "target", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent required2: %v", err)
+		}
+		// A background job on the same parent run must not appear in the
+		// required-jobs listing.
+		if _, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-3", OriginatorRunID: "orig-3", UserID: "u",
+			ToolCallID: "call-3c", TargetAgentID: "target", Task: "t", Mode: agent.JobModeBackground,
+		}); err != nil {
+			t.Fatalf("DispatchAgent background: %v", err)
+		}
+		pending, err := s.PendingRequiredJobs(ctx, "parent-3", "u")
+		if err != nil {
+			t.Fatalf("PendingRequiredJobs: %v", err)
+		}
+		got := map[string]bool{}
+		for _, p := range pending {
+			got[p.JobID] = true
+		}
+		if len(pending) != 2 || !got[required1.JobID] || !got[required2.JobID] {
+			t.Fatalf("PendingRequiredJobs = %+v, want exactly %s and %s", pending, required1.JobID, required2.JobID)
+		}
+	})
+
+	t.Run("mark_awaiting_resolves_as_not_all_terminal", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-4", OriginatorRunID: "orig-4", UserID: "u",
+			ToolCallID: "call-4", TargetAgentID: "target", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		await := agent.PendingAwait{JobID: d.JobID, AwaitToolCallID: "await-call-4", CreatedAt: time.Now()}
+		if err := s.MarkAwaiting(ctx, "parent-4", []agent.PendingAwait{await}); err != nil {
+			t.Fatalf("MarkAwaiting: %v", err)
+		}
+		results, allTerminal, err := s.ResolveAwaits(ctx, "parent-4", "u", []agent.PendingAwait{await})
+		if err != nil {
+			t.Fatalf("ResolveAwaits: %v", err)
+		}
+		if allTerminal {
+			t.Fatal("allTerminal = true, want false while the job is still pending")
+		}
+		if len(results) != 1 || !results[0].Pending {
+			t.Fatalf("results = %+v, want a single pending result", results)
+		}
+	})
+
+	t.Run("mark_delivered_clears_from_pending", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-5", OriginatorRunID: "orig-5", UserID: "u",
+			ToolCallID: "call-5", TargetAgentID: "target", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		await := agent.PendingAwait{JobID: d.JobID, AwaitToolCallID: "await-call-5", CreatedAt: time.Now()}
+		terminal := agent.AwaitJobResult{JobID: d.JobID, Status: "succeeded", Output: "done"}
+		if err := s.MarkDelivered(ctx, "parent-5", "u", []agent.AwaitJobResult{terminal}, []agent.PendingAwait{await}); err != nil {
+			t.Fatalf("MarkDelivered: %v", err)
+		}
+		pending, err := s.PendingRequiredJobs(ctx, "parent-5", "u")
+		if err != nil {
+			t.Fatalf("PendingRequiredJobs: %v", err)
+		}
+		for _, p := range pending {
+			if p.JobID == d.JobID {
+				t.Fatalf("PendingRequiredJobs still lists delivered job %s", d.JobID)
+			}
+		}
+	})
+}
+
+// JobLifecycleStore is the full job-repo surface these two suites need: seed
+// jobs the way the runtime does (agent.AsyncJobStore.DispatchAgent), then
+// exercise the coordinator and worker ports under test. One concrete job
+// repo implements all three — there is no other seam to create a fresh job.
+type JobLifecycleStore interface {
+	agent.AsyncJobStore
+	dispatcher.CoordinatorJobStore
+	dispatcher.WorkerJobStore
+}
+
+// RunCoordinatorJobConformance pins dispatcher.CoordinatorJobStore: claim CAS
+// (queued and expired-starting are reclaimable, running is not), lock
+// acquire/release owner-fencing, MarkJobDispatched's claim-owner fencing,
+// FindReadyWaitingRunIDs' all-terminal grouping, and cancellation before a
+// job is ever dispatched.
+func RunCoordinatorJobConformance(t *testing.T, newStore func(t *testing.T) JobLifecycleStore) {
+	ctx := context.Background()
+
+	t.Run("claim_starting_admits_queued_rejects_unexpired_running", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-c1", OriginatorRunID: "orig-c1", UserID: "u",
+			ToolCallID: "call-c1", TargetAgentID: "target", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		claimed, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-a", time.Minute)
+		if err != nil || !ok || claimed.JobID != d.JobID {
+			t.Fatalf("claim queued job: ok=%v err=%v claimed=%+v", ok, err, claimed)
+		}
+		_, ok, err = s.ClaimJobStarting(ctx, d.JobID, "owner-b", time.Minute)
+		if err != nil {
+			t.Fatalf("claim unexpired starting: %v", err)
+		}
+		if ok {
+			t.Fatal("claimed an unexpired starting job held by another owner")
+		}
+	})
+
+	t.Run("claim_starting_reclaims_expired_lease", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-c2", OriginatorRunID: "orig-c2", UserID: "u",
+			ToolCallID: "call-c2", TargetAgentID: "target", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		if _, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-a", -time.Millisecond); err != nil || !ok {
+			t.Fatalf("first claim (immediately-expiring lease): ok=%v err=%v", ok, err)
+		}
+		claimed, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-b", time.Minute)
+		if err != nil || !ok || claimed.JobID != d.JobID {
+			t.Fatalf("reclaim expired starting: ok=%v err=%v claimed=%+v", ok, err, claimed)
+		}
+	})
+
+	t.Run("claim_starting_rejects_running", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-c3", OriginatorRunID: "orig-c3", UserID: "u",
+			ToolCallID: "call-c3", TargetAgentID: "target", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		if _, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-a", time.Minute); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		if applied, err := s.MarkJobDispatched(ctx, d.JobID, "owner-a", "child-run", "child-thread"); err != nil || !applied {
+			t.Fatalf("MarkJobDispatched: applied=%v err=%v", applied, err)
+		}
+		_, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-b", time.Minute)
+		if err != nil {
+			t.Fatalf("claim running job: %v", err)
+		}
+		if ok {
+			t.Fatal("claimed a running job")
+		}
+	})
+
+	t.Run("acquire_lock_same_job_requires_same_owner", func(t *testing.T) {
+		s := newStore(t)
+		acquired, err := s.AcquireLock(ctx, "target", "lock-c4", "job-x", "run-x", "owner-a", time.Minute)
+		if err != nil || !acquired {
+			t.Fatalf("first acquire: acquired=%v err=%v", acquired, err)
+		}
+		// Same job, DIFFERENT owner, unexpired lease: must be rejected — a
+		// second coordinator can't silently steal an unexpired lease just by
+		// re-asserting the same job id under a different owner.
+		reacquired, err := s.AcquireLock(ctx, "target", "lock-c4", "job-x", "run-x", "owner-b", time.Minute)
+		if err != nil {
+			t.Fatalf("cross-owner reacquire: %v", err)
+		}
+		if reacquired {
+			t.Fatal("a different owner reacquired an unexpired same-job lock")
+		}
+		// Same job, SAME owner: re-affirming (an idempotent retry of the same
+		// claim attempt) is fine.
+		reaffirmed, err := s.AcquireLock(ctx, "target", "lock-c4", "job-x", "run-x", "owner-a", time.Minute)
+		if err != nil || !reaffirmed {
+			t.Fatalf("same-owner reaffirm: acquired=%v err=%v", reaffirmed, err)
+		}
+	})
+
+	t.Run("release_lock_requires_matching_owner", func(t *testing.T) {
+		s := newStore(t)
+		if acquired, err := s.AcquireLock(ctx, "target", "lock-c5", "job-y", "run-y", "owner-a", time.Minute); err != nil || !acquired {
+			t.Fatalf("acquire: acquired=%v err=%v", acquired, err)
+		}
+		if err := s.ReleaseLock(ctx, "lock-c5", "job-y", "owner-wrong"); err != nil {
+			t.Fatalf("release with wrong owner: %v", err)
+		}
+		stillHeld, err := s.AcquireLock(ctx, "target", "lock-c5", "job-z", "run-z", "owner-b", time.Minute)
+		if err != nil {
+			t.Fatalf("acquire after wrong-owner release: %v", err)
+		}
+		if stillHeld {
+			t.Fatal("lock was released by the wrong owner")
+		}
+		if err := s.ReleaseLock(ctx, "lock-c5", "job-y", "owner-a"); err != nil {
+			t.Fatalf("release with correct owner: %v", err)
+		}
+		freed, err := s.AcquireLock(ctx, "target", "lock-c5", "job-z", "run-z", "owner-b", time.Minute)
+		if err != nil || !freed {
+			t.Fatalf("acquire after correct release: acquired=%v err=%v", freed, err)
+		}
+	})
+
+	t.Run("mark_job_dispatched_requires_claim_owner", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-c6", OriginatorRunID: "orig-c6", UserID: "u",
+			ToolCallID: "call-c6", TargetAgentID: "target", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		if _, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-a", time.Minute); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		// A wrong-owner dispatch must report applied=false and be a no-op:
+		// the job stays "starting" under owner-a, so the correct-owner
+		// dispatch below must still succeed.
+		applied, err := s.MarkJobDispatched(ctx, d.JobID, "owner-wrong", "child-run-wrong", "child-thread-wrong")
+		if err != nil {
+			t.Fatalf("MarkJobDispatched(wrong owner): %v", err)
+		}
+		if applied {
+			t.Fatal("MarkJobDispatched applied with the wrong owner")
+		}
+		applied, err = s.MarkJobDispatched(ctx, d.JobID, "owner-a", "child-run", "child-thread")
+		if err != nil || !applied {
+			t.Fatalf("MarkJobDispatched(correct owner): applied=%v err=%v", applied, err)
+		}
+		expired, err := s.FindExpiredRunningJobs(ctx, time.Now().Add(time.Hour), 10)
+		if err != nil {
+			t.Fatalf("FindExpiredRunningJobs: %v", err)
+		}
+		var found *agent.JobRecord
+		for i := range expired {
+			if expired[i].JobID == d.JobID {
+				found = &expired[i]
+			}
+		}
+		if found == nil || found.ChildRunID != "child-run" {
+			t.Fatalf("job not correctly dispatched: expired=%+v", expired)
+		}
+	})
+
+	t.Run("mark_claimed_job_failed_requires_claim_owner", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-c9", OriginatorRunID: "orig-c9", UserID: "u",
+			ToolCallID: "call-c9", TargetAgentID: "target", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		if _, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-a", time.Minute); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		// This is the pre-dispatch path: child_run_id is never persisted at
+		// this point, so fencing must be on the claim owner, not a run id.
+		applied, err := s.MarkClaimedJobFailed(ctx, d.JobID, "owner-wrong", "boom")
+		if err != nil {
+			t.Fatalf("MarkClaimedJobFailed(wrong owner): %v", err)
+		}
+		if applied {
+			t.Fatal("MarkClaimedJobFailed applied with the wrong owner")
+		}
+		applied, err = s.MarkClaimedJobFailed(ctx, d.JobID, "owner-a", "boom")
+		if err != nil || !applied {
+			t.Fatalf("MarkClaimedJobFailed(correct owner): applied=%v err=%v", applied, err)
+		}
+		_, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-b", time.Minute)
+		if err != nil {
+			t.Fatalf("claim after failure: %v", err)
+		}
+		if ok {
+			t.Fatal("claimed an already-failed job")
+		}
+	})
+
+	t.Run("mark_job_cancelled_before_dispatch_uses_empty_child_run_id_fence", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-c8", OriginatorRunID: "orig-c8", UserID: "u",
+			ToolCallID: "call-c8", TargetAgentID: "target", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		// Still queued — never claimed/dispatched — child_run_id is unset.
+		if applied, err := s.MarkJobCancelled(ctx, d.JobID, "", "originator cancelled"); err != nil || !applied {
+			t.Fatalf("MarkJobCancelled: applied=%v err=%v", applied, err)
+		}
+		_, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-a", time.Minute)
+		if err != nil {
+			t.Fatalf("claim cancelled job: %v", err)
+		}
+		if ok {
+			t.Fatal("claimed an already-cancelled job")
+		}
+	})
+
+	t.Run("ready_waiting_run_ids_requires_all_awaiting_jobs_terminal", func(t *testing.T) {
+		s := newStore(t)
+		d1, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-c7", OriginatorRunID: "orig-c7", UserID: "u",
+			ToolCallID: "call-c7a", TargetAgentID: "target", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent d1: %v", err)
+		}
+		d2, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-c7", OriginatorRunID: "orig-c7", UserID: "u",
+			ToolCallID: "call-c7b", TargetAgentID: "target2", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent d2: %v", err)
+		}
+		if err := s.MarkAwaiting(ctx, "parent-c7", []agent.PendingAwait{{JobID: d1.JobID}, {JobID: d2.JobID}}); err != nil {
+			t.Fatalf("MarkAwaiting: %v", err)
+		}
+
+		assertNotReady := func(t *testing.T) {
+			t.Helper()
+			ready, err := s.FindReadyWaitingRunIDs(ctx, 10)
+			if err != nil {
+				t.Fatalf("FindReadyWaitingRunIDs: %v", err)
+			}
+			for _, runID := range ready {
+				if runID == "parent-c7" {
+					t.Fatalf("parent-c7 reported ready too early: ready=%v", ready)
+				}
+			}
+		}
+		assertNotReady(t)
+		if applied, err := s.MarkJobSucceeded(ctx, d1.JobID, "", "done-1"); err != nil || !applied {
+			t.Fatalf("MarkJobSucceeded d1: applied=%v err=%v", applied, err)
+		}
+		assertNotReady(t) // d2 is still pending
+
+		if applied, err := s.MarkJobSucceeded(ctx, d2.JobID, "", "done-2"); err != nil || !applied {
+			t.Fatalf("MarkJobSucceeded d2: applied=%v err=%v", applied, err)
+		}
+		ready, err := s.FindReadyWaitingRunIDs(ctx, 10)
+		if err != nil {
+			t.Fatalf("FindReadyWaitingRunIDs: %v", err)
+		}
+		found := false
+		for _, runID := range ready {
+			if runID == "parent-c7" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("parent-c7 not ready after both awaiting jobs succeeded: ready=%v", ready)
+		}
+	})
+
+	t.Run("mark_callback_cancelled_before_start_then_running_is_rejected", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-c10", OriginatorRunID: "orig-c10", UserID: "u",
+			ToolCallID: "call-c10", TargetAgentID: "target", Task: "t", Mode: agent.JobModeBackground,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		// Callback is still "queued" — never claimed. Cancel it via the
+		// empty-run-id, pre-start path: this must fence on callback_status
+		// being "queued", not just on the (empty) callback_run_id, or a
+		// racing terminal write could apply after the callback already left
+		// "queued".
+		if err := s.MarkCallbackCancelled(ctx, d.JobID, "", "originator cancelled"); err != nil {
+			t.Fatalf("MarkCallbackCancelled: %v", err)
+		}
+		// It's now terminal (cancelled), not "queued" — a later claim
+		// attempt must be rejected, proving the cancellation actually
+		// transitioned it (not a silent no-op) and that the terminal state
+		// sticks (not reclaimable).
+		applied, err := s.MarkCallbackRunning(ctx, d.JobID, "late-callback-run", "owner-a", time.Minute)
+		if err != nil {
+			t.Fatalf("MarkCallbackRunning after cancellation: %v", err)
+		}
+		if applied {
+			t.Fatal("claimed a callback that was already cancelled before start")
+		}
+	})
+}
+
+// RunWorkerJobConformance pins dispatcher.WorkerJobStore: terminal writes and
+// lease refreshes fence on the child/callback run id supplied — a call
+// carrying a mismatched run id (e.g. a stale or duplicate bus delivery) is a
+// no-op rather than clobbering the job's real outcome — and a callback's own
+// failure never overwrites the job's own Error.
+func RunWorkerJobConformance(t *testing.T, newStore func(t *testing.T) JobLifecycleStore) {
+	ctx := context.Background()
+
+	t.Run("mark_job_succeeded_requires_matching_child_run_id", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-w1", OriginatorRunID: "orig-w1", UserID: "u",
+			ToolCallID: "call-w1", TargetAgentID: "target", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		if _, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-a", time.Minute); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		if applied, err := s.MarkJobDispatched(ctx, d.JobID, "owner-a", "child-run-1", "thread-1"); err != nil || !applied {
+			t.Fatalf("dispatch: applied=%v err=%v", applied, err)
+		}
+		// A completion write carrying the WRONG child run id (e.g. a stale or
+		// duplicate bus delivery) must report applied=false and be a no-op —
+		// the job stays running, untouched, under its real child run.
+		applied, err := s.MarkJobSucceeded(ctx, d.JobID, "wrong-child-run", "stale output")
+		if err != nil {
+			t.Fatalf("mismatched MarkJobSucceeded: %v", err)
+		}
+		if applied {
+			t.Fatal("MarkJobSucceeded applied with a mismatched child run id")
+		}
+		expired, err := s.FindExpiredRunningJobs(ctx, time.Now().Add(time.Hour), 10)
+		if err != nil {
+			t.Fatalf("FindExpiredRunningJobs: %v", err)
+		}
+		var found *agent.JobRecord
+		for i := range expired {
+			if expired[i].JobID == d.JobID {
+				found = &expired[i]
+			}
+		}
+		if found == nil {
+			t.Fatal("job vanished from the running set — mismatched completion incorrectly applied")
+		}
+		if found.Status != string(agent.JobStatusRunning) || found.ChildRunID != "child-run-1" {
+			t.Fatalf("job state after mismatched write = %+v, want still running under child-run-1", found)
+		}
+		// The call carrying the CORRECT child run id applies for real.
+		applied, err = s.MarkJobSucceeded(ctx, d.JobID, "child-run-1", "real output")
+		if err != nil || !applied {
+			t.Fatalf("matching MarkJobSucceeded: applied=%v err=%v", applied, err)
+		}
+		res, err := s.AwaitJob(ctx, agent.AwaitJobRequest{JobID: d.JobID, UserID: "u", OriginatorRunID: "orig-w1"})
+		if err != nil {
+			t.Fatalf("AwaitJob: %v", err)
+		}
+		if res.Pending || res.Output != "real output" {
+			t.Fatalf("final job state = %+v, want terminal with real output", res)
+		}
+	})
+
+	t.Run("callback_failure_does_not_overwrite_job_error", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-w2", OriginatorRunID: "orig-w2", UserID: "u",
+			ToolCallID: "call-w2", TargetAgentID: "target", Task: "t", Mode: agent.JobModeBackground,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		if _, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-a", time.Minute); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		if applied, err := s.MarkJobDispatched(ctx, d.JobID, "owner-a", "child-run", "thread"); err != nil || !applied {
+			t.Fatalf("dispatch: applied=%v err=%v", applied, err)
+		}
+		if applied, err := s.MarkJobSucceeded(ctx, d.JobID, "child-run", "job output"); err != nil || !applied {
+			t.Fatalf("MarkJobSucceeded: applied=%v err=%v", applied, err)
+		}
+		applied, err := s.MarkCallbackRunning(ctx, d.JobID, "callback-run-1", "owner-a", time.Minute)
+		if err != nil || !applied {
+			t.Fatalf("MarkCallbackRunning: applied=%v err=%v", applied, err)
+		}
+		if err := s.MarkCallbackFailed(ctx, d.JobID, "callback-run-1", "callback blew up"); err != nil {
+			t.Fatalf("MarkCallbackFailed: %v", err)
+		}
+		res, err := s.AwaitJob(ctx, agent.AwaitJobRequest{JobID: d.JobID, UserID: "u", OriginatorRunID: "orig-w2"})
+		if err != nil {
+			t.Fatalf("AwaitJob: %v", err)
+		}
+		if res.Error != "" || res.Output != "job output" || res.Status != string(agent.JobStatusSucceeded) {
+			t.Fatalf("callback failure corrupted the job's own outcome: %+v", res)
+		}
+	})
+
+	t.Run("mark_callback_running_reports_applied_and_rejects_replay", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-w3", OriginatorRunID: "orig-w3", UserID: "u",
+			ToolCallID: "call-w3", TargetAgentID: "target", Task: "t", Mode: agent.JobModeBackground,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		if _, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-a", time.Minute); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		if applied, err := s.MarkJobDispatched(ctx, d.JobID, "owner-a", "child-run", "thread"); err != nil || !applied {
+			t.Fatalf("dispatch: applied=%v err=%v", applied, err)
+		}
+		if applied, err := s.MarkJobSucceeded(ctx, d.JobID, "child-run", "output"); err != nil || !applied {
+			t.Fatalf("MarkJobSucceeded: applied=%v err=%v", applied, err)
+		}
+		applied, err := s.MarkCallbackRunning(ctx, d.JobID, "callback-run-1", "owner-a", time.Minute)
+		if err != nil || !applied {
+			t.Fatalf("first MarkCallbackRunning: applied=%v err=%v", applied, err)
+		}
+		// Already running: a second claim attempt must report applied=false,
+		// not silently succeed and let two callback runs both believe they
+		// own it.
+		applied, err = s.MarkCallbackRunning(ctx, d.JobID, "callback-run-2", "owner-b", time.Minute)
+		if err != nil {
+			t.Fatalf("second MarkCallbackRunning: %v", err)
+		}
+		if applied {
+			t.Fatal("MarkCallbackRunning claimed an already-running callback")
+		}
+	})
+
+	t.Run("refresh_job_lease_fences_on_child_run_id", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-w4", OriginatorRunID: "orig-w4", UserID: "u",
+			ToolCallID: "call-w4", TargetAgentID: "target-w4", Task: "t", Mode: agent.JobModeRequired,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		if _, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-a", time.Minute); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		if applied, err := s.MarkJobDispatched(ctx, d.JobID, "owner-a", "child-run", "thread"); err != nil || !applied {
+			t.Fatalf("dispatch: applied=%v err=%v", applied, err)
+		}
+		if err := s.RefreshJobLease(ctx, d.JobID, "child-run", "orig-w4", "target-w4", "worker:child-run", time.Minute); err != nil {
+			t.Fatalf("refresh with correct child run: %v", err)
+		}
+		if err := s.RefreshJobLease(ctx, d.JobID, "some-other-run", "orig-w4", "target-w4", "worker:other", time.Minute); err == nil {
+			t.Fatal("refresh with mismatched child run id succeeded, want error")
+		}
+	})
+
+	t.Run("refresh_callback_lease_fences_on_callback_run_id", func(t *testing.T) {
+		s := newStore(t)
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-w5", OriginatorRunID: "orig-w5", UserID: "u",
+			ToolCallID: "call-w5", TargetAgentID: "target", Task: "t", Mode: agent.JobModeBackground,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		if _, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-a", time.Minute); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		if applied, err := s.MarkJobDispatched(ctx, d.JobID, "owner-a", "child-run", "thread-w5"); err != nil || !applied {
+			t.Fatalf("dispatch: applied=%v err=%v", applied, err)
+		}
+		if applied, err := s.MarkJobSucceeded(ctx, d.JobID, "child-run", "output"); err != nil || !applied {
+			t.Fatalf("MarkJobSucceeded: applied=%v err=%v", applied, err)
+		}
+		if applied, err := s.MarkCallbackRunning(ctx, d.JobID, "callback-run", "owner-a", time.Minute); err != nil || !applied {
+			t.Fatalf("MarkCallbackRunning: applied=%v err=%v", applied, err)
+		}
+		if err := s.RefreshCallbackLease(ctx, d.JobID, "callback-run", "thread-w5", "worker:callback-run", time.Minute); err != nil {
+			t.Fatalf("refresh with correct callback run: %v", err)
+		}
+		if err := s.RefreshCallbackLease(ctx, d.JobID, "some-other-callback-run", "thread-w5", "worker:other", time.Minute); err == nil {
+			t.Fatal("refresh with mismatched callback run id succeeded, want error")
+		}
+	})
+
+	t.Run("mark_callback_terminal_mismatched_run_id_does_not_release_current_attempts_lock", func(t *testing.T) {
+		s := newStore(t)
+		// ParentThreadID must be set: markCallbackTerminal's internal
+		// auto-release reconstructs the callback lock key from the job's own
+		// parent_thread_id, the same "callback_thread:"+threadID convention
+		// dispatcher.JobCoordinator uses to construct it in the first place.
+		d, err := s.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-w6", OriginatorRunID: "orig-w6", ParentThreadID: "thread-w6", UserID: "u",
+			ToolCallID: "call-w6", TargetAgentID: "target", Task: "t", Mode: agent.JobModeBackground,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		if _, ok, err := s.ClaimJobStarting(ctx, d.JobID, "owner-a", time.Minute); err != nil || !ok {
+			t.Fatalf("claim: ok=%v err=%v", ok, err)
+		}
+		if applied, err := s.MarkJobDispatched(ctx, d.JobID, "owner-a", "child-run", "child-thread-w6"); err != nil || !applied {
+			t.Fatalf("dispatch: applied=%v err=%v", applied, err)
+		}
+		if applied, err := s.MarkJobSucceeded(ctx, d.JobID, "child-run", "output"); err != nil || !applied {
+			t.Fatalf("MarkJobSucceeded: applied=%v err=%v", applied, err)
+		}
+		lockKey := "callback_thread:thread-w6"
+		if acquired, err := s.AcquireLock(ctx, "callback_thread", lockKey, d.JobID, "callback-run-1", "owner-a", time.Minute); err != nil || !acquired {
+			t.Fatalf("acquire callback lock: acquired=%v err=%v", acquired, err)
+		}
+		applied, err := s.MarkCallbackRunning(ctx, d.JobID, "callback-run-1", "owner-a", time.Minute)
+		if err != nil || !applied {
+			t.Fatalf("MarkCallbackRunning: applied=%v err=%v", applied, err)
+		}
+		// A mismatched terminal write (wrong callback run id) must not release
+		// the lock the CURRENT legitimate callback attempt still holds.
+		if err := s.MarkCallbackFailed(ctx, d.JobID, "wrong-callback-run", "stale error"); err != nil {
+			t.Fatalf("mismatched MarkCallbackFailed: %v", err)
+		}
+		stillHeld, err := s.AcquireLock(ctx, "callback_thread", lockKey, "other-job", "other-run", "owner-b", time.Minute)
+		if err != nil {
+			t.Fatalf("acquire attempt: %v", err)
+		}
+		if stillHeld {
+			t.Fatal("mismatched terminal write released the current callback attempt's lock")
+		}
+		// The correctly-matching write DOES apply and DOES release the lock.
+		if err := s.MarkCallbackCompleted(ctx, d.JobID, "callback-run-1"); err != nil {
+			t.Fatalf("matching MarkCallbackCompleted: %v", err)
+		}
+		freed, err := s.AcquireLock(ctx, "callback_thread", lockKey, "other-job", "other-run", "owner-b", time.Minute)
+		if err != nil {
+			t.Fatalf("acquire after real completion: %v", err)
+		}
+		if !freed {
+			t.Fatal("lock not released after the matching callback completed")
 		}
 	})
 }

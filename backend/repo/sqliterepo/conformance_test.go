@@ -12,15 +12,20 @@ import (
 )
 
 var (
-	_ agent.CheckpointStore        = (*sqliterepo.RunRepo)(nil)
-	_ conformancetest.RunStore     = (*sqliterepo.RunRepo)(nil)
-	_ conformancetest.TaskStore    = (*sqliterepo.TaskRepo)(nil)
-	_ memory.MetaStore             = (*sqliterepo.MemoryMetaRepo)(nil)
-	_ memory.RevisionStore         = (*sqliterepo.MemoryRevisionRepo)(nil)
-	_ dispatcher.ThreadStore       = (*sqliterepo.ThreadRepo)(nil)
-	_ dispatcher.MessageStore      = (*sqliterepo.MessageRepo)(nil)
-	_ conformancetest.ThreadStore  = (*sqliterepo.ThreadRepo)(nil)
-	_ conformancetest.MessageStore = (*sqliterepo.MessageRepo)(nil)
+	_ agent.CheckpointStore          = (*sqliterepo.RunRepo)(nil)
+	_ conformancetest.RunStore       = (*sqliterepo.RunRepo)(nil)
+	_ conformancetest.TaskStore      = (*sqliterepo.TaskRepo)(nil)
+	_ memory.MetaStore               = (*sqliterepo.MemoryMetaRepo)(nil)
+	_ memory.RevisionStore           = (*sqliterepo.MemoryRevisionRepo)(nil)
+	_ dispatcher.ThreadStore         = (*sqliterepo.ThreadRepo)(nil)
+	_ dispatcher.MessageStore        = (*sqliterepo.MessageRepo)(nil)
+	_ conformancetest.ThreadStore    = (*sqliterepo.ThreadRepo)(nil)
+	_ conformancetest.MessageStore   = (*sqliterepo.MessageRepo)(nil)
+	_ agent.AsyncJobStore            = (*sqliterepo.JobRepo)(nil)
+	_ dispatcher.CoordinatorJobStore = (*sqliterepo.JobRepo)(nil)
+	_ dispatcher.WorkerJobStore      = (*sqliterepo.JobRepo)(nil)
+	_ dispatcher.CoordinatorRunStore = (*sqliterepo.RunRepo)(nil)
+	_ dispatcher.DurableCancelStore  = (*sqliterepo.TaskRepo)(nil)
 )
 
 func testDB(t *testing.T) *sql.DB {
@@ -67,4 +72,22 @@ func TestMessageRepoConformance(t *testing.T) {
 	conformancetest.RunMessageConformance(t, func(t *testing.T) conformancetest.MessageStore {
 		return sqliterepo.NewMessageRepo(testDB(t))
 	})
+}
+
+func newJobLifecycleStore(t *testing.T) conformancetest.JobLifecycleStore {
+	return sqliterepo.NewJobRepo(testDB(t))
+}
+
+func TestJobRepoConformance(t *testing.T) {
+	conformancetest.RunAsyncJobConformance(t, func(t *testing.T) agent.AsyncJobStore {
+		return sqliterepo.NewJobRepo(testDB(t))
+	})
+}
+
+func TestJobRepoCoordinatorConformance(t *testing.T) {
+	conformancetest.RunCoordinatorJobConformance(t, newJobLifecycleStore)
+}
+
+func TestJobRepoWorkerConformance(t *testing.T) {
+	conformancetest.RunWorkerJobConformance(t, newJobLifecycleStore)
 }

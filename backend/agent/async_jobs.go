@@ -20,6 +20,28 @@ const (
 	DefaultCallbackInstruction = "Share the result with the user once the task finishes."
 )
 
+type JobStatus string
+
+const (
+	JobStatusQueued    JobStatus = "queued"
+	JobStatusStarting  JobStatus = "starting"
+	JobStatusRunning   JobStatus = "running"
+	JobStatusSucceeded JobStatus = "succeeded"
+	JobStatusFailed    JobStatus = "failed"
+	JobStatusCancelled JobStatus = "cancelled"
+)
+
+type CallbackStatus string
+
+const (
+	CallbackStatusNone      CallbackStatus = "none"
+	CallbackStatusQueued    CallbackStatus = "queued"
+	CallbackStatusRunning   CallbackStatus = "running"
+	CallbackStatusCompleted CallbackStatus = "completed"
+	CallbackStatusFailed    CallbackStatus = "failed"
+	CallbackStatusCancelled CallbackStatus = "cancelled"
+)
+
 type RunResultStatus string
 
 const (

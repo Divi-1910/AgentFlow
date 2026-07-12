@@ -63,6 +63,10 @@ func NewToolRegistry(redisClient *redis.Client, memorySvc *memory.Service, scrat
 	return r
 }
 
+func NewValidationRegistry() *ToolRegistry {
+	return NewToolRegistry(nil, &memory.Service{}, &scratchpad.Service{})
+}
+
 func (r *ToolRegistry) Register(t Tool) {
 	r.tools[t.Name()] = t
 }

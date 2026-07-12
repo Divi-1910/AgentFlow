@@ -59,6 +59,140 @@ func TestRejectedTaskKeyIsNotStored(t *testing.T) {
 	}
 }
 
+func TestCancelTaskPreservesBudgetAndAutoCreatesMissingTask(t *testing.T) {
+	db := testDBInternal(t)
+	repo := NewTaskRepo(db)
+	ctx := context.Background()
+
+	if err := repo.EnsureTask(ctx, "origin", "user-1", 4); err != nil {
+		t.Fatalf("EnsureTask: %v", err)
+	}
+	if _, ok, err := repo.TryConsumeRun(ctx, "origin", "user-1", "key-1"); err != nil || !ok {
+		t.Fatalf("TryConsumeRun: ok=%v err=%v", ok, err)
+	}
+	cancelled, err := repo.IsCancelled(ctx, "origin")
+	if err != nil || cancelled {
+		t.Fatalf("IsCancelled before cancel: cancelled=%v err=%v", cancelled, err)
+	}
+	if err := repo.CancelTask(ctx, "origin", "cancelled"); err != nil {
+		t.Fatalf("CancelTask: %v", err)
+	}
+	cancelled, err = repo.IsCancelled(ctx, "origin")
+	if err != nil || !cancelled {
+		t.Fatalf("IsCancelled after cancel: cancelled=%v err=%v", cancelled, err)
+	}
+	status, err := repo.BudgetStatus(ctx, "origin")
+	if err != nil || status.MaxRuns != 4 || status.RunsUsed != 1 {
+		t.Fatalf("budget changed after cancel: %+v, err=%v", status, err)
+	}
+
+	// Cancelling a task that doesn't exist yet auto-creates it with the
+	// default budget, matching EnsureTask's first-creation-owns-max_runs.
+	if err := repo.CancelTask(ctx, "cancel-first", "cancelled"); err != nil {
+		t.Fatalf("CancelTask new: %v", err)
+	}
+	cancelled, err = repo.IsCancelled(ctx, "cancel-first")
+	if err != nil || !cancelled {
+		t.Fatalf("IsCancelled for auto-created task: cancelled=%v err=%v", cancelled, err)
+	}
+	status, err = repo.BudgetStatus(ctx, "cancel-first")
+	if err != nil || status.MaxRuns != agent.DefaultMaxTaskRuns || status.RunsUsed != 0 {
+		t.Fatalf("auto-created cancel budget = %+v, want defaults, err=%v", status, err)
+	}
+}
+
+func TestIsCancelledFalseForMissingAndUncancelledTask(t *testing.T) {
+	db := testDBInternal(t)
+	repo := NewTaskRepo(db)
+	ctx := context.Background()
+
+	cancelled, err := repo.IsCancelled(ctx, "never-created")
+	if err != nil || cancelled {
+		t.Fatalf("IsCancelled for missing task: cancelled=%v err=%v", cancelled, err)
+	}
+	if err := repo.EnsureTask(ctx, "uncancelled", "user-1", 1); err != nil {
+		t.Fatalf("EnsureTask: %v", err)
+	}
+	cancelled, err = repo.IsCancelled(ctx, "uncancelled")
+	if err != nil || cancelled {
+		t.Fatalf("IsCancelled for uncancelled task: cancelled=%v err=%v", cancelled, err)
+	}
+}
+
+// TestJobRepoCallbackTerminalTransitionRequiresExpectedStatus directly
+// inspects callback_status because no port method exposes it: AwaitJob only
+// surfaces the job's own Status/Error, and the list methods
+// (FindQueuedCallbacks/FindExpiredRunningCallbacks) each require a specific
+// callback_status to match a row at all, so neither can observe a callback
+// that already reached a DIFFERENT terminal state. Mirrors
+// TestRunCheckpointRetentionTimestamps' pattern: a fact the port doesn't
+// expose gets a package-internal test reading the column directly.
+func TestJobRepoCallbackTerminalTransitionRequiresExpectedStatus(t *testing.T) {
+	db := testDBInternal(t)
+	r := NewJobRepo(db)
+	ctx := context.Background()
+
+	dispatchBackground := func(toolCallID string) agent.DispatchAgentResult {
+		t.Helper()
+		res, err := r.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-run", OriginatorRunID: "originator-run", ParentThreadID: "parent-thread",
+			ParentAgentID: "agent-a", UserID: "user-1", ToolCallID: toolCallID,
+			DelegateTool: "ask_researcher", TargetAgentID: "agent-b", Task: "research",
+			Mode: agent.JobModeBackground,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		return res
+	}
+	callbackStatus := func(jobID string) string {
+		t.Helper()
+		var status string
+		if err := db.QueryRow(`SELECT callback_status FROM jobs WHERE job_id = ?`, jobID).Scan(&status); err != nil {
+			t.Fatalf("query callback_status for %s: %v", jobID, err)
+		}
+		return status
+	}
+
+	// running -> terminal: a completed callback must not be flipped by a
+	// late write for the SAME callback run id.
+	running := dispatchBackground("dispatch-cb-running")
+	if _, ok, err := r.ClaimJobStarting(ctx, running.JobID, "owner-a", time.Minute); err != nil || !ok {
+		t.Fatalf("ClaimJobStarting: ok=%v err=%v", ok, err)
+	}
+	if applied, err := r.MarkJobDispatched(ctx, running.JobID, "owner-a", "child-run", "child-thread"); err != nil || !applied {
+		t.Fatalf("MarkJobDispatched: applied=%v err=%v", applied, err)
+	}
+	if applied, err := r.MarkJobSucceeded(ctx, running.JobID, "child-run", "output"); err != nil || !applied {
+		t.Fatalf("MarkJobSucceeded: applied=%v err=%v", applied, err)
+	}
+	if applied, err := r.MarkCallbackRunning(ctx, running.JobID, "callback-run-1", "owner-a", time.Minute); err != nil || !applied {
+		t.Fatalf("MarkCallbackRunning: applied=%v err=%v", applied, err)
+	}
+	if err := r.MarkCallbackCompleted(ctx, running.JobID, "callback-run-1"); err != nil {
+		t.Fatalf("MarkCallbackCompleted: %v", err)
+	}
+	if err := r.MarkCallbackFailed(ctx, running.JobID, "callback-run-1", "late failure"); err != nil {
+		t.Fatalf("late MarkCallbackFailed: %v", err)
+	}
+	if got := callbackStatus(running.JobID); got != string(agent.CallbackStatusCompleted) {
+		t.Fatalf("callback_status = %q, want %q (late failure must not overwrite completed)", got, agent.CallbackStatusCompleted)
+	}
+
+	// queued -> terminal: a cancelled-before-start callback must not be
+	// flipped by a late write ALSO using the empty run id.
+	queued := dispatchBackground("dispatch-cb-queued")
+	if err := r.MarkCallbackCancelled(ctx, queued.JobID, "", "originator cancelled"); err != nil {
+		t.Fatalf("MarkCallbackCancelled: %v", err)
+	}
+	if err := r.MarkCallbackFailed(ctx, queued.JobID, "", "late failure"); err != nil {
+		t.Fatalf("late MarkCallbackFailed (queued path): %v", err)
+	}
+	if got := callbackStatus(queued.JobID); got != string(agent.CallbackStatusCancelled) {
+		t.Fatalf("callback_status = %q, want %q (late failure must not overwrite cancelled)", got, agent.CallbackStatusCancelled)
+	}
+}
+
 func TestConstraintCodeClassification(t *testing.T) {
 	db := testDBInternal(t)
 	now := unixNano(time.Now())

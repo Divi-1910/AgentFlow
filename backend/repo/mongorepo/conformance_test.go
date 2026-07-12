@@ -20,14 +20,18 @@ import (
 // mongorepo_test imports both freely — test imports never enter the production
 // dependency graph — which is exactly where these compile checks belong.
 var (
-	_ agent.CheckpointStore     = (*mongorepo.RunRepo)(nil)
-	_ agent.AsyncJobStore       = (*mongorepo.JobRepo)(nil)
-	_ memory.MetaStore          = (*mongorepo.MemoryMetaRepo)(nil)
-	_ memory.RevisionStore      = (*mongorepo.MemoryRevisionRepo)(nil)
-	_ dispatcher.AgentReader    = (*mongorepo.AgentRepo)(nil)
-	_ dispatcher.ThreadStore    = (*mongorepo.ThreadRepo)(nil)
-	_ dispatcher.MessageStore   = (*mongorepo.MessageRepo)(nil)
-	_ conformancetest.TaskStore = (*mongorepo.TaskRepo)(nil)
+	_ agent.CheckpointStore          = (*mongorepo.RunRepo)(nil)
+	_ agent.AsyncJobStore            = (*mongorepo.JobRepo)(nil)
+	_ memory.MetaStore               = (*mongorepo.MemoryMetaRepo)(nil)
+	_ memory.RevisionStore           = (*mongorepo.MemoryRevisionRepo)(nil)
+	_ dispatcher.AgentReader         = (*mongorepo.AgentRepo)(nil)
+	_ dispatcher.ThreadStore         = (*mongorepo.ThreadRepo)(nil)
+	_ dispatcher.MessageStore        = (*mongorepo.MessageRepo)(nil)
+	_ conformancetest.TaskStore      = (*mongorepo.TaskRepo)(nil)
+	_ dispatcher.CoordinatorJobStore = (*mongorepo.JobRepo)(nil)
+	_ dispatcher.WorkerJobStore      = (*mongorepo.JobRepo)(nil)
+	_ dispatcher.CoordinatorRunStore = (*mongorepo.RunRepo)(nil)
+	_ dispatcher.DurableCancelStore  = (*mongorepo.TaskRepo)(nil)
 )
 
 func TestRunRepoConformance(t *testing.T) {
@@ -58,6 +62,23 @@ func TestJobRepoConformance(t *testing.T) {
 		}
 		return r
 	})
+}
+
+func newJobLifecycleStore(t *testing.T) conformancetest.JobLifecycleStore {
+	t.Helper()
+	r := mongorepo.NewJobRepo(col(t, "conf_jobs"), col(t, "conf_locks"))
+	if err := r.EnsureIndexes(context.Background()); err != nil {
+		t.Fatalf("EnsureIndexes: %v", err)
+	}
+	return r
+}
+
+func TestJobRepoCoordinatorConformance(t *testing.T) {
+	conformancetest.RunCoordinatorJobConformance(t, newJobLifecycleStore)
+}
+
+func TestJobRepoWorkerConformance(t *testing.T) {
+	conformancetest.RunWorkerJobConformance(t, newJobLifecycleStore)
 }
 
 func TestMemoryMetaRepoConformance(t *testing.T) {

@@ -13,7 +13,7 @@ import (
 
 func TestJobCoordinatorLaunchQueuedJobsSerializesSameTargetAndDispatchesOtherTarget(t *testing.T) {
 	jobs := &coordinatorFakeJobs{
-		queue: []model.JobDocument{
+		queue: []agent.JobRecord{
 			coordinatorQueuedJob("job-b", "agent-b"),
 			coordinatorQueuedJob("job-c", "agent-c"),
 		},
@@ -35,9 +35,32 @@ func TestJobCoordinatorLaunchQueuedJobsSerializesSameTargetAndDispatchesOtherTar
 	}
 }
 
+// TestJobCoordinatorLaunchQueuedJobsReleasesAdmissionLockBeforeDispatch proves
+// the admission lock (Finding 5's fix) is held only for the count-then-claim
+// decision, not through the rest of dispatchJob — otherwise unrelated targets
+// for the same originator would be serialized behind one job's full dispatch.
+func TestJobCoordinatorLaunchQueuedJobsReleasesAdmissionLockBeforeDispatch(t *testing.T) {
+	jobs := &coordinatorFakeJobs{queue: []agent.JobRecord{coordinatorQueuedJob("job-b", "agent-b")}}
+	c := newCoordinatorTestHarness(jobs, &coordinatorFakeRuns{runs: map[string]*agent.RunInfo{}}, &coordinatorRecordingBus{}, nil)
+
+	c.launchQueuedJobs(context.Background())
+
+	admissionKey := admissionLockKey("origin-run")
+	targetKey := targetLockKey("origin-run", "agent-b")
+	if got, want := jobs.acquiredLockKeys, []string{admissionKey, targetKey}; !sameStrings(got, want) {
+		t.Fatalf("acquired lock keys = %v, want %v (admission before target)", got, want)
+	}
+	if got, want := jobs.releasedLockKeys, []string{admissionKey}; !sameStrings(got, want) {
+		t.Fatalf("released lock keys = %v, want %v (admission released right after claim; target lock stays held until the job terminates)", got, want)
+	}
+	if got, want := jobs.dispatched, []string{"job-b"}; !sameStrings(got, want) {
+		t.Fatalf("dispatched = %v, want %v", got, want)
+	}
+}
+
 func TestJobCoordinatorLaunchQueuedJobsHonorsActiveCap(t *testing.T) {
 	jobs := &coordinatorFakeJobs{
-		queue:  []model.JobDocument{coordinatorQueuedJob("job-b", "agent-b")},
+		queue:  []agent.JobRecord{coordinatorQueuedJob("job-b", "agent-b")},
 		active: 1,
 	}
 	c := newCoordinatorTestHarness(jobs, &coordinatorFakeRuns{runs: map[string]*agent.RunInfo{}}, &coordinatorRecordingBus{}, nil)
@@ -48,10 +71,43 @@ func TestJobCoordinatorLaunchQueuedJobsHonorsActiveCap(t *testing.T) {
 	if len(jobs.claimed) != 0 || len(jobs.dispatched) != 0 {
 		t.Fatalf("claimed=%v dispatched=%v, want none while cap is full", jobs.claimed, jobs.dispatched)
 	}
+	admissionKey := admissionLockKey("origin-run")
+	if got, want := jobs.acquiredLockKeys, []string{admissionKey}; !sameStrings(got, want) {
+		t.Fatalf("acquired lock keys = %v, want %v (admission gate must run before any target lock)", got, want)
+	}
+	if got, want := jobs.releasedLockKeys, []string{admissionKey}; !sameStrings(got, want) {
+		t.Fatalf("released lock keys = %v, want %v (admission lock must not leak when the cap blocks the claim)", got, want)
+	}
+}
+
+// TestJobCoordinatorLaunchQueuedJobsDeniesClaimWhenAdmissionLockHeld covers
+// Finding 5: without the admission lock, two coordinators (or two candidates
+// for the same originator in one tick) could both read CountActiveForOriginator
+// before either claimed, and both proceed past the cap. Denying the admission
+// lock — simulating another coordinator mid-decision for this originator —
+// must block the candidate before it ever reads the active count.
+func TestJobCoordinatorLaunchQueuedJobsDeniesClaimWhenAdmissionLockHeld(t *testing.T) {
+	jobs := &coordinatorFakeJobs{
+		queue:          []agent.JobRecord{coordinatorQueuedJob("job-b", "agent-b")},
+		deniedLockKeys: map[string]bool{admissionLockKey("origin-run"): true},
+	}
+	c := newCoordinatorTestHarness(jobs, &coordinatorFakeRuns{runs: map[string]*agent.RunInfo{}}, &coordinatorRecordingBus{}, nil)
+
+	c.launchQueuedJobs(context.Background())
+
+	if jobs.countActiveCalls != 0 {
+		t.Fatalf("CountActiveForOriginator called %d times, want 0 — admission gate must block before it's ever read", jobs.countActiveCalls)
+	}
+	if len(jobs.claimed) != 0 || len(jobs.dispatched) != 0 {
+		t.Fatalf("claimed=%v dispatched=%v, want none while another coordinator holds the admission lock", jobs.claimed, jobs.dispatched)
+	}
+	if len(jobs.releasedLockKeys) != 0 {
+		t.Fatalf("releasedLockKeys = %v, want none — a denied acquire must not attempt a release", jobs.releasedLockKeys)
+	}
 }
 
 func TestJobCoordinatorLaunchQueuedJobsCancelsDurablyCancelledOriginator(t *testing.T) {
-	jobs := &coordinatorFakeJobs{queue: []model.JobDocument{coordinatorQueuedJob("job-b", "agent-b")}}
+	jobs := &coordinatorFakeJobs{queue: []agent.JobRecord{coordinatorQueuedJob("job-b", "agent-b")}}
 	tasks := &coordinatorFakeTasks{cancelled: map[string]bool{"origin-run": true}}
 	c := newCoordinatorTestHarness(jobs, &coordinatorFakeRuns{runs: map[string]*agent.RunInfo{}}, &coordinatorRecordingBus{}, tasks)
 
@@ -66,7 +122,7 @@ func TestJobCoordinatorLaunchQueuedJobsCancelsDurablyCancelledOriginator(t *test
 }
 
 func TestJobCoordinatorExpireStaleRunningJobsSkipsWaitingRun(t *testing.T) {
-	jobs := &coordinatorFakeJobs{expiredJobs: []model.JobDocument{
+	jobs := &coordinatorFakeJobs{expiredJobs: []agent.JobRecord{
 		coordinatorRunningJob("job-waiting", "agent-b", "child-waiting"),
 		coordinatorRunningJob("job-stale", "agent-b", "child-stale"),
 	}}
@@ -87,7 +143,7 @@ func TestJobCoordinatorExpireStaleRunningJobsSkipsWaitingRun(t *testing.T) {
 }
 
 func TestJobCoordinatorLaunchCallbacksSerializesParentThread(t *testing.T) {
-	jobs := &coordinatorFakeJobs{callbacks: []model.JobDocument{
+	jobs := &coordinatorFakeJobs{callbacks: []agent.JobRecord{
 		coordinatorCallbackJob("job-callback-1", "first result"),
 		coordinatorCallbackJob("job-callback-2", "second result"),
 	}}
@@ -183,9 +239,9 @@ func newCoordinatorTestHarness(jobs *coordinatorFakeJobs, runs *coordinatorFakeR
 	})
 }
 
-func coordinatorQueuedJob(jobID, target string) model.JobDocument {
+func coordinatorQueuedJob(jobID, target string) agent.JobRecord {
 	now := time.Now()
-	return model.JobDocument{
+	return agent.JobRecord{
 		JobID:           jobID,
 		ParentRunID:     "parent-run",
 		OriginatorRunID: "origin-run",
@@ -198,42 +254,43 @@ func coordinatorQueuedJob(jobID, target string) model.JobDocument {
 		Task:            "task for " + jobID,
 		Mode:            agent.JobModeRequired,
 		DelegationChain: []string{"agent-a"},
-		Status:          string(model.JobStatusQueued),
-		CallbackStatus:  string(model.CallbackStatusNone),
+		Status:          string(agent.JobStatusQueued),
+		CallbackStatus:  string(agent.CallbackStatusNone),
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
 }
 
-func coordinatorRunningJob(jobID, target, childRunID string) model.JobDocument {
+func coordinatorRunningJob(jobID, target, childRunID string) agent.JobRecord {
 	doc := coordinatorQueuedJob(jobID, target)
-	doc.Status = string(model.JobStatusRunning)
+	doc.Status = string(agent.JobStatusRunning)
 	doc.ChildRunID = childRunID
 	doc.ChildThreadID = "sub-origin-run-" + target
 	return doc
 }
 
-func coordinatorCallbackJob(jobID, output string) model.JobDocument {
+func coordinatorCallbackJob(jobID, output string) agent.JobRecord {
 	doc := coordinatorQueuedJob(jobID, "agent-b")
 	doc.Mode = agent.JobModeBackground
-	doc.Status = string(model.JobStatusSucceeded)
+	doc.Status = string(agent.JobStatusSucceeded)
 	doc.Output = output
-	doc.CallbackStatus = string(model.CallbackStatusQueued)
+	doc.CallbackStatus = string(agent.CallbackStatusQueued)
 	doc.FinishedAt = time.Now()
 	return doc
 }
 
 type coordinatorFakeJobs struct {
-	queue            []model.JobDocument
+	queue            []agent.JobRecord
 	active           int64
 	runningTargets   map[string]bool
-	expiredJobs      []model.JobDocument
-	expiredCallbacks []model.JobDocument
+	expiredJobs      []agent.JobRecord
+	expiredCallbacks []agent.JobRecord
 	expiredBefore    time.Time
 	callbackBefore   time.Time
 	readyRuns        []string
-	callbacks        []model.JobDocument
+	callbacks        []agent.JobRecord
 	runningCallbacks map[string]bool
+	deniedLockKeys   map[string]bool
 
 	claimed           []string
 	dispatched        []string
@@ -242,21 +299,25 @@ type coordinatorFakeJobs struct {
 	callbackRunning   []string
 	callbackFailed    []string
 	callbackCancelled []string
+	acquiredLockKeys  []string
+	releasedLockKeys  []string
+	countActiveCalls  int
 }
 
-func (f *coordinatorFakeJobs) FindQueueCandidates(context.Context, int) ([]model.JobDocument, error) {
-	return append([]model.JobDocument(nil), f.queue...), nil
+func (f *coordinatorFakeJobs) FindQueueCandidates(context.Context, int) ([]agent.JobRecord, error) {
+	return append([]agent.JobRecord(nil), f.queue...), nil
 }
 func (f *coordinatorFakeJobs) CountActiveForOriginator(context.Context, string) (int64, error) {
+	f.countActiveCalls++
 	return f.active, nil
 }
-func (f *coordinatorFakeJobs) FindExpiredRunningJobs(_ context.Context, before time.Time, _ int) ([]model.JobDocument, error) {
+func (f *coordinatorFakeJobs) FindExpiredRunningJobs(_ context.Context, before time.Time, _ int) ([]agent.JobRecord, error) {
 	f.expiredBefore = before
-	return append([]model.JobDocument(nil), f.expiredJobs...), nil
+	return append([]agent.JobRecord(nil), f.expiredJobs...), nil
 }
-func (f *coordinatorFakeJobs) FindExpiredRunningCallbacks(_ context.Context, before time.Time, _ int) ([]model.JobDocument, error) {
+func (f *coordinatorFakeJobs) FindExpiredRunningCallbacks(_ context.Context, before time.Time, _ int) ([]agent.JobRecord, error) {
 	f.callbackBefore = before
-	return append([]model.JobDocument(nil), f.expiredCallbacks...), nil
+	return append([]agent.JobRecord(nil), f.expiredCallbacks...), nil
 }
 func (f *coordinatorFakeJobs) HasRunningTargetJob(_ context.Context, originatorRunID, targetAgentID, _ string) (bool, error) {
 	return f.runningTargets[originatorRunID+"\x00"+targetAgentID], nil
@@ -264,57 +325,68 @@ func (f *coordinatorFakeJobs) HasRunningTargetJob(_ context.Context, originatorR
 func (f *coordinatorFakeJobs) HasRunningCallback(_ context.Context, parentThreadID, _ string) (bool, error) {
 	return f.runningCallbacks[parentThreadID], nil
 }
-func (f *coordinatorFakeJobs) AcquireLock(context.Context, string, string, string, string, string, time.Duration) (bool, error) {
+func (f *coordinatorFakeJobs) AcquireLock(_ context.Context, _, lockKey, _, _, _ string, _ time.Duration) (bool, error) {
+	f.acquiredLockKeys = append(f.acquiredLockKeys, lockKey)
+	if f.deniedLockKeys[lockKey] {
+		return false, nil
+	}
 	return true, nil
 }
-func (f *coordinatorFakeJobs) ReleaseLock(context.Context, string, string) error { return nil }
-func (f *coordinatorFakeJobs) ClaimJobStarting(_ context.Context, jobID, _ string, _ time.Duration) (model.JobDocument, bool, error) {
+func (f *coordinatorFakeJobs) ReleaseLock(_ context.Context, lockKey, _, _ string) error {
+	f.releasedLockKeys = append(f.releasedLockKeys, lockKey)
+	return nil
+}
+func (f *coordinatorFakeJobs) ClaimJobStarting(_ context.Context, jobID, _ string, _ time.Duration) (agent.JobRecord, bool, error) {
 	for _, doc := range f.queue {
 		if doc.JobID == jobID {
 			f.claimed = append(f.claimed, jobID)
-			doc.Status = string(model.JobStatusStarting)
+			doc.Status = string(agent.JobStatusStarting)
 			return doc, true, nil
 		}
 	}
-	return model.JobDocument{}, false, nil
+	return agent.JobRecord{}, false, nil
 }
-func (f *coordinatorFakeJobs) MarkJobDispatched(_ context.Context, jobID, _, _ string) error {
+func (f *coordinatorFakeJobs) MarkJobDispatched(_ context.Context, jobID, _, _, _ string) (bool, error) {
 	f.dispatched = append(f.dispatched, jobID)
 	if doc, ok := f.findJob(jobID); ok {
 		f.runningTargets[doc.OriginatorRunID+"\x00"+doc.TargetAgentID] = true
 	}
-	return nil
+	return true, nil
 }
-func (f *coordinatorFakeJobs) MarkJobFailed(_ context.Context, jobID, _ string) error {
+func (f *coordinatorFakeJobs) MarkClaimedJobFailed(_ context.Context, jobID, _, _ string) (bool, error) {
 	f.failed = append(f.failed, jobID)
-	return nil
+	return true, nil
 }
-func (f *coordinatorFakeJobs) MarkJobCancelled(_ context.Context, jobID, _ string) error {
+func (f *coordinatorFakeJobs) MarkJobFailed(_ context.Context, jobID, _, _ string) (bool, error) {
+	f.failed = append(f.failed, jobID)
+	return true, nil
+}
+func (f *coordinatorFakeJobs) MarkJobCancelled(_ context.Context, jobID, _, _ string) (bool, error) {
 	f.cancelled = append(f.cancelled, jobID)
-	return nil
+	return true, nil
 }
 func (f *coordinatorFakeJobs) FindReadyWaitingRunIDs(context.Context, int) ([]string, error) {
 	return append([]string(nil), f.readyRuns...), nil
 }
-func (f *coordinatorFakeJobs) FindQueuedCallbacks(context.Context, int) ([]model.JobDocument, error) {
-	return append([]model.JobDocument(nil), f.callbacks...), nil
+func (f *coordinatorFakeJobs) FindQueuedCallbacks(context.Context, int) ([]agent.JobRecord, error) {
+	return append([]agent.JobRecord(nil), f.callbacks...), nil
 }
-func (f *coordinatorFakeJobs) MarkCallbackRunning(_ context.Context, jobID, _ string, _ string, _ time.Duration) error {
+func (f *coordinatorFakeJobs) MarkCallbackRunning(_ context.Context, jobID, _ string, _ string, _ time.Duration) (bool, error) {
 	f.callbackRunning = append(f.callbackRunning, jobID)
 	if doc, ok := f.findCallback(jobID); ok {
 		f.runningCallbacks[doc.ParentThreadID] = true
 	}
-	return nil
+	return true, nil
 }
-func (f *coordinatorFakeJobs) MarkCallbackFailed(_ context.Context, jobID, _ string) error {
+func (f *coordinatorFakeJobs) MarkCallbackFailed(_ context.Context, jobID, _, _ string) error {
 	f.callbackFailed = append(f.callbackFailed, jobID)
 	return nil
 }
-func (f *coordinatorFakeJobs) MarkCallbackCancelled(_ context.Context, jobID, _ string) error {
+func (f *coordinatorFakeJobs) MarkCallbackCancelled(_ context.Context, jobID, _, _ string) error {
 	f.callbackCancelled = append(f.callbackCancelled, jobID)
 	return nil
 }
-func (f *coordinatorFakeJobs) findJob(jobID string) (model.JobDocument, bool) {
+func (f *coordinatorFakeJobs) findJob(jobID string) (agent.JobRecord, bool) {
 	for _, doc := range f.queue {
 		if doc.JobID == jobID {
 			return doc, true
@@ -325,15 +397,15 @@ func (f *coordinatorFakeJobs) findJob(jobID string) (model.JobDocument, bool) {
 			return doc, true
 		}
 	}
-	return model.JobDocument{}, false
+	return agent.JobRecord{}, false
 }
-func (f *coordinatorFakeJobs) findCallback(jobID string) (model.JobDocument, bool) {
+func (f *coordinatorFakeJobs) findCallback(jobID string) (agent.JobRecord, bool) {
 	for _, doc := range f.callbacks {
 		if doc.JobID == jobID {
 			return doc, true
 		}
 	}
-	return model.JobDocument{}, false
+	return agent.JobRecord{}, false
 }
 
 type coordinatorFakeRuns struct {

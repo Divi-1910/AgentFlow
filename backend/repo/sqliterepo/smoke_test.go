@@ -79,13 +79,13 @@ func (f *delegationLLM) ChatCompletion(_ context.Context, req *llm.ChatRequest) 
 	}, nil
 }
 
-func testRuntime(t *testing.T, client llm.LLMClient, runRepo *sqliterepo.RunRepo) (*agent.AgentRuntime, *tools.ToolRegistry) {
+func testRuntime(t *testing.T, client llm.LLMClient, runRepo *sqliterepo.RunRepo, capabilities agent.ToolCapabilities) (*agent.AgentRuntime, *tools.ToolRegistry) {
 	t.Helper()
 	registry := llm.NewEmptyLLMRegistry()
 	registry.Register("fake", client)
 	toolRegistry := tools.NewEmptyRegistry()
 	builder := agent.NewContextBuilder(&agent.PlatformConfig{Body: "<platform>sqlite smoke</platform>"}, nil, nil, nil)
-	runtime := agent.NewAgentRuntime(registry, toolRegistry, builder, agent.ToolCapabilities{AsyncJobs: false}).WithCheckpointStore(runRepo)
+	runtime := agent.NewAgentRuntime(registry, toolRegistry, builder, capabilities).WithCheckpointStore(runRepo)
 	return runtime, toolRegistry
 }
 
@@ -111,7 +111,7 @@ func TestFileReopenResumeAndSynchronousDelegation(t *testing.T) {
 	}
 
 	blocked := &blockingLLM{entered: make(chan struct{}, 1)}
-	runtime1, _ := testRuntime(t, blocked, runs1)
+	runtime1, _ := testRuntime(t, blocked, runs1, agent.ToolCapabilities{AsyncJobs: false})
 	ag := &agent.Agent{ID: agentID, Provider: "fake", Model: "resume", SystemPrompt: "resume", MaxSteps: 3}
 	runCtx := agent.RunContext{
 		RunID: runID, ThreadID: threadID, Input: "persist me", Attempt: 1,
@@ -158,7 +158,7 @@ func TestFileReopenResumeAndSynchronousDelegation(t *testing.T) {
 	threads := sqliterepo.NewThreadRepo(db2)
 	messages := sqliterepo.NewMessageRepo(db2)
 	tasks := sqliterepo.NewTaskRepo(db2)
-	runtime2, toolRegistry := testRuntime(t, finalLLM{content: "resumed complete"}, runs)
+	runtime2, toolRegistry := testRuntime(t, finalLLM{content: "resumed complete"}, runs, agent.ToolCapabilities{AsyncJobs: false})
 	claimed, err := runs.TransitionStatusForUser(ctx, runID, userID, string(model.RunStatusInterrupted), string(model.RunStatusRunning))
 	if err != nil || !claimed {
 		t.Fatalf("owner CAS: claimed=%v err=%v", claimed, err)
@@ -204,7 +204,7 @@ func TestFileReopenResumeAndSynchronousDelegation(t *testing.T) {
 	}
 	worker := &agent.Agent{ID: "worker", Provider: "fake", Model: "worker", SystemPrompt: "work", MaxSteps: 2}
 	reader := &mapAgentReader{userID: userID, agents: map[string]*agent.Agent{supervisor.ID: supervisor, worker.ID: worker}}
-	delegationRuntime, delegationTools := testRuntime(t, &delegationLLM{}, runs)
+	delegationRuntime, delegationTools := testRuntime(t, &delegationLLM{}, runs, agent.ToolCapabilities{AsyncJobs: false})
 	theBus := bus.NewInProc()
 	defer theBus.Close()
 	rootCtx, stop := context.WithCancel(context.Background())

@@ -22,25 +22,6 @@ type runStatusUpdater interface {
 	UpdateStatus(ctx context.Context, runID, status, lastError string) error
 }
 
-type asyncJobStatusStore interface {
-	MarkJobSucceeded(ctx context.Context, jobID, output string) error
-	MarkJobFailed(ctx context.Context, jobID, errText string) error
-	MarkJobCancelled(ctx context.Context, jobID, errText string) error
-	MarkCallbackCompleted(ctx context.Context, jobID string) error
-	MarkCallbackFailed(ctx context.Context, jobID, errText string) error
-	MarkCallbackCancelled(ctx context.Context, jobID, errText string) error
-}
-
-type asyncJobLeaseStore interface {
-	RefreshJobLease(ctx context.Context, jobID, originatorRunID, targetAgentID, owner string, ttl time.Duration) error
-	RefreshCallbackLease(ctx context.Context, jobID, parentThreadID, owner string, ttl time.Duration) error
-}
-
-type durableCancelStore interface {
-	IsCancelled(ctx context.Context, originatorRunID string) (bool, error)
-	CancelTask(ctx context.Context, originatorRunID, reason string) error
-}
-
 type AgentPool struct {
 	agentID  string
 	bus      bus.MessageBus
@@ -48,8 +29,8 @@ type AgentPool struct {
 	runtime  Runtime
 	status   runStatusUpdater
 	messages MessageStore
-	jobs     asyncJobStatusStore
-	tasks    durableCancelStore
+	jobs     WorkerJobStore
+	tasks    DurableCancelStore
 	hub      *JobHub
 	sub      bus.Subscription
 	workers  int
@@ -67,8 +48,8 @@ func NewAgentPool(
 	runtime Runtime,
 	status runStatusUpdater,
 	messages MessageStore,
-	jobs asyncJobStatusStore,
-	tasks durableCancelStore,
+	jobs WorkerJobStore,
+	tasks DurableCancelStore,
 	hub *JobHub,
 	workers int,
 	cancels *CancelRegistry,
@@ -221,12 +202,20 @@ func (p *AgentPool) afterRun(payload DispatchPayload, prepared PreparedRun, res 
 			return
 		}
 		if runErr != nil {
+			var applied bool
+			var writeErr error
 			if errors.Is(runErr, context.Canceled) {
-				_ = p.jobs.MarkJobCancelled(context.Background(), jobID, runErr.Error())
+				applied, writeErr = p.jobs.MarkJobCancelled(context.Background(), jobID, payload.RunID, runErr.Error())
 			} else {
-				_ = p.jobs.MarkJobFailed(context.Background(), jobID, runErr.Error())
+				applied, writeErr = p.jobs.MarkJobFailed(context.Background(), jobID, payload.RunID, runErr.Error())
 			}
-			p.notifyJobTerminal(payload, jobID, false, runErr.Error())
+			// Only notify the parent if the fenced write actually applied —
+			// otherwise this worker is a zombie from a superseded dispatch
+			// attempt, and reporting job.completed/job.failed here would
+			// tell the parent about an outcome the durable store rejected.
+			if writeErr == nil && applied {
+				p.notifyJobTerminal(payload, jobID, false, runErr.Error())
+			}
 			return
 		}
 		if res != nil && res.Status == agent.RunResultWaiting {
@@ -236,8 +225,10 @@ func (p *AgentPool) afterRun(payload DispatchPayload, prepared PreparedRun, res 
 		if res != nil {
 			output = res.Output
 		}
-		_ = p.jobs.MarkJobSucceeded(context.Background(), jobID, output)
-		p.notifyJobTerminal(payload, jobID, true, "")
+		applied, writeErr := p.jobs.MarkJobSucceeded(context.Background(), jobID, payload.RunID, output)
+		if writeErr == nil && applied {
+			p.notifyJobTerminal(payload, jobID, true, "")
+		}
 		return
 	}
 
@@ -248,16 +239,16 @@ func (p *AgentPool) afterRun(payload DispatchPayload, prepared PreparedRun, res 
 		}
 		if runErr != nil {
 			if errors.Is(runErr, context.Canceled) {
-				_ = p.jobs.MarkCallbackCancelled(context.Background(), jobID, runErr.Error())
+				_ = p.jobs.MarkCallbackCancelled(context.Background(), jobID, payload.RunID, runErr.Error())
 			} else {
-				_ = p.jobs.MarkCallbackFailed(context.Background(), jobID, runErr.Error())
+				_ = p.jobs.MarkCallbackFailed(context.Background(), jobID, payload.RunID, runErr.Error())
 			}
 			return
 		}
 		if res != nil && res.Status == agent.RunResultWaiting {
 			return
 		}
-		_ = p.jobs.MarkCallbackCompleted(context.Background(), jobID)
+		_ = p.jobs.MarkCallbackCompleted(context.Background(), jobID, payload.RunID)
 		return
 	}
 
@@ -270,10 +261,6 @@ func (p *AgentPool) startLeaseHeartbeat(payload DispatchPayload) func() {
 	if p.jobs == nil || payload.JobID == "" {
 		return func() {}
 	}
-	leases, ok := p.jobs.(asyncJobLeaseStore)
-	if !ok {
-		return func() {}
-	}
 	kind := payload.InvocationKind
 	ttl := defaultJobLockLease
 	if kind == agent.InvocationCallback {
@@ -282,9 +269,9 @@ func (p *AgentPool) startLeaseHeartbeat(payload DispatchPayload) func() {
 	refresh := func(ctx context.Context, owner string) error {
 		switch kind {
 		case agent.InvocationAsyncJob:
-			return leases.RefreshJobLease(ctx, payload.JobID, payload.OriginatorRunID, payload.AgentID, owner, ttl)
+			return p.jobs.RefreshJobLease(ctx, payload.JobID, payload.RunID, payload.OriginatorRunID, payload.AgentID, owner, ttl)
 		case agent.InvocationCallback:
-			return leases.RefreshCallbackLease(ctx, payload.JobID, payload.ThreadID, owner, ttl)
+			return p.jobs.RefreshCallbackLease(ctx, payload.JobID, payload.RunID, payload.ThreadID, owner, ttl)
 		default:
 			return nil
 		}
@@ -388,10 +375,12 @@ func (p *AgentPool) markAsyncFailed(payload DispatchPayload, errText string) {
 	}
 	switch payload.InvocationKind {
 	case agent.InvocationAsyncJob:
-		_ = p.jobs.MarkJobFailed(context.Background(), payload.JobID, errText)
-		p.notifyJobTerminal(payload, payload.JobID, false, errText)
+		applied, err := p.jobs.MarkJobFailed(context.Background(), payload.JobID, payload.RunID, errText)
+		if err == nil && applied {
+			p.notifyJobTerminal(payload, payload.JobID, false, errText)
+		}
 	case agent.InvocationCallback:
-		_ = p.jobs.MarkCallbackFailed(context.Background(), payload.JobID, errText)
+		_ = p.jobs.MarkCallbackFailed(context.Background(), payload.JobID, payload.RunID, errText)
 	}
 }
 
@@ -401,10 +390,12 @@ func (p *AgentPool) markAsyncCanceled(payload DispatchPayload) {
 	}
 	switch payload.InvocationKind {
 	case agent.InvocationAsyncJob:
-		_ = p.jobs.MarkJobCancelled(context.Background(), payload.JobID, "cancelled before start")
-		p.notifyJobTerminal(payload, payload.JobID, false, "cancelled before start")
+		applied, err := p.jobs.MarkJobCancelled(context.Background(), payload.JobID, payload.RunID, "cancelled before start")
+		if err == nil && applied {
+			p.notifyJobTerminal(payload, payload.JobID, false, "cancelled before start")
+		}
 	case agent.InvocationCallback:
-		_ = p.jobs.MarkCallbackCancelled(context.Background(), payload.JobID, "cancelled before start")
+		_ = p.jobs.MarkCallbackCancelled(context.Background(), payload.JobID, payload.RunID, "cancelled before start")
 	}
 }
 

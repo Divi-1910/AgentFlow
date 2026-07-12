@@ -19,6 +19,53 @@ type RunRepo struct{ db *sql.DB }
 
 func NewRunRepo(db *sql.DB) *RunRepo { return &RunRepo{db: db} }
 
+type RecoveryResult struct {
+	Interrupted int64
+	Failed      int64
+}
+
+// RecoverOrphanedRuns is called once during cold start, before workers begin.
+// With no prior process still executing, every owned running row is orphaned:
+// checkpointed runs remain resumable, while checkpointless runs cannot resume.
+func (r *RunRepo) RecoverOrphanedRuns(ctx context.Context, userID string) (RecoveryResult, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return RecoveryResult{}, fmt.Errorf("run_repo: begin orphan recovery: %w", err)
+	}
+	defer tx.Rollback()
+	now := unixNano(time.Now())
+	interrupted, err := tx.ExecContext(ctx, `
+UPDATE runs
+SET status = ?, updated_at = ?
+WHERE user_id = ? AND status = ?
+  AND EXISTS (SELECT 1 FROM run_checkpoints c WHERE c.run_id = runs.run_id)`,
+		string(model.RunStatusInterrupted), now, userID, string(model.RunStatusRunning))
+	if err != nil {
+		return RecoveryResult{}, fmt.Errorf("run_repo: recover checkpointed runs: %w", err)
+	}
+	failed, err := tx.ExecContext(ctx, `
+UPDATE runs
+SET status = ?, last_error = ?, updated_at = ?
+WHERE user_id = ? AND status = ?
+  AND NOT EXISTS (SELECT 1 FROM run_checkpoints c WHERE c.run_id = runs.run_id)`,
+		string(model.RunStatusFailed), "runtime restarted before first checkpoint", now, userID, string(model.RunStatusRunning))
+	if err != nil {
+		return RecoveryResult{}, fmt.Errorf("run_repo: recover checkpointless runs: %w", err)
+	}
+	interruptedCount, err := interrupted.RowsAffected()
+	if err != nil {
+		return RecoveryResult{}, fmt.Errorf("run_repo: checkpointed recovery result: %w", err)
+	}
+	failedCount, err := failed.RowsAffected()
+	if err != nil {
+		return RecoveryResult{}, fmt.Errorf("run_repo: checkpointless recovery result: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return RecoveryResult{}, fmt.Errorf("run_repo: commit orphan recovery: %w", err)
+	}
+	return RecoveryResult{Interrupted: interruptedCount, Failed: failedCount}, nil
+}
+
 func (r *RunRepo) CreateRun(ctx context.Context, runID, threadID, agentID, userID string) error {
 	return r.createRun(ctx, runID, threadID, agentID, userID, runID, "", agent.InvocationTopLevel, "")
 }

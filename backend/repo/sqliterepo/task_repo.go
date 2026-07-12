@@ -112,6 +112,41 @@ RETURNING max_runs, runs_used`, now, originatorRunID).Scan(&maxRuns, &runsUsed);
 	return budgetStatus(originatorRunID, maxRuns, runsUsed), true, nil
 }
 
+// CancelTask idempotently marks an originator run cancelled, auto-creating
+// the budget ledger (owning DefaultMaxTaskRuns) if it doesn't exist yet —
+// matching EnsureTask's first-creation-owns-max_runs contract.
+func (r *TaskRepo) CancelTask(ctx context.Context, originatorRunID, reason string) error {
+	if originatorRunID == "" {
+		return nil
+	}
+	now := unixNano(time.Now())
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO tasks(originator_run_id, max_runs, runs_used, cancelled_at, cancel_reason, created_at, updated_at)
+VALUES(?, ?, 0, ?, ?, ?, ?)
+ON CONFLICT(originator_run_id) DO UPDATE SET
+    cancelled_at = excluded.cancelled_at, cancel_reason = excluded.cancel_reason, updated_at = excluded.updated_at`,
+		originatorRunID, agent.DefaultMaxTaskRuns, now, reason, now, now)
+	if err != nil {
+		return fmt.Errorf("task_repo: cancel task: %w", err)
+	}
+	return nil
+}
+
+func (r *TaskRepo) IsCancelled(ctx context.Context, originatorRunID string) (bool, error) {
+	if originatorRunID == "" {
+		return false, nil
+	}
+	var cancelledAt sql.NullInt64
+	err := r.db.QueryRowContext(ctx, `SELECT cancelled_at FROM tasks WHERE originator_run_id = ?`, originatorRunID).Scan(&cancelledAt)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("task_repo: is cancelled: %w", err)
+	}
+	return cancelledAt.Valid, nil
+}
+
 func budgetStatus(originatorRunID string, maxRuns, runsUsed int) agent.RunBudgetStatus {
 	maxRuns = normalizeMaxRuns(maxRuns)
 	return agent.RunBudgetStatus{

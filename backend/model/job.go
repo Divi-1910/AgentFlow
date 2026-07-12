@@ -6,33 +6,11 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
-type JobStatus string
-
-const (
-	JobStatusQueued    JobStatus = "queued"
-	JobStatusStarting  JobStatus = "starting"
-	JobStatusRunning   JobStatus = "running"
-	JobStatusSucceeded JobStatus = "succeeded"
-	JobStatusFailed    JobStatus = "failed"
-	JobStatusCancelled JobStatus = "cancelled"
-)
-
 type JobMode string
 
 const (
 	JobModeRequired   JobMode = "required"
 	JobModeBackground JobMode = "background"
-)
-
-type CallbackStatus string
-
-const (
-	CallbackStatusNone      CallbackStatus = "none"
-	CallbackStatusQueued    CallbackStatus = "queued"
-	CallbackStatusRunning   CallbackStatus = "running"
-	CallbackStatusCompleted CallbackStatus = "completed"
-	CallbackStatusFailed    CallbackStatus = "failed"
-	CallbackStatusCancelled CallbackStatus = "cancelled"
 )
 
 type JobDocument struct {
@@ -69,6 +47,7 @@ type JobDocument struct {
 
 	CallbackStatus string `bson:"callback_status" json:"callback_status"`
 	CallbackRunID  string `bson:"callback_run_id,omitempty" json:"callback_run_id,omitempty"`
+	CallbackError  string `bson:"callback_error,omitempty" json:"callback_error,omitempty"`
 
 	LeaseOwner     string     `bson:"lease_owner,omitempty"      json:"lease_owner,omitempty"`
 	LeaseExpiresAt *time.Time `bson:"lease_expires_at,omitempty" json:"lease_expires_at,omitempty"`

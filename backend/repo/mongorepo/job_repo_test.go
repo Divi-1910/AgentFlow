@@ -184,12 +184,12 @@ func TestJobRepoMarkDeliveredClearsAwaitReverseLink(t *testing.T) {
 	if err := r.MarkAwaiting(ctx, "parent-run", []agent.PendingAwait{await}); err != nil {
 		t.Fatalf("MarkAwaiting: %v", err)
 	}
-	if err := r.MarkJobSucceeded(ctx, dispatch.JobID, "done"); err != nil {
-		t.Fatalf("MarkJobSucceeded: %v", err)
+	if applied, err := r.MarkJobSucceeded(ctx, dispatch.JobID, "", "done"); err != nil || !applied {
+		t.Fatalf("MarkJobSucceeded: applied=%v err=%v", applied, err)
 	}
 	if err := r.MarkDelivered(ctx, "parent-run", "user-1", []agent.AwaitJobResult{{
 		JobID:        dispatch.JobID,
-		Status:       string(model.JobStatusSucceeded),
+		Status:       string(agent.JobStatusSucceeded),
 		Output:       "done",
 		CreatedAt:    await.CreatedAt,
 		DelegateTool: "ask_researcher",
@@ -235,8 +235,8 @@ func TestJobRepoFindExpiredRunningJobs(t *testing.T) {
 	if _, ok, err := r.ClaimJobStarting(ctx, dispatch.JobID, "coordinator-1", time.Minute); err != nil || !ok {
 		t.Fatalf("ClaimJobStarting ok=%v err=%v", ok, err)
 	}
-	if err := r.MarkJobDispatched(ctx, dispatch.JobID, "child-run", "child-thread"); err != nil {
-		t.Fatalf("MarkJobDispatched: %v", err)
+	if applied, err := r.MarkJobDispatched(ctx, dispatch.JobID, "coordinator-1", "child-run", "child-thread"); err != nil || !applied {
+		t.Fatalf("MarkJobDispatched: applied=%v err=%v", applied, err)
 	}
 	_, err := jobs.UpdateOne(ctx,
 		bson.M{"job_id": dispatch.JobID},
@@ -267,11 +267,11 @@ func TestJobRepoCountActiveForOriginatorCountsRunningAndUnexpiredStartingOnly(t 
 	ctx := context.Background()
 	now := time.Now()
 	docs := []any{
-		activeCountDoc("queued", "origin", string(model.JobStatusQueued), nil, now),
-		activeCountDoc("running", "origin", string(model.JobStatusRunning), nil, now),
-		activeCountDoc("starting-fresh", "origin", string(model.JobStatusStarting), ptrTime(now.Add(time.Minute)), now),
-		activeCountDoc("starting-expired", "origin", string(model.JobStatusStarting), ptrTime(now.Add(-time.Minute)), now),
-		activeCountDoc("other-origin", "other", string(model.JobStatusRunning), nil, now),
+		activeCountDoc("queued", "origin", string(agent.JobStatusQueued), nil, now),
+		activeCountDoc("running", "origin", string(agent.JobStatusRunning), nil, now),
+		activeCountDoc("starting-fresh", "origin", string(agent.JobStatusStarting), ptrTime(now.Add(time.Minute)), now),
+		activeCountDoc("starting-expired", "origin", string(agent.JobStatusStarting), ptrTime(now.Add(-time.Minute)), now),
+		activeCountDoc("other-origin", "other", string(agent.JobStatusRunning), nil, now),
 	}
 	if _, err := jobs.InsertMany(ctx, docs); err != nil {
 		t.Fatalf("InsertMany: %v", err)
@@ -343,6 +343,79 @@ func TestJobRepoAcquireLockConcurrentExpiredLockHasSingleWinner(t *testing.T) {
 	}
 	if len(got) != 1 {
 		t.Fatalf("winners = %v, want exactly one", got)
+	}
+}
+
+// TestJobRepoCallbackTerminalTransitionRequiresExpectedStatus directly
+// inspects callback_status because no port method exposes it: AwaitJob only
+// surfaces the job's own Status/Error, and the list methods
+// (FindQueuedCallbacks/FindExpiredRunningCallbacks) each require a specific
+// callback_status to match a row at all, so neither can observe a callback
+// that already reached a DIFFERENT terminal state. Mirrors the retention
+// stamp pattern from the SQLite backend: a fact the port doesn't expose gets
+// a backend-specific test.
+func TestJobRepoCallbackTerminalTransitionRequiresExpectedStatus(t *testing.T) {
+	r, jobs, _ := newJobRepo(t)
+	ctx := context.Background()
+
+	dispatchBackground := func(toolCallID string) agent.DispatchAgentResult {
+		t.Helper()
+		res, err := r.DispatchAgent(ctx, agent.DispatchAgentRequest{
+			ParentRunID: "parent-run", OriginatorRunID: "originator-run", ParentThreadID: "parent-thread",
+			ParentAgentID: "agent-a", UserID: "user-1", ToolCallID: toolCallID,
+			DelegateTool: "ask_researcher", TargetAgentID: "agent-b", Task: "research",
+			Mode: agent.JobModeBackground,
+		})
+		if err != nil {
+			t.Fatalf("DispatchAgent: %v", err)
+		}
+		return res
+	}
+	callbackStatus := func(jobID string) string {
+		t.Helper()
+		var doc model.JobDocument
+		if err := jobs.FindOne(ctx, bson.M{"job_id": jobID}).Decode(&doc); err != nil {
+			t.Fatalf("find job %s: %v", jobID, err)
+		}
+		return doc.CallbackStatus
+	}
+
+	// running -> terminal: a completed callback must not be flipped by a
+	// late write for the SAME callback run id.
+	running := dispatchBackground("dispatch-cb-running")
+	if _, ok, err := r.ClaimJobStarting(ctx, running.JobID, "owner-a", time.Minute); err != nil || !ok {
+		t.Fatalf("ClaimJobStarting: ok=%v err=%v", ok, err)
+	}
+	if applied, err := r.MarkJobDispatched(ctx, running.JobID, "owner-a", "child-run", "child-thread"); err != nil || !applied {
+		t.Fatalf("MarkJobDispatched: applied=%v err=%v", applied, err)
+	}
+	if applied, err := r.MarkJobSucceeded(ctx, running.JobID, "child-run", "output"); err != nil || !applied {
+		t.Fatalf("MarkJobSucceeded: applied=%v err=%v", applied, err)
+	}
+	if applied, err := r.MarkCallbackRunning(ctx, running.JobID, "callback-run-1", "owner-a", time.Minute); err != nil || !applied {
+		t.Fatalf("MarkCallbackRunning: applied=%v err=%v", applied, err)
+	}
+	if err := r.MarkCallbackCompleted(ctx, running.JobID, "callback-run-1"); err != nil {
+		t.Fatalf("MarkCallbackCompleted: %v", err)
+	}
+	if err := r.MarkCallbackFailed(ctx, running.JobID, "callback-run-1", "late failure"); err != nil {
+		t.Fatalf("late MarkCallbackFailed: %v", err)
+	}
+	if got := callbackStatus(running.JobID); got != string(agent.CallbackStatusCompleted) {
+		t.Fatalf("callback_status = %q, want %q (late failure must not overwrite completed)", got, agent.CallbackStatusCompleted)
+	}
+
+	// queued -> terminal: a cancelled-before-start callback must not be
+	// flipped by a late write ALSO using the empty run id.
+	queued := dispatchBackground("dispatch-cb-queued")
+	if err := r.MarkCallbackCancelled(ctx, queued.JobID, "", "originator cancelled"); err != nil {
+		t.Fatalf("MarkCallbackCancelled: %v", err)
+	}
+	if err := r.MarkCallbackFailed(ctx, queued.JobID, "", "late failure"); err != nil {
+		t.Fatalf("late MarkCallbackFailed (queued path): %v", err)
+	}
+	if got := callbackStatus(queued.JobID); got != string(agent.CallbackStatusCancelled) {
+		t.Fatalf("callback_status = %q, want %q (late failure must not overwrite cancelled)", got, agent.CallbackStatusCancelled)
 	}
 }
 

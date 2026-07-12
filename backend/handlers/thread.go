@@ -51,6 +51,18 @@ func toThreadResponse(t *agent.ThreadRecord) ThreadResponse {
 }
 
 func (h *ThreadHandler) Create(w http.ResponseWriter, r *http.Request) {
+	h.createForAgent(w, r, r.PathValue("id"))
+}
+
+// CreateForAgent binds thread creation to a frozen agent id. The standalone
+// runtime uses this for its root agent while Studio keeps the path-based API.
+func (h *ThreadHandler) CreateForAgent(agentID string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		h.createForAgent(w, r, agentID)
+	}
+}
+
+func (h *ThreadHandler) createForAgent(w http.ResponseWriter, r *http.Request, agentID string) {
 	userID, ok := getUserID(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
@@ -61,8 +73,6 @@ func (h *ThreadHandler) Create(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-
-	agentID := r.PathValue("id")
 
 	if _, err := h.agentRepo.GetByID(r.Context(), agentID, userID); err != nil {
 		if err.Error() == "agent not found" {

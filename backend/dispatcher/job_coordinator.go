@@ -15,77 +15,52 @@ import (
 )
 
 const (
-	defaultJobLease          = 30 * time.Second
-	defaultJobLockLease      = 30 * time.Second
-	defaultCallbackLockLease = 30 * time.Second
-	defaultCoordinatorTick   = time.Second
-	defaultConcurrentJobs    = 5
+	defaultJobLease           = 30 * time.Second
+	defaultJobLockLease       = 30 * time.Second
+	defaultCallbackLockLease  = 30 * time.Second
+	defaultAdmissionLockLease = 5 * time.Second
+	defaultCoordinatorTick    = time.Second
+	defaultConcurrentJobs     = 5
 )
-
-type coordinatorJobStore interface {
-	FindQueueCandidates(ctx context.Context, limit int) ([]model.JobDocument, error)
-	CountActiveForOriginator(ctx context.Context, originatorRunID string) (int64, error)
-	FindExpiredRunningJobs(ctx context.Context, before time.Time, limit int) ([]model.JobDocument, error)
-	FindExpiredRunningCallbacks(ctx context.Context, before time.Time, limit int) ([]model.JobDocument, error)
-	HasRunningTargetJob(ctx context.Context, originatorRunID, targetAgentID, excludeJobID string) (bool, error)
-	HasRunningCallback(ctx context.Context, parentThreadID, excludeJobID string) (bool, error)
-	AcquireLock(ctx context.Context, lockType, lockKey, activeJobID, activeRunID, owner string, ttl time.Duration) (bool, error)
-	ReleaseLock(ctx context.Context, lockKey, activeJobID string) error
-	ClaimJobStarting(ctx context.Context, jobID, owner string, lease time.Duration) (model.JobDocument, bool, error)
-	MarkJobDispatched(ctx context.Context, jobID, childRunID, childThreadID string) error
-	MarkJobFailed(ctx context.Context, jobID, errText string) error
-	MarkJobCancelled(ctx context.Context, jobID, errText string) error
-	FindReadyWaitingRunIDs(ctx context.Context, limit int) ([]string, error)
-	FindQueuedCallbacks(ctx context.Context, limit int) ([]model.JobDocument, error)
-	MarkCallbackRunning(ctx context.Context, jobID, callbackRunID, owner string, lease time.Duration) error
-	MarkCallbackFailed(ctx context.Context, jobID, errText string) error
-	MarkCallbackCancelled(ctx context.Context, jobID, errText string) error
-}
-
-type coordinatorRunStore interface {
-	CreateChildRunWithKind(ctx context.Context, runID, threadID, agentID, userID, originatorRunID, parentRunID, invocationKind, jobID string) error
-	UpdateStatus(ctx context.Context, runID, status, lastError string) error
-	TransitionStatus(ctx context.Context, runID string, from, to string) (bool, error)
-	IncrementAttempt(ctx context.Context, runID string) (int, error)
-	GetRun(ctx context.Context, runID string) (*agent.RunInfo, error)
-}
 
 type JobCoordinatorConfig struct {
 	Bus      bus.MessageBus
 	Pools    *PoolManager
 	Threads  ThreadStore
-	Runs     coordinatorRunStore
-	Jobs     coordinatorJobStore
-	Tasks    durableCancelStore
+	Runs     CoordinatorRunStore
+	Jobs     CoordinatorJobStore
+	Tasks    DurableCancelStore
 	Hub      *JobHub
 	WorkerID string
 	Logger   *slog.Logger
 
-	ConcurrentJobs    int
-	JobLease          time.Duration
-	JobLockLease      time.Duration
-	CallbackLockLease time.Duration
-	ReclaimGrace      time.Duration
-	Tick              time.Duration
+	ConcurrentJobs     int
+	JobLease           time.Duration
+	JobLockLease       time.Duration
+	CallbackLockLease  time.Duration
+	AdmissionLockLease time.Duration
+	ReclaimGrace       time.Duration
+	Tick               time.Duration
 }
 
 type JobCoordinator struct {
 	bus     bus.MessageBus
 	pools   *PoolManager
 	threads ThreadStore
-	runs    coordinatorRunStore
-	jobs    coordinatorJobStore
-	tasks   durableCancelStore
+	runs    CoordinatorRunStore
+	jobs    CoordinatorJobStore
+	tasks   DurableCancelStore
 	hub     *JobHub
 	owner   string
 	logger  *slog.Logger
 
-	concurrentJobs    int
-	jobLease          time.Duration
-	jobLockLease      time.Duration
-	callbackLockLease time.Duration
-	reclaimGrace      time.Duration
-	tick              time.Duration
+	concurrentJobs     int
+	jobLease           time.Duration
+	jobLockLease       time.Duration
+	callbackLockLease  time.Duration
+	admissionLockLease time.Duration
+	reclaimGrace       time.Duration
+	tick               time.Duration
 }
 
 func NewJobCoordinator(cfg JobCoordinatorConfig) *JobCoordinator {
@@ -113,6 +88,10 @@ func NewJobCoordinator(cfg JobCoordinatorConfig) *JobCoordinator {
 	if callbackLockLease <= 0 {
 		callbackLockLease = defaultCallbackLockLease
 	}
+	admissionLockLease := cfg.AdmissionLockLease
+	if admissionLockLease <= 0 {
+		admissionLockLease = defaultAdmissionLockLease
+	}
 	reclaimGrace := cfg.ReclaimGrace
 	if reclaimGrace <= 0 {
 		reclaimGrace = 2 * leaseRefreshInterval(jobLease)
@@ -122,21 +101,22 @@ func NewJobCoordinator(cfg JobCoordinatorConfig) *JobCoordinator {
 		tick = defaultCoordinatorTick
 	}
 	return &JobCoordinator{
-		bus:               cfg.Bus,
-		pools:             cfg.Pools,
-		threads:           cfg.Threads,
-		runs:              cfg.Runs,
-		jobs:              cfg.Jobs,
-		tasks:             cfg.Tasks,
-		hub:               cfg.Hub,
-		owner:             owner,
-		logger:            logger,
-		concurrentJobs:    concurrentJobs,
-		jobLease:          jobLease,
-		jobLockLease:      jobLockLease,
-		callbackLockLease: callbackLockLease,
-		reclaimGrace:      reclaimGrace,
-		tick:              tick,
+		bus:                cfg.Bus,
+		pools:              cfg.Pools,
+		threads:            cfg.Threads,
+		runs:               cfg.Runs,
+		jobs:               cfg.Jobs,
+		tasks:              cfg.Tasks,
+		hub:                cfg.Hub,
+		owner:              owner,
+		logger:             logger,
+		concurrentJobs:     concurrentJobs,
+		jobLease:           jobLease,
+		jobLockLease:       jobLockLease,
+		callbackLockLease:  callbackLockLease,
+		admissionLockLease: admissionLockLease,
+		reclaimGrace:       reclaimGrace,
+		tick:               tick,
 	}
 }
 
@@ -191,7 +171,7 @@ func (c *JobCoordinator) expireStaleRunningJobs(ctx context.Context) {
 		if c.runIsWaiting(ctx, doc.ChildRunID) {
 			continue
 		}
-		c.failJob(doc, fmt.Errorf("job lease expired"))
+		c.failJob(doc, doc.ChildRunID, fmt.Errorf("job lease expired"))
 	}
 }
 
@@ -208,7 +188,7 @@ func (c *JobCoordinator) expireStaleRunningCallbacks(ctx context.Context) {
 		if c.runIsWaiting(ctx, doc.CallbackRunID) {
 			continue
 		}
-		_ = c.jobs.MarkCallbackFailed(context.Background(), doc.JobID, "callback lease expired")
+		_ = c.jobs.MarkCallbackFailed(context.Background(), doc.JobID, doc.CallbackRunID, "callback lease expired")
 	}
 }
 
@@ -231,65 +211,111 @@ func (c *JobCoordinator) launchQueuedJobs(ctx context.Context) {
 			return
 		}
 		if c.isCancelled(ctx, doc.OriginatorRunID) {
-			_ = c.jobs.MarkJobCancelled(context.Background(), doc.JobID, "originator cancelled")
+			_, _ = c.jobs.MarkJobCancelled(context.Background(), doc.JobID, doc.ChildRunID, "originator cancelled")
 			continue
 		}
-		active, err := c.jobs.CountActiveForOriginator(ctx, doc.OriginatorRunID)
-		if err != nil {
-			c.logger.Warn("job coordinator: count active", "job_id", doc.JobID, "error", err)
-			continue
-		}
-		if active >= int64(c.concurrentJobs) {
-			continue
-		}
-		runningSameTarget, err := c.jobs.HasRunningTargetJob(ctx, doc.OriginatorRunID, doc.TargetAgentID, doc.JobID)
-		if err != nil {
-			c.logger.Warn("job coordinator: check target running job", "job_id", doc.JobID, "error", err)
-			continue
-		}
-		if runningSameTarget {
-			continue
-		}
-		lockKey := targetLockKey(doc.OriginatorRunID, doc.TargetAgentID)
-		acquired, err := c.jobs.AcquireLock(ctx, "target", lockKey, doc.JobID, doc.ChildRunID, c.owner, c.jobLockLease)
-		if err != nil {
-			c.logger.Warn("job coordinator: acquire target lock", "job_id", doc.JobID, "error", err)
-			continue
-		}
-		if !acquired {
-			continue
-		}
-		claimed, ok, err := c.jobs.ClaimJobStarting(ctx, doc.JobID, c.owner, c.jobLease)
-		if err != nil {
-			c.logger.Warn("job coordinator: claim job", "job_id", doc.JobID, "error", err)
-			_ = c.jobs.ReleaseLock(context.Background(), lockKey, doc.JobID)
-			continue
-		}
-		if !ok {
-			_ = c.jobs.ReleaseLock(context.Background(), lockKey, doc.JobID)
-			continue
-		}
-		c.dispatchJob(ctx, claimed)
+		c.tryLaunchQueuedJob(ctx, doc)
 	}
 }
 
-func (c *JobCoordinator) dispatchJob(ctx context.Context, doc model.JobDocument) {
-	subThreadID, err := c.threads.FindOrCreateSubThread(ctx, doc.UserID, doc.OriginatorRunID, doc.TargetAgentID)
+// tryLaunchQueuedJob serializes the count-then-claim admission decision
+// behind a per-originator lock: without it, two coordinators (or two
+// candidates for the same originator, different targets, in the same tick)
+// could both observe room under concurrentJobs via CountActiveForOriginator
+// and both proceed to claim, exceeding the cap. Only matters across multiple
+// coordinator instances (e.g. multi-replica Studio) — a single coordinator's
+// own loop is already sequential.
+//
+// The admission lock is released as soon as the claim resolves, not held
+// through dispatchJob: once ClaimJobStarting succeeds, the job is durably
+// "starting" and already reflected in the next CountActiveForOriginator, so
+// holding the lock any longer would only serialize dispatch of unrelated
+// targets for the same originator without protecting anything further.
+func (c *JobCoordinator) tryLaunchQueuedJob(ctx context.Context, doc agent.JobRecord) {
+	admissionKey := admissionLockKey(doc.OriginatorRunID)
+	admitted, err := c.jobs.AcquireLock(ctx, "admission", admissionKey, doc.JobID, doc.ChildRunID, c.owner, c.admissionLockLease)
 	if err != nil {
-		c.failJob(doc, fmt.Errorf("resolve sub-thread: %w", err))
+		c.logger.Warn("job coordinator: acquire admission lock", "job_id", doc.JobID, "error", err)
 		return
 	}
+	if !admitted {
+		return
+	}
+	releaseAdmission := func() {
+		_ = c.jobs.ReleaseLock(context.Background(), admissionKey, doc.JobID, c.owner)
+	}
+
+	active, err := c.jobs.CountActiveForOriginator(ctx, doc.OriginatorRunID)
+	if err != nil {
+		c.logger.Warn("job coordinator: count active", "job_id", doc.JobID, "error", err)
+		releaseAdmission()
+		return
+	}
+	if active >= int64(c.concurrentJobs) {
+		releaseAdmission()
+		return
+	}
+	runningSameTarget, err := c.jobs.HasRunningTargetJob(ctx, doc.OriginatorRunID, doc.TargetAgentID, doc.JobID)
+	if err != nil {
+		c.logger.Warn("job coordinator: check target running job", "job_id", doc.JobID, "error", err)
+		releaseAdmission()
+		return
+	}
+	if runningSameTarget {
+		releaseAdmission()
+		return
+	}
+	lockKey := targetLockKey(doc.OriginatorRunID, doc.TargetAgentID)
+	acquired, err := c.jobs.AcquireLock(ctx, "target", lockKey, doc.JobID, doc.ChildRunID, c.owner, c.jobLockLease)
+	if err != nil {
+		c.logger.Warn("job coordinator: acquire target lock", "job_id", doc.JobID, "error", err)
+		releaseAdmission()
+		return
+	}
+	if !acquired {
+		releaseAdmission()
+		return
+	}
+	claimed, ok, err := c.jobs.ClaimJobStarting(ctx, doc.JobID, c.owner, c.jobLease)
+	if err != nil {
+		c.logger.Warn("job coordinator: claim job", "job_id", doc.JobID, "error", err)
+		_ = c.jobs.ReleaseLock(context.Background(), lockKey, doc.JobID, c.owner)
+		releaseAdmission()
+		return
+	}
+	if !ok {
+		_ = c.jobs.ReleaseLock(context.Background(), lockKey, doc.JobID, c.owner)
+		releaseAdmission()
+		return
+	}
+	releaseAdmission()
+	c.dispatchJob(ctx, claimed)
+}
+
+// dispatchJob's failure handling is split by whether MarkJobDispatched has
+// succeeded yet. Before it has, child_run_id is not persisted, so failures
+// (resolve sub-thread, create child run, ensure pool, marshal, or
+// MarkJobDispatched itself erroring) go through failClaimedJob, which fences
+// on the claim owner instead. Only the failure AFTER MarkJobDispatched
+// succeeds (bus.Publish) uses failJob's child-run fencing, because that's
+// the first point child_run_id is actually set.
+func (c *JobCoordinator) dispatchJob(ctx context.Context, doc agent.JobRecord) {
 	childRunID := doc.ChildRunID
 	if childRunID == "" {
 		childRunID = uuid.NewString()
 	}
+	subThreadID, err := c.threads.FindOrCreateSubThread(ctx, doc.UserID, doc.OriginatorRunID, doc.TargetAgentID)
+	if err != nil {
+		c.failClaimedJob(doc, fmt.Errorf("resolve sub-thread: %w", err))
+		return
+	}
 	if err := c.runs.CreateChildRunWithKind(ctx, childRunID, subThreadID, doc.TargetAgentID, doc.UserID, doc.OriginatorRunID, doc.ParentRunID, agent.InvocationAsyncJob, doc.JobID); err != nil {
-		c.failJob(doc, fmt.Errorf("create child run: %w", err))
+		c.failClaimedJob(doc, fmt.Errorf("create child run: %w", err))
 		return
 	}
 	if err := c.pools.Ensure(ctx, doc.TargetAgentID); err != nil {
 		_ = c.runs.UpdateStatus(context.Background(), childRunID, string(model.RunStatusFailed), err.Error())
-		c.failJob(doc, err)
+		c.failClaimedJob(doc, err)
 		return
 	}
 	chain := append([]string(nil), doc.DelegationChain...)
@@ -314,18 +340,29 @@ func (c *JobCoordinator) dispatchJob(ctx context.Context, doc model.JobDocument)
 	body, err := json.Marshal(payload)
 	if err != nil {
 		_ = c.runs.UpdateStatus(context.Background(), childRunID, string(model.RunStatusFailed), err.Error())
-		c.failJob(doc, err)
+		c.failClaimedJob(doc, err)
 		return
 	}
-	if err := c.jobs.MarkJobDispatched(ctx, doc.JobID, childRunID, subThreadID); err != nil {
+	applied, err := c.jobs.MarkJobDispatched(ctx, doc.JobID, c.owner, childRunID, subThreadID)
+	if err != nil {
 		_ = c.runs.UpdateStatus(context.Background(), childRunID, string(model.RunStatusFailed), err.Error())
-		c.failJob(doc, err)
+		c.failClaimedJob(doc, err)
+		return
+	}
+	if !applied {
+		// Lost the claim before dispatching — the lease expired and was
+		// reclaimed by another coordinator, or a racing attempt already
+		// dispatched it. The child run just created here has no legitimate
+		// owner: mark it failed rather than publish a stale dispatch that
+		// nobody durable is tracking (the job record belongs to whoever
+		// actually holds the claim now).
+		_ = c.runs.UpdateStatus(context.Background(), childRunID, string(model.RunStatusFailed), "lost job claim before dispatch")
 		return
 	}
 	c.publishParentJobEvent(doc.ParentRunID, agent.EventJobStarted, doc, nil)
 	if err := c.bus.Publish(ctx, dispatchTopic(doc.TargetAgentID), bus.Message{Body: body}); err != nil {
 		_ = c.runs.UpdateStatus(context.Background(), childRunID, string(model.RunStatusFailed), err.Error())
-		c.failJob(doc, err)
+		c.failJob(doc, childRunID, err)
 		return
 	}
 }
@@ -397,7 +434,7 @@ func (c *JobCoordinator) launchCallbacks(ctx context.Context) {
 			return
 		}
 		if c.isCancelled(ctx, doc.OriginatorRunID) {
-			_ = c.jobs.MarkCallbackCancelled(context.Background(), doc.JobID, "originator cancelled")
+			_ = c.jobs.MarkCallbackCancelled(context.Background(), doc.JobID, doc.CallbackRunID, "originator cancelled")
 			continue
 		}
 		runningSameThread, err := c.jobs.HasRunningCallback(ctx, doc.ParentThreadID, doc.JobID)
@@ -418,17 +455,23 @@ func (c *JobCoordinator) launchCallbacks(ctx context.Context) {
 		if !acquired {
 			continue
 		}
-		if err := c.jobs.MarkCallbackRunning(ctx, doc.JobID, callbackRunID, c.owner, c.callbackLockLease); err != nil {
-			_ = c.jobs.ReleaseLock(context.Background(), lockKey, doc.JobID)
+		applied, err := c.jobs.MarkCallbackRunning(ctx, doc.JobID, callbackRunID, c.owner, c.callbackLockLease)
+		if err != nil {
+			c.logger.Warn("job coordinator: mark callback running", "job_id", doc.JobID, "error", err)
+			_ = c.jobs.ReleaseLock(context.Background(), lockKey, doc.JobID, c.owner)
+			continue
+		}
+		if !applied {
+			_ = c.jobs.ReleaseLock(context.Background(), lockKey, doc.JobID, c.owner)
 			continue
 		}
 		if err := c.runs.CreateChildRunWithKind(ctx, callbackRunID, doc.ParentThreadID, doc.ParentAgentID, doc.UserID, doc.OriginatorRunID, doc.ParentRunID, agent.InvocationCallback, doc.JobID); err != nil {
-			_ = c.jobs.MarkCallbackFailed(context.Background(), doc.JobID, err.Error())
+			_ = c.jobs.MarkCallbackFailed(context.Background(), doc.JobID, callbackRunID, err.Error())
 			continue
 		}
 		if err := c.pools.Ensure(ctx, doc.ParentAgentID); err != nil {
 			_ = c.runs.UpdateStatus(context.Background(), callbackRunID, string(model.RunStatusFailed), err.Error())
-			_ = c.jobs.MarkCallbackFailed(context.Background(), doc.JobID, err.Error())
+			_ = c.jobs.MarkCallbackFailed(context.Background(), doc.JobID, callbackRunID, err.Error())
 			continue
 		}
 		payload := DispatchPayload{
@@ -446,27 +489,51 @@ func (c *JobCoordinator) launchCallbacks(ctx context.Context) {
 		body, err := json.Marshal(payload)
 		if err != nil {
 			_ = c.runs.UpdateStatus(context.Background(), callbackRunID, string(model.RunStatusFailed), err.Error())
-			_ = c.jobs.MarkCallbackFailed(context.Background(), doc.JobID, err.Error())
+			_ = c.jobs.MarkCallbackFailed(context.Background(), doc.JobID, callbackRunID, err.Error())
 			continue
 		}
 		if err := c.bus.Publish(ctx, dispatchTopic(doc.ParentAgentID), bus.Message{Body: body}); err != nil {
 			_ = c.runs.UpdateStatus(context.Background(), callbackRunID, string(model.RunStatusFailed), err.Error())
-			_ = c.jobs.MarkCallbackFailed(context.Background(), doc.JobID, err.Error())
+			_ = c.jobs.MarkCallbackFailed(context.Background(), doc.JobID, callbackRunID, err.Error())
 			continue
 		}
 	}
 }
 
-func (c *JobCoordinator) failJob(doc model.JobDocument, err error) {
+// failJob fences the terminal write on childRunID — use only after
+// MarkJobDispatched has succeeded for this job (child_run_id is persisted).
+// Notifies only if the write actually applied: a no-op fenced write means
+// some other attempt already owns this job's outcome, which must not be
+// clobbered or double-reported.
+func (c *JobCoordinator) failJob(doc agent.JobRecord, childRunID string, err error) {
 	errText := err.Error()
-	_ = c.jobs.MarkJobFailed(context.Background(), doc.JobID, errText)
+	applied, writeErr := c.jobs.MarkJobFailed(context.Background(), doc.JobID, childRunID, errText)
+	if writeErr != nil || !applied {
+		return
+	}
 	if c.hub != nil {
 		c.hub.Notify(doc.JobID)
 	}
 	c.publishParentJobEvent(doc.ParentRunID, agent.EventJobFailed, doc, &agent.ErrMeta{Code: "job.failed", Message: errText})
 }
 
-func (c *JobCoordinator) publishParentJobEvent(parentRunID string, typ agent.EventType, doc model.JobDocument, errMeta *agent.ErrMeta) {
+// failClaimedJob fences on the coordinator's claim owner — use for any
+// dispatchJob failure BEFORE MarkJobDispatched has succeeded, when
+// child_run_id is still unset in the store and childRunID-fencing could
+// never match.
+func (c *JobCoordinator) failClaimedJob(doc agent.JobRecord, err error) {
+	errText := err.Error()
+	applied, writeErr := c.jobs.MarkClaimedJobFailed(context.Background(), doc.JobID, c.owner, errText)
+	if writeErr != nil || !applied {
+		return
+	}
+	if c.hub != nil {
+		c.hub.Notify(doc.JobID)
+	}
+	c.publishParentJobEvent(doc.ParentRunID, agent.EventJobFailed, doc, &agent.ErrMeta{Code: "job.failed", Message: errText})
+}
+
+func (c *JobCoordinator) publishParentJobEvent(parentRunID string, typ agent.EventType, doc agent.JobRecord, errMeta *agent.ErrMeta) {
 	if c.bus == nil || parentRunID == "" {
 		return
 	}
@@ -496,16 +563,20 @@ func targetLockKey(originatorRunID, targetAgentID string) string {
 	return "target:" + originatorRunID + ":" + targetAgentID
 }
 
+func admissionLockKey(originatorRunID string) string {
+	return "admission:" + originatorRunID
+}
+
 func callbackLockKey(threadID string) string {
 	return "callback_thread:" + threadID
 }
 
-func callbackSystemContext(doc model.JobDocument) string {
+func callbackSystemContext(doc agent.JobRecord) string {
 	instruction := doc.CallbackInstruction
 	if instruction == "" {
 		instruction = agent.DefaultCallbackInstruction
 	}
-	if doc.Status == string(model.JobStatusSucceeded) {
+	if doc.Status == string(agent.JobStatusSucceeded) {
 		return fmt.Sprintf("A background task you started earlier has finished.\n\njob_id: %s\ndelegate_tool: %s\nstatus: succeeded\ninstruction: %s\n\nresult:\n%s\n\nShare this result with the user, continuing the earlier conversation.",
 			doc.JobID, doc.DelegateTool, instruction, doc.Output)
 	}
