@@ -146,7 +146,7 @@ func main() {
 
 	agentRepo := mongorepo.NewAgentRepo(agentsCol, llmRegistryCol)
 	deploymentRevisionRepo := mongorepo.NewDeploymentRevisionRepo(deploymentRevisionsCol)
-	deploymentStateRepo := mongorepo.NewDeploymentStateRepo(deploymentStatesCol, deploymentRevisionsCol)
+	deploymentStateRepo := mongorepo.NewDeploymentStateRepo(deploymentStatesCol)
 	threadRepo := mongorepo.NewThreadRepo(threadsCol)
 	messageRepo := mongorepo.NewMessageRepo(messagesCol)
 	runRepo := mongorepo.NewRunRepo(runsCol, checkpointsCol)

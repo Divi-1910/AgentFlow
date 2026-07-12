@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-var ErrDeployStateNotFound = errors.New("deployment state not found")
+var (
+	ErrDeployStateNotFound = errors.New("deployment state not found")
+	ErrDeployStateConflict = errors.New("deployment state does not match published revision")
+)
 
 var nonDNSLabelCharRE = regexp.MustCompile(`[^a-z0-9]+`)
 

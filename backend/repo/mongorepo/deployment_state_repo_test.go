@@ -24,34 +24,38 @@ func TestDeploymentStatePointsToOwnedPublishedRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	states := mongorepo.NewDeploymentStateRepo(col(t, "deployment_states"), revisionsCol)
+	states := mongorepo.NewDeploymentStateRepo(col(t, "deployment_states"))
 	if err := states.EnsureIndexes(ctx); err != nil {
 		t.Fatal(err)
 	}
+	service, err := deployment.NewService(states, revisions)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	selected, err := states.PointToRevision(ctx, userA, first.DeploymentID, first.Revision)
-	if err != nil || selected.Revision != 1 || selected.ConfigHash != first.ConfigHash {
+	selected, err := service.SelectRevision(ctx, userA, first.DeploymentID, first.Revision)
+	if err != nil || selected.State.Revision != 1 || selected.State.ConfigHash != first.ConfigHash {
 		t.Fatalf("first selection = %+v err=%v", selected, err)
 	}
-	updated, err := states.PointToRevision(ctx, userA, second.DeploymentID, second.Revision)
-	if err != nil || updated.Revision != 2 || updated.CreatedAt != selected.CreatedAt || updated.UpdatedAt.Before(selected.UpdatedAt) {
+	updated, err := service.SelectRevision(ctx, userA, second.DeploymentID, second.Revision)
+	if err != nil || updated.State.Revision != 2 || updated.State.CreatedAt != selected.State.CreatedAt || updated.State.UpdatedAt.Before(selected.State.UpdatedAt) {
 		t.Fatalf("updated selection = %+v err=%v", updated, err)
 	}
 	wantName, _ := deployment.ResourceName(second.DeploymentID, second.Revision, second.ConfigHash)
-	if updated.ResourceName != wantName {
-		t.Fatalf("resource name = %q, want %q", updated.ResourceName, wantName)
+	if updated.State.ResourceName != wantName {
+		t.Fatalf("resource name = %q, want %q", updated.State.ResourceName, wantName)
 	}
-	loaded, err := states.Get(ctx, userA, second.DeploymentID)
-	if err != nil || loaded.Revision != 2 {
+	loaded, err := service.GetSelectedRevision(ctx, userA, second.DeploymentID)
+	if err != nil || loaded.State.Revision != 2 || loaded.Revision.ConfigHash != second.ConfigHash {
 		t.Fatalf("Get = %+v err=%v", loaded, err)
 	}
 	if _, err := states.Get(ctx, userB, second.DeploymentID); !errors.Is(err, deployment.ErrDeployStateNotFound) {
 		t.Fatalf("cross-owner Get = %v", err)
 	}
-	if _, err := states.PointToRevision(ctx, userB, second.DeploymentID, second.Revision); !errors.Is(err, deployment.ErrRevisionNotFound) {
-		t.Fatalf("cross-owner PointToRevision = %v", err)
+	if _, err := service.SelectRevision(ctx, userB, second.DeploymentID, second.Revision); !errors.Is(err, deployment.ErrRevisionNotFound) {
+		t.Fatalf("cross-owner SelectRevision = %v", err)
 	}
-	if _, err := states.PointToRevision(ctx, userA, second.DeploymentID, 99); !errors.Is(err, deployment.ErrRevisionNotFound) {
-		t.Fatalf("missing PointToRevision = %v", err)
+	if _, err := service.SelectRevision(ctx, userA, second.DeploymentID, 99); !errors.Is(err, deployment.ErrRevisionNotFound) {
+		t.Fatalf("missing SelectRevision = %v", err)
 	}
 }

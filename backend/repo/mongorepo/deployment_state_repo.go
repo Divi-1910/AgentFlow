@@ -13,12 +13,11 @@ import (
 )
 
 type DeploymentStateRepo struct {
-	states    *mongo.Collection
-	revisions *mongo.Collection
+	states *mongo.Collection
 }
 
-func NewDeploymentStateRepo(states, revisions *mongo.Collection) *DeploymentStateRepo {
-	return &DeploymentStateRepo{states: states, revisions: revisions}
+func NewDeploymentStateRepo(states *mongo.Collection) *DeploymentStateRepo {
+	return &DeploymentStateRepo{states: states}
 }
 
 type deploymentStateBSON struct {
@@ -43,39 +42,23 @@ func (r *DeploymentStateRepo) EnsureIndexes(ctx context.Context) error {
 	return nil
 }
 
-// PointToRevision selects an existing immutable publication. Revisions never
-// mutate, so validating the owner/hash before this upsert cannot race with a
-// later artifact change.
-func (r *DeploymentStateRepo) PointToRevision(ctx context.Context, userID, deploymentID string, revision int) (*deployment.DeployState, error) {
-	uid, err := bson.ObjectIDFromHex(userID)
+func (r *DeploymentStateRepo) Select(ctx context.Context, input deployment.DeployStateInput) (*deployment.DeployState, error) {
+	uid, err := bson.ObjectIDFromHex(input.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("deployment_state_repo: invalid user_id: %w", err)
 	}
-	if deploymentID == "" || revision <= 0 {
-		return nil, deployment.ErrRevisionNotFound
-	}
-	var published deploymentRevisionBSON
-	err = r.revisions.FindOne(ctx, bson.D{
-		{Key: "user_id", Value: uid}, {Key: "deployment_id", Value: deploymentID}, {Key: "revision", Value: revision},
-	}, options.FindOne().SetProjection(bson.D{{Key: "config_hash", Value: 1}})).Decode(&published)
-	if err == mongo.ErrNoDocuments {
-		return nil, deployment.ErrRevisionNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("deployment_state_repo: find revision: %w", err)
-	}
-	resourceName, err := deployment.ResourceName(deploymentID, revision, published.ConfigHash)
-	if err != nil {
-		return nil, err
+	wantName, err := deployment.ResourceName(input.DeploymentID, input.Revision, input.ConfigHash)
+	if err != nil || input.ResourceName != wantName {
+		return nil, deployment.ErrDeployStateConflict
 	}
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	filter := bson.D{{Key: "user_id", Value: uid}, {Key: "deployment_id", Value: deploymentID}}
+	filter := bson.D{{Key: "user_id", Value: uid}, {Key: "deployment_id", Value: input.DeploymentID}}
 	update := bson.D{
 		{Key: "$set", Value: bson.D{
-			{Key: "revision", Value: revision}, {Key: "config_hash", Value: published.ConfigHash},
-			{Key: "resource_name", Value: resourceName}, {Key: "updated_at", Value: now},
+			{Key: "revision", Value: input.Revision}, {Key: "config_hash", Value: input.ConfigHash},
+			{Key: "resource_name", Value: input.ResourceName}, {Key: "updated_at", Value: now},
 		}},
-		{Key: "$setOnInsert", Value: bson.D{{Key: "_id", Value: bson.NewObjectID()}, {Key: "user_id", Value: uid}, {Key: "deployment_id", Value: deploymentID}, {Key: "created_at", Value: now}}},
+		{Key: "$setOnInsert", Value: bson.D{{Key: "_id", Value: bson.NewObjectID()}, {Key: "user_id", Value: uid}, {Key: "deployment_id", Value: input.DeploymentID}, {Key: "created_at", Value: now}}},
 	}
 	var raw deploymentStateBSON
 	err = r.states.FindOneAndUpdate(ctx, filter, update, options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)).Decode(&raw)
