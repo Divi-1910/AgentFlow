@@ -1,6 +1,7 @@
 package deployment
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,7 +16,10 @@ import (
 	"backend/tools"
 )
 
-const SchemaVersion = 1
+const (
+	SchemaVersion  = 1
+	MaxBundleBytes = 12 << 20
+)
 
 var (
 	providerNameRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
@@ -74,8 +78,12 @@ func Read(path string) (*Bundle, error) {
 	}
 	defer f.Close()
 
+	return decodeBundle(f)
+}
+
+func decodeBundle(r io.Reader) (*Bundle, error) {
 	var b Bundle
-	dec := json.NewDecoder(f)
+	dec := json.NewDecoder(r)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&b); err != nil {
 		return nil, fmt.Errorf("deployment: decode bundle: %w", err)
@@ -96,6 +104,17 @@ func Read(path string) (*Bundle, error) {
 
 func Load(path string) (*Bundle, error) {
 	b, err := Read(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := b.VerifyHash(); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+func Parse(data []byte) (*Bundle, error) {
+	b, err := decodeBundle(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
@@ -347,6 +366,81 @@ func (b *Bundle) ValidateRuntime(registry *tools.ToolRegistry, providers *llm.LL
 		}
 	}
 	return nil
+}
+
+func (b *Bundle) ValidateForPublication(registry *tools.ToolRegistry, capabilities agent.ToolCapabilities) error {
+	if err := b.ValidateStatic(); err != nil {
+		return err
+	}
+	for _, cfg := range b.Agents {
+		if !llm.IsSupportedProvider(cfg.Provider) {
+			return fmt.Errorf("deployment: agent %q uses unsupported provider %q", cfg.ID, cfg.Provider)
+		}
+		for _, server := range cfg.MCPServers {
+			if err := tools.ValidateMCPServerURLSyntax(server.URL); err != nil {
+				return fmt.Errorf("deployment: agent %q MCP server %q: %w", cfg.ID, server.Alias, err)
+			}
+		}
+		if _, err := agent.BuildToolSetForValidation(registry, cfg.Agent(), capabilities); err != nil {
+			return fmt.Errorf("deployment: agent %q tool set: %w", cfg.ID, err)
+		}
+	}
+	return nil
+}
+
+func BundleAgentFromAgent(a *agent.Agent) (BundleAgent, error) {
+	if a == nil {
+		return BundleAgent{}, fmt.Errorf("deployment: agent is nil")
+	}
+	modelContextLimit := a.ModelContextLimit
+	if modelContextLimit <= 0 {
+		modelContextLimit = agent.LookupContextLimit(a.Model)
+	}
+	contextWindow := a.ContextWindow
+	if contextWindow == 0 {
+		contextWindow = agent.DefaultContextWindow
+	}
+	contextKeepRatio := a.ContextKeepRatio
+	if contextKeepRatio == 0 {
+		contextKeepRatio = agent.DefaultContextKeepRatio
+	}
+	summarizationModel := a.SummarizationModel
+	if summarizationModel == "" {
+		summarizationModel = a.Model
+	}
+	maxSteps := a.MaxSteps
+	if maxSteps == 0 {
+		maxSteps = agent.DefaultMaxSteps
+	}
+	temperature := a.Temperature
+	if temperature == 0 {
+		temperature = agent.DefaultTemperature
+	}
+	maxTokens := a.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = agent.DefaultMaxTokens
+	}
+	maxRuns := a.MaxRuns
+	if maxRuns <= 0 {
+		maxRuns = agent.DefaultMaxTaskRuns
+	}
+
+	delegates := make([]BundleDelegate, len(a.Delegates))
+	for i, d := range a.Delegates {
+		delegates[i] = BundleDelegate{AgentID: d.AgentID, ToolName: d.ToolName, Description: d.Description, Instructions: d.Instructions}
+	}
+	servers := make([]BundleMCPServer, len(a.MCPServers))
+	for i, server := range a.MCPServers {
+		servers[i] = BundleMCPServer{Alias: server.Alias, URL: server.URL, BearerEnv: server.BearerEnv}
+	}
+	toolsCopy := append([]string{}, a.Tools...)
+	return BundleAgent{
+		ID: a.ID, Name: a.Name, Description: a.Description, Provider: a.Provider, Model: a.Model,
+		SystemPrompt: a.SystemPrompt, Tools: toolsCopy, Delegates: delegates, MCPServers: servers,
+		ModelContextLimit: modelContextLimit, ContextWindow: contextWindow, ContextKeepRatio: contextKeepRatio,
+		SummarizationModel: summarizationModel, MaxSteps: maxSteps, Temperature: temperature,
+		MaxTokens: maxTokens, MaxRuns: maxRuns,
+	}, nil
 }
 
 func (a BundleAgent) Agent() *agent.Agent {

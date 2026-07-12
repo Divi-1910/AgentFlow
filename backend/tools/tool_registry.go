@@ -19,6 +19,10 @@ type ToolRegistry struct {
 }
 
 func NewToolRegistry(redisClient *redis.Client, memorySvc *memory.Service, scratchpadSvc *scratchpad.Service) *ToolRegistry {
+	return newToolRegistry(redisClient, memorySvc, scratchpadSvc, os.Getenv("TAVILY_API_KEY"))
+}
+
+func newToolRegistry(redisClient *redis.Client, memorySvc *memory.Service, scratchpadSvc *scratchpad.Service, webSearchKey string) *ToolRegistry {
 	r := &ToolRegistry{
 		tools: make(map[string]Tool),
 	}
@@ -29,8 +33,8 @@ func NewToolRegistry(redisClient *redis.Client, memorySvc *memory.Service, scrat
 	r.Register(NewHTTPTool(30*time.Second, newDedupCache(redisClient, "http_request")))
 	slog.Info("tool registered", "name", "http_request")
 
-	if key := os.Getenv("TAVILY_API_KEY"); key != "" {
-		r.Register(NewWebSearchTool(key, 30*time.Second, newDedupCache(redisClient, "web_search")))
+	if webSearchKey != "" {
+		r.Register(NewWebSearchTool(webSearchKey, 30*time.Second, newDedupCache(redisClient, "web_search")))
 		slog.Info("tool registered", "name", "web_search")
 	} else {
 		slog.Info("tool skipped (TAVILY_API_KEY not set)", "name", "web_search")
@@ -65,6 +69,12 @@ func NewToolRegistry(redisClient *redis.Client, memorySvc *memory.Service, scrat
 
 func NewValidationRegistry() *ToolRegistry {
 	return NewToolRegistry(nil, &memory.Service{}, &scratchpad.Service{})
+}
+
+// NewCatalogRegistry contains every embedded tool definition regardless of
+// credentials. It is publication-only and its tools must never be executed.
+func NewCatalogRegistry() *ToolRegistry {
+	return newToolRegistry(nil, &memory.Service{}, &scratchpad.Service{}, "catalog-definition-only")
 }
 
 func (r *ToolRegistry) Register(t Tool) {

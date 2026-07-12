@@ -63,6 +63,29 @@ func TestMCPDiscoverHappyPath(t *testing.T) {
 	}
 }
 
+func TestValidateMCPServerURLSyntax(t *testing.T) {
+	valid := []string{
+		"https://example.com/mcp",
+		"https://example.com:8443/mcp?tenant=a",
+	}
+	for _, raw := range valid {
+		if err := ValidateMCPServerURLSyntax(raw); err != nil {
+			t.Errorf("ValidateMCPServerURLSyntax(%q): %v", raw, err)
+		}
+	}
+	invalid := []string{
+		"http://example.com/mcp",
+		"/relative/mcp",
+		"https:///missing-host",
+		"https://token@example.com/mcp",
+	}
+	for _, raw := range invalid {
+		if err := ValidateMCPServerURLSyntax(raw); err == nil {
+			t.Errorf("ValidateMCPServerURLSyntax(%q) succeeded", raw)
+		}
+	}
+}
+
 func TestMCPDiscoverDegradesOnUnreachable(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)

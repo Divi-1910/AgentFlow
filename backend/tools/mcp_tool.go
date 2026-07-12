@@ -143,6 +143,15 @@ func NewMCPManagerWithURLValidator(httpClient *http.Client, validate func(string
 // MCP discovery. Deployment loaders call it at boot so a frozen bundle cannot
 // contain a URL the runtime will deterministically refuse later.
 func ValidateMCPServerURL(rawURL string) error {
+	if err := ValidateMCPServerURLSyntax(rawURL); err != nil {
+		return err
+	}
+	return checkSSRF(rawURL, defaultBlockedCIDRs())
+}
+
+// ValidateMCPServerURLSyntax performs publication-safe validation without DNS
+// or network access. Full runtime validation adds the SSRF resolution check.
+func ValidateMCPServerURLSyntax(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid MCP url: %w", err)
@@ -150,7 +159,13 @@ func ValidateMCPServerURL(rawURL string) error {
 	if parsed.Scheme != "https" {
 		return fmt.Errorf("MCP url must be https, got %q", parsed.Scheme)
 	}
-	return checkSSRF(rawURL, defaultBlockedCIDRs())
+	if parsed.Host == "" || parsed.Hostname() == "" {
+		return fmt.Errorf("MCP url requires a host")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("MCP url must not contain userinfo")
+	}
+	return nil
 }
 
 // Discover connects to each server in parallel (per-server timeout), lists its

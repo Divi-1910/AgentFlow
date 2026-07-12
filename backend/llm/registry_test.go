@@ -2,6 +2,7 @@ package llm_test
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"backend/llm"
@@ -12,6 +13,38 @@ type fakeLLMClient struct{}
 
 func (f *fakeLLMClient) ChatCompletion(_ context.Context, _ *llm.ChatRequest) (*llm.ChatResponse, error) {
 	return &llm.ChatResponse{Content: "fake"}, nil
+}
+
+func TestSupportedProvidersAreSortedAndDefensive(t *testing.T) {
+	want := []string{"anthropic", "nvidia", "openai"}
+	got := llm.SupportedProviders()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("SupportedProviders = %v, want %v", got, want)
+	}
+	got[0] = "mutated"
+	if reflect.DeepEqual(llm.SupportedProviders(), got) {
+		t.Fatal("SupportedProviders returned shared storage")
+	}
+	for _, provider := range want {
+		if !llm.IsSupportedProvider(provider) {
+			t.Fatalf("IsSupportedProvider(%q) = false", provider)
+		}
+	}
+	if llm.IsSupportedProvider("fake") {
+		t.Fatal("fake provider reported supported")
+	}
+}
+
+func TestNewLLMRegistryUsesSupportedProviderTable(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test")
+	t.Setenv("NVIDIA_API_KEY", "test")
+	t.Setenv("ANTHROPIC_API_KEY", "test")
+	r := llm.NewLLMRegistry()
+	for _, provider := range llm.SupportedProviders() {
+		if _, err := r.Get(provider); err != nil {
+			t.Fatalf("provider %q not registered: %v", provider, err)
+		}
+	}
 }
 
 func TestNewEmptyLLMRegistryHasNoProviders(t *testing.T) {

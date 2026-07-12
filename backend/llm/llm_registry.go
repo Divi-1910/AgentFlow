@@ -4,8 +4,36 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"time"
 )
+
+type providerSpec struct {
+	name   string
+	envKey string
+	build  func(string) LLMClient
+}
+
+var providerSpecs = []providerSpec{
+	{
+		name: "openai", envKey: "OPENAI_API_KEY",
+		build: func(key string) LLMClient {
+			return NewOpenAIAdapter(AdapterConfig{APIKey: key, BaseURL: "https://api.openai.com/v1", MaxRetries: 3, Timeout: 30 * time.Second})
+		},
+	},
+	{
+		name: "nvidia", envKey: "NVIDIA_API_KEY",
+		build: func(key string) LLMClient {
+			return NewOpenAIAdapter(AdapterConfig{APIKey: key, BaseURL: "https://integrate.api.nvidia.com/v1", MaxRetries: 3, Timeout: 30 * time.Second})
+		},
+	},
+	{
+		name: "anthropic", envKey: "ANTHROPIC_API_KEY",
+		build: func(key string) LLMClient {
+			return NewAnthropicAdapter(AdapterConfig{APIKey: key, MaxRetries: 3, Timeout: 60 * time.Second})
+		},
+	},
+}
 
 type LLMRegistry struct {
 	clients map[string]LLMClient
@@ -24,64 +52,36 @@ func (r *LLMRegistry) Register(provider string, client LLMClient) {
 }
 
 func NewLLMRegistry() *LLMRegistry {
-	r := &LLMRegistry{
-		clients: make(map[string]LLMClient),
+	r := NewEmptyLLMRegistry()
+	for _, spec := range providerSpecs {
+		key := os.Getenv(spec.envKey)
+		if key == "" {
+			log.Printf("%s api skipped (%s not set)", spec.name, spec.envKey)
+			continue
+		}
+		r.clients[spec.name] = spec.build(key)
+		log.Printf("%s api registered", spec.name)
 	}
-
-	if key := os.Getenv("OPENAI_API_KEY"); key != "" {
-
-		r.clients["openai"] = NewOpenAIAdapter(AdapterConfig{
-			APIKey:     key,
-			BaseURL:    "https://api.openai.com/v1",
-			MaxRetries: 3,
-			Timeout:    30 * time.Second,
-		})
-
-		log.Println("openai api registered")
-
-	} else {
-
-		log.Println(" openai api skipped (OPENAI_API_KEY not set)")
-
-	}
-
-	// NVIDIA is OpenAI Compatible
-	if key := os.Getenv("NVIDIA_API_KEY"); key != "" {
-
-		r.clients["nvidia"] = NewOpenAIAdapter(AdapterConfig{
-			APIKey:     key,
-			BaseURL:    "https://integrate.api.nvidia.com/v1",
-			MaxRetries: 3,
-			Timeout:    30 * time.Second,
-		})
-
-		log.Println("nvidia api registered")
-
-	} else {
-
-		log.Println(" nvidia api skipped (NVIDIA_API_KEY not set)")
-
-	}
-
-	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
-
-		r.clients["anthropic"] = NewAnthropicAdapter(AdapterConfig{
-			APIKey:     key,
-			MaxRetries: 3,
-			Timeout:    60 * time.Second,
-		})
-
-		log.Println("anthropic api registered")
-
-	} else {
-
-		log.Println(" anthropic api skipped (ANTHROPIC_API_KEY not set)")
-
-	}
-
 	log.Printf("%d provider(s) available", len(r.clients))
-
 	return r
+}
+
+func SupportedProviders() []string {
+	providers := make([]string, len(providerSpecs))
+	for i, spec := range providerSpecs {
+		providers[i] = spec.name
+	}
+	sort.Strings(providers)
+	return providers
+}
+
+func IsSupportedProvider(name string) bool {
+	for _, spec := range providerSpecs {
+		if spec.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *LLMRegistry) Get(provider string) (LLMClient, error) {

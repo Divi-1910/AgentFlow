@@ -67,6 +67,87 @@ func TestLoadVerifiesCanonicalHash(t *testing.T) {
 	}
 }
 
+func TestParseVerifiesExactBundleBytes(t *testing.T) {
+	b := validBundle()
+	hash, _ := b.CanonicalHash()
+	b.ConfigHash = hash
+	raw, _ := json.Marshal(b)
+	parsed, err := Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.ConfigHash != hash {
+		t.Fatalf("hash = %q, want %q", parsed.ConfigHash, hash)
+	}
+	if _, err := Parse(append(raw, []byte(`{}`)...)); err == nil {
+		t.Fatal("Parse accepted trailing JSON")
+	}
+}
+
+func TestBundleAgentFromAgentFreezesEffectiveValues(t *testing.T) {
+	source := &agent.Agent{
+		ID: "a", Name: "Agent", Provider: "openai", Model: "unknown-model", SystemPrompt: "prompt",
+		Tools: nil, Delegates: nil, MCPServers: nil,
+	}
+	frozen, err := BundleAgentFromAgent(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frozen.ModelContextLimit != agent.LookupContextLimit(source.Model) ||
+		frozen.ContextWindow != agent.DefaultContextWindow ||
+		frozen.ContextKeepRatio != agent.DefaultContextKeepRatio ||
+		frozen.SummarizationModel != source.Model ||
+		frozen.MaxSteps != agent.DefaultMaxSteps ||
+		frozen.Temperature != agent.DefaultTemperature ||
+		frozen.MaxTokens != agent.DefaultMaxTokens ||
+		frozen.MaxRuns != agent.DefaultMaxTaskRuns {
+		t.Fatalf("defaults not frozen: %+v", frozen)
+	}
+	if frozen.Tools == nil || frozen.Delegates == nil || frozen.MCPServers == nil {
+		t.Fatalf("nil slices were not normalized: %+v", frozen)
+	}
+}
+
+func TestBundleAgentFromAgentPreservesResolvedContextAndCopies(t *testing.T) {
+	source := &agent.Agent{
+		ID: "a", Name: "Agent", Provider: "openai", Model: "gpt-4o", SystemPrompt: "prompt",
+		Tools: []string{"calculator"}, Delegates: []agent.DelegateConfig{{AgentID: "b", ToolName: "ask_b"}},
+		MCPServers:        []agent.MCPServerConfig{{Alias: "docs", URL: "https://docs.example/mcp", BearerEnv: "DOCS_TOKEN"}},
+		ModelContextLimit: 128000, ContextWindow: 3, ContextKeepRatio: .25, SummarizationModel: "summary-model",
+		MaxSteps: 9, Temperature: .2, MaxTokens: 777, MaxRuns: 4,
+	}
+	frozen, err := BundleAgentFromAgent(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frozen.ModelContextLimit != 128000 || frozen.ContextWindow != 3 || frozen.MaxRuns != 4 {
+		t.Fatalf("resolved values changed: %+v", frozen)
+	}
+	source.Tools[0] = "mutated"
+	source.Delegates[0].ToolName = "mutated"
+	source.MCPServers[0].Alias = "mutated"
+	if frozen.Tools[0] != "calculator" || frozen.Delegates[0].ToolName != "ask_b" || frozen.MCPServers[0].Alias != "docs" {
+		t.Fatalf("conversion retained source slices: %+v", frozen)
+	}
+	roundTrip := frozen.Agent()
+	if roundTrip.ModelContextLimit != 128000 || roundTrip.SummarizationModel != "summary-model" {
+		t.Fatalf("inverse conversion lost values: %+v", roundTrip)
+	}
+}
+
+func TestBundleAgentFromAgentPreservesInvalidNegativeValues(t *testing.T) {
+	source := &agent.Agent{ID: "a", Name: "A", Provider: "openai", Model: "m", SystemPrompt: "p", ContextWindow: -1, ContextKeepRatio: -1, MaxSteps: -1, Temperature: -1, MaxTokens: -1}
+	frozen, err := BundleAgentFromAgent(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := validBundle()
+	b.RootAgentID, b.DeploymentID, b.Agents = "a", "a", []BundleAgent{frozen}
+	if err := b.ValidateStatic(); err == nil {
+		t.Fatal("invalid negative values were silently repaired")
+	}
+}
+
 func TestCanonicalHashIgnoresJSONFormatting(t *testing.T) {
 	b := validBundle()
 	hash, _ := b.CanonicalHash()
@@ -226,5 +307,23 @@ func TestValidateRuntimeRequiresProviderAndTools(t *testing.T) {
 	b.Agents[0].Tools = []string{"missing_tool"}
 	if err := b.ValidateRuntime(registry, providers, capabilities); err == nil || !strings.Contains(err.Error(), "missing_tool") {
 		t.Fatalf("missing tool error = %v", err)
+	}
+}
+
+func TestValidateForPublicationUsesEnvironmentIndependentCatalog(t *testing.T) {
+	t.Setenv("TAVILY_API_KEY", "")
+	b := validBundle()
+	b.Agents[0].Tools = []string{"web_search"}
+	if err := b.ValidateForPublication(tools.NewCatalogRegistry(), agent.ToolCapabilities{AsyncJobs: true}); err != nil {
+		t.Fatalf("known conditional tool rejected: %v", err)
+	}
+	b.Agents[0].Tools = []string{"web_serach"}
+	if err := b.ValidateForPublication(tools.NewCatalogRegistry(), agent.ToolCapabilities{AsyncJobs: true}); err == nil || !strings.Contains(err.Error(), "web_serach") {
+		t.Fatalf("unknown tool error = %v", err)
+	}
+	b.Agents[0].Tools = []string{}
+	b.Agents[0].Provider = "fake"
+	if err := b.ValidateForPublication(tools.NewCatalogRegistry(), agent.ToolCapabilities{AsyncJobs: true}); err == nil || !strings.Contains(err.Error(), "unsupported provider") {
+		t.Fatalf("unsupported provider error = %v", err)
 	}
 }

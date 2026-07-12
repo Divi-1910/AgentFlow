@@ -9,6 +9,7 @@ import (
 	"backend/llm"
 	"backend/memory"
 	"backend/middleware"
+	"backend/publisher"
 	"backend/repo/mongorepo"
 	"backend/scratchpad"
 	"backend/tools"
@@ -96,6 +97,7 @@ func main() {
 	usersCol := db.GetCollection(dbName, "users")
 	llmRegistryCol := db.GetCollection(dbName, "llm_registry")
 	agentsCol := db.GetCollection(dbName, "agents")
+	deploymentRevisionsCol := db.GetCollection(dbName, "deployment_revisions")
 	threadsCol := db.GetCollection(dbName, "threads")
 	messagesCol := db.GetCollection(dbName, "messages")
 	runsCol := db.GetCollection(dbName, "runs")
@@ -142,6 +144,7 @@ func main() {
 	llmHandler := handlers.NewLLMHandler(llmModelRepo, llmRegistry)
 
 	agentRepo := mongorepo.NewAgentRepo(agentsCol, llmRegistryCol)
+	deploymentRevisionRepo := mongorepo.NewDeploymentRevisionRepo(deploymentRevisionsCol)
 	threadRepo := mongorepo.NewThreadRepo(threadsCol)
 	messageRepo := mongorepo.NewMessageRepo(messagesCol)
 	runRepo := mongorepo.NewRunRepo(runsCol, checkpointsCol)
@@ -165,6 +168,10 @@ func main() {
 		slog.Error("failed to create thread indexes", "error", err)
 		os.Exit(1)
 	}
+	if err := deploymentRevisionRepo.EnsureIndexes(context.Background()); err != nil {
+		slog.Error("failed to create deployment revision indexes", "error", err)
+		os.Exit(1)
+	}
 
 	platformPath := strings.TrimSpace(os.Getenv("PLATFORM_XML_PATH"))
 	if platformPath == "" {
@@ -176,6 +183,13 @@ func main() {
 		os.Exit(1)
 	}
 	contextBuilder := agent.NewContextBuilder(platformCfg, memorySvc, memoryMetaRepo, scratchpadSvc)
+	publisherSvc, err := publisher.NewService(publisher.Config{
+		Agents: agentRepo, Revisions: deploymentRevisionRepo, Platform: platformCfg, Catalog: tools.NewCatalogRegistry(),
+	})
+	if err != nil {
+		slog.Error("failed to initialize deployment publisher", "error", err)
+		os.Exit(1)
+	}
 	capabilities := agent.ToolCapabilities{AsyncJobs: true}
 	agentRuntime := agent.NewAgentRuntime(llmRegistry, toolRegistry, contextBuilder, capabilities).WithCheckpointStore(runRepo)
 	agentRuntime.SetMCPManager(mcpManager) // must follow WithCheckpointStore (which copies a still-nil manager)
@@ -251,6 +265,7 @@ func main() {
 	}
 
 	agentHandler := handlers.NewAgentHandler(agentRepo, toolRegistry)
+	publicationHandler := handlers.NewPublicationHandler(publisherSvc)
 	threadHandler := handlers.NewThreadHandler(threadRepo, agentRepo)
 	messageHandler := handlers.NewMessageHandler(
 		agentRepo,
@@ -278,6 +293,8 @@ func main() {
 	mux.HandleFunc("GET /api/agents/{id}", middleware.RequireAuth(agentHandler.Get))
 	mux.HandleFunc("PUT /api/agents/{id}", middleware.RequireAuth(agentHandler.Update))
 	mux.HandleFunc("DELETE /api/agents/{id}", middleware.RequireAuth(agentHandler.Delete))
+	mux.HandleFunc("POST /api/agents/{id}/publish", middleware.RequireAuth(publicationHandler.Publish))
+	mux.HandleFunc("GET /api/agents/{id}/publications/{revision}/bundle", middleware.RequireAuth(publicationHandler.GetBundle))
 	mux.HandleFunc("POST /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.Create))
 	mux.HandleFunc("GET /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.ListByAgent))
 	mux.HandleFunc("POST /api/threads/{id}/messages", middleware.RequireAuth(messageHandler.Send))
