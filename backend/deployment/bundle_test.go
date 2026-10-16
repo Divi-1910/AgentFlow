@@ -90,7 +90,7 @@ func TestBundleAgentFromAgentFreezesEffectiveValues(t *testing.T) {
 		ID: "a", Name: "Agent", Provider: "openai", Model: "unknown-model", SystemPrompt: "prompt",
 		Tools: nil, Delegates: nil, MCPServers: nil,
 	}
-	frozen, err := BundleAgentFromAgent(source)
+	frozen, err := BundleAgentFromAgent(source, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,11 +113,12 @@ func TestBundleAgentFromAgentPreservesResolvedContextAndCopies(t *testing.T) {
 	source := &agent.Agent{
 		ID: "a", Name: "Agent", Provider: "openai", Model: "gpt-4o", SystemPrompt: "prompt",
 		Tools: []string{"calculator"}, Delegates: []agent.DelegateConfig{{AgentID: "b", ToolName: "ask_b"}},
-		MCPServers:        []agent.MCPServerConfig{{Alias: "docs", URL: "https://docs.example/mcp", BearerEnv: "DOCS_TOKEN"}},
+		MCPServers:        []agent.MCPServerSelection{{ServerID: "docs"}},
 		ModelContextLimit: 128000, ContextWindow: 3, ContextKeepRatio: .25, SummarizationModel: "summary-model",
 		MaxSteps: 9, Temperature: .2, MaxTokens: 777, MaxRuns: 4,
 	}
-	frozen, err := BundleAgentFromAgent(source)
+	connections := []agent.MCPServerConnection{{ServerID: "docs", Alias: "docs", URL: "http://docs.mcp-system.svc.cluster.local/mcp"}}
+	frozen, err := BundleAgentFromAgent(source, connections)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,19 +127,20 @@ func TestBundleAgentFromAgentPreservesResolvedContextAndCopies(t *testing.T) {
 	}
 	source.Tools[0] = "mutated"
 	source.Delegates[0].ToolName = "mutated"
-	source.MCPServers[0].Alias = "mutated"
+	connections[0].Alias = "mutated"
 	if frozen.Tools[0] != "calculator" || frozen.Delegates[0].ToolName != "ask_b" || frozen.MCPServers[0].Alias != "docs" {
 		t.Fatalf("conversion retained source slices: %+v", frozen)
 	}
 	roundTrip := frozen.Agent()
-	if roundTrip.ModelContextLimit != 128000 || roundTrip.SummarizationModel != "summary-model" {
+	if roundTrip.ModelContextLimit != 128000 || roundTrip.SummarizationModel != "summary-model" ||
+		len(roundTrip.MCPConnections) != 1 || roundTrip.MCPConnections[0].ServerID != "docs" {
 		t.Fatalf("inverse conversion lost values: %+v", roundTrip)
 	}
 }
 
 func TestBundleAgentFromAgentPreservesInvalidNegativeValues(t *testing.T) {
 	source := &agent.Agent{ID: "a", Name: "A", Provider: "openai", Model: "m", SystemPrompt: "p", ContextWindow: -1, ContextKeepRatio: -1, MaxSteps: -1, Temperature: -1, MaxTokens: -1}
-	frozen, err := BundleAgentFromAgent(source)
+	frozen, err := BundleAgentFromAgent(source, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,12 +198,12 @@ func TestStudioOnlyEditsDoNotChangeHash(t *testing.T) {
 		MaxSteps: 25, Temperature: .7, MaxTokens: 100, MaxRuns: 10,
 		CreatedAt: time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
-	first, err := BundleAgentFromAgent(source)
+	first, err := BundleAgentFromAgent(source, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	source.CreatedAt = time.Date(2026, 7, 12, 0, 0, 0, 0, time.UTC)
-	second, err := BundleAgentFromAgent(source)
+	second, err := BundleAgentFromAgent(source, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,36 +291,24 @@ func TestAgentReaderScopesAndDefensiveCopies(t *testing.T) {
 	}
 }
 
-func TestValidateEnvironmentRequiresMCPBearer(t *testing.T) {
+func TestValidateMCPConnectionsRejectsUnsupportedScheme(t *testing.T) {
 	b := validBundle()
-	b.Agents[0].MCPServers = []BundleMCPServer{{Alias: "context7", URL: "https://example.invalid/mcp", BearerEnv: "CONTEXT7_TOKEN"}}
-	if err := b.ValidateEnvironment(func(string) (string, bool) { return "", false }); err == nil || !strings.Contains(err.Error(), "CONTEXT7_TOKEN") {
-		t.Fatalf("ValidateEnvironment = %v", err)
+	b.Agents[0].MCPServers = []BundleMCPServer{{ServerID: "context7", Alias: "context7", URL: "ftp://example.test/mcp"}}
+	if err := b.ValidateMCPConnections(nil); err == nil || !strings.Contains(err.Error(), "http or https") {
+		t.Fatalf("ValidateMCPConnections = %v", err)
 	}
 }
 
-func TestValidateEnvironmentRejectsHTTPMCP(t *testing.T) {
+func TestValidateMCPConnectionsAllowsManagedHTTP(t *testing.T) {
 	b := validBundle()
-	b.Agents[0].MCPServers = []BundleMCPServer{{Alias: "context7", URL: "http://8.8.8.8/mcp"}}
-	if err := b.ValidateEnvironment(func(string) (string, bool) { return "", false }); err == nil || !strings.Contains(err.Error(), "must be https") {
-		t.Fatalf("ValidateEnvironment = %v", err)
-	}
-}
-
-func TestValidateEnvironmentAllowsExplicitNoAuthMCP(t *testing.T) {
-	b := validBundle()
-	b.Agents[0].MCPServers = []BundleMCPServer{{Alias: "context7", URL: "https://mcp.example.test"}}
-	lookupCalled := false
+	b.Agents[0].MCPServers = []BundleMCPServer{{ServerID: "context7", Alias: "context7", URL: "http://context7.mcp-system.svc.cluster.local/mcp"}}
 	validatedURL := ""
-	err := b.ValidateEnvironmentWith(
-		func(string) (string, bool) { lookupCalled = true; return "", false },
-		func(rawURL string) error { validatedURL = rawURL; return nil },
-	)
+	err := b.ValidateMCPConnections(func(rawURL string) error { validatedURL = rawURL; return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lookupCalled || validatedURL != "https://mcp.example.test" {
-		t.Fatalf("lookupCalled=%v validatedURL=%q", lookupCalled, validatedURL)
+	if validatedURL != "http://context7.mcp-system.svc.cluster.local/mcp" {
+		t.Fatalf("validatedURL=%q", validatedURL)
 	}
 }
 

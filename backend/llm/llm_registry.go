@@ -84,6 +84,18 @@ func IsSupportedProvider(name string) bool {
 	return false
 }
 
+// CredentialEnvName returns the runtime environment variable that supplies
+// the AgentFlow-owned credential for a supported provider. It performs no
+// environment lookup and never returns a credential value.
+func CredentialEnvName(provider string) (string, bool) {
+	for _, spec := range providerSpecs {
+		if spec.name == provider {
+			return spec.envKey, true
+		}
+	}
+	return "", false
+}
+
 func (r *LLMRegistry) Get(provider string) (LLMClient, error) {
 
 	client, ok := r.clients[provider]

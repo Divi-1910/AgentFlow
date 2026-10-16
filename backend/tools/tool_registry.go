@@ -19,7 +19,7 @@ type ToolRegistry struct {
 }
 
 func NewToolRegistry(redisClient *redis.Client, memorySvc *memory.Service, scratchpadSvc *scratchpad.Service) *ToolRegistry {
-	return newToolRegistry(redisClient, memorySvc, scratchpadSvc, os.Getenv("TAVILY_API_KEY"))
+	return newToolRegistry(redisClient, memorySvc, scratchpadSvc, os.Getenv(webSearchCredentialEnvName))
 }
 
 func newToolRegistry(redisClient *redis.Client, memorySvc *memory.Service, scratchpadSvc *scratchpad.Service, webSearchKey string) *ToolRegistry {
@@ -37,7 +37,7 @@ func newToolRegistry(redisClient *redis.Client, memorySvc *memory.Service, scrat
 		r.Register(NewWebSearchTool(webSearchKey, 30*time.Second, newDedupCache(redisClient, "web_search")))
 		slog.Info("tool registered", "name", "web_search")
 	} else {
-		slog.Info("tool skipped (TAVILY_API_KEY not set)", "name", "web_search")
+		slog.Info("tool skipped (credential not set)", "name", "web_search", "environment", webSearchCredentialEnvName)
 	}
 
 	if memorySvc != nil {

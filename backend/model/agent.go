@@ -16,10 +16,10 @@ type AgentDocument struct {
 	Provider string `bson:"provider" json:"provider"`
 	Model    string `bson:"model"    json:"model"`
 
-	SystemPrompt string               `bson:"system_prompt" json:"system_prompt"`
-	Tools        []string             `bson:"tools"         json:"tools"`
-	Delegates    []DelegateConfigDoc  `bson:"delegates,omitempty" json:"delegates,omitempty"`
-	MCPServers   []MCPServerConfigDoc `bson:"mcp_servers,omitempty" json:"mcp_servers,omitempty"`
+	SystemPrompt string                  `bson:"system_prompt" json:"system_prompt"`
+	Tools        []string                `bson:"tools"         json:"tools"`
+	Delegates    []DelegateConfigDoc     `bson:"delegates,omitempty" json:"delegates,omitempty"`
+	MCPServers   []MCPServerSelectionDoc `bson:"mcp_servers,omitempty" json:"mcp_servers,omitempty"`
 
 	ContextWindow      int     `bson:"context_window,omitempty"      json:"context_window,omitempty"`
 	ContextKeepRatio   float64 `bson:"context_keep_ratio,omitempty"  json:"context_keep_ratio,omitempty"`
@@ -42,10 +42,8 @@ type DelegateConfigDoc struct {
 	Instructions string `bson:"instructions,omitempty" json:"instructions,omitempty"`
 }
 
-// MCPServerConfigDoc is the persisted form of agent.MCPServerConfig. Only the
-// env-var NAME is stored (BearerEnv) — never a resolved token.
-type MCPServerConfigDoc struct {
-	Alias     string `bson:"alias"      json:"alias"`
-	URL       string `bson:"url"        json:"url"`
-	BearerEnv string `bson:"bearer_env,omitempty" json:"bearer_env,omitempty"`
+// MCPServerSelectionDoc persists only the stable catalog selection. Connection
+// details remain owned by the MCP catalog and are resolved later.
+type MCPServerSelectionDoc struct {
+	ServerID string `bson:"server_id" json:"server_id"`
 }

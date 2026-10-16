@@ -39,7 +39,7 @@ func (r *AgentRepo) Create(ctx context.Context, userID string, input *agent.Agen
 		SystemPrompt:       input.SystemPrompt,
 		Tools:              input.Tools,
 		Delegates:          toDelegateConfigDocs(input.Delegates),
-		MCPServers:         toMCPServerConfigDocs(input.MCPServers),
+		MCPServers:         toMCPServerSelectionDocs(input.MCPServers),
 		ContextWindow:      input.ContextWindow,
 		ContextKeepRatio:   input.ContextKeepRatio,
 		SummarizationModel: input.SummarizationModel,
@@ -153,7 +153,7 @@ func (r *AgentRepo) Update(ctx context.Context, agentID, userID string, input ag
 		set["delegates"] = toDelegateConfigDocs(*input.Delegates)
 	}
 	if input.MCPServers != nil {
-		set["mcp_servers"] = toMCPServerConfigDocs(*input.MCPServers)
+		set["mcp_servers"] = toMCPServerSelectionDocs(*input.MCPServers)
 	}
 	if input.Provider != nil {
 		set["provider"] = *input.Provider
@@ -228,7 +228,7 @@ func (r *AgentRepo) toRuntimeAgent(ctx context.Context, doc model.AgentDocument)
 		SystemPrompt:       doc.SystemPrompt,
 		Tools:              doc.Tools,
 		Delegates:          toDelegateConfigs(doc.Delegates),
-		MCPServers:         toMCPServerConfigs(doc.MCPServers),
+		MCPServers:         toMCPServerSelections(doc.MCPServers),
 		ModelContextLimit:  r.resolveContextLimit(ctx, doc.Provider, doc.Model),
 		ContextWindow:      doc.ContextWindow,
 		ContextKeepRatio:   doc.ContextKeepRatio,
@@ -280,24 +280,24 @@ func toDelegateConfigs(in []model.DelegateConfigDoc) []agent.DelegateConfig {
 	return out
 }
 
-func toMCPServerConfigDocs(in []agent.MCPServerConfig) []model.MCPServerConfigDoc {
+func toMCPServerSelectionDocs(in []agent.MCPServerSelection) []model.MCPServerSelectionDoc {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make([]model.MCPServerConfigDoc, len(in))
+	out := make([]model.MCPServerSelectionDoc, len(in))
 	for i, m := range in {
-		out[i] = model.MCPServerConfigDoc{Alias: m.Alias, URL: m.URL, BearerEnv: m.BearerEnv}
+		out[i] = model.MCPServerSelectionDoc{ServerID: m.ServerID}
 	}
 	return out
 }
 
-func toMCPServerConfigs(in []model.MCPServerConfigDoc) []agent.MCPServerConfig {
+func toMCPServerSelections(in []model.MCPServerSelectionDoc) []agent.MCPServerSelection {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make([]agent.MCPServerConfig, len(in))
+	out := make([]agent.MCPServerSelection, len(in))
 	for i, m := range in {
-		out[i] = agent.MCPServerConfig{Alias: m.Alias, URL: m.URL, BearerEnv: m.BearerEnv}
+		out[i] = agent.MCPServerSelection{ServerID: m.ServerID}
 	}
 	return out
 }

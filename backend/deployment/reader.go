@@ -39,6 +39,7 @@ func cloneAgent(a *agent.Agent) *agent.Agent {
 	copy := *a
 	copy.Tools = append([]string(nil), a.Tools...)
 	copy.Delegates = append([]agent.DelegateConfig(nil), a.Delegates...)
-	copy.MCPServers = append([]agent.MCPServerConfig(nil), a.MCPServers...)
+	copy.MCPServers = append([]agent.MCPServerSelection(nil), a.MCPServers...)
+	copy.MCPConnections = append([]agent.MCPServerConnection(nil), a.MCPConnections...)
 	return &copy
 }

@@ -22,12 +22,22 @@ func TestPublisherRoundTripThroughRuntimeBundleLoader(t *testing.T) {
 	agentsCol := col(t, "publisher_agents")
 	modelsCol := col(t, "publisher_models")
 	revisionsCol := col(t, "publisher_revisions")
+	mcpServersCol := col(t, "publisher_mcp_servers")
 	if _, err := modelsCol.InsertOne(ctx, model.LLMModel{
 		ModelID: "catalog-gpt4o", Name: "GPT-4o", Provider: "openai", APIModelID: "gpt-4o", ContextWindow: 128000,
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := mcpServersCol.InsertOne(ctx, model.MCPServerDocument{
+		ID: bson.NewObjectID(), ServerID: "context7", Name: "Context7", Alias: "context7",
+		StudioURL:     "http://localhost:8101/mcp",
+		DeploymentURL: "http://context7.mcp-system.svc.cluster.local/mcp",
+		Enabled:       true, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	agents := mongorepo.NewAgentRepo(agentsCol, modelsCol)
+	mcpServers := mongorepo.NewMCPServerRepo(mcpServersCol)
 	child, err := agents.Create(ctx, userA, &agent.Agent{
 		Name: "Researcher", Provider: "openai", Model: "gpt-4o", SystemPrompt: "research",
 	})
@@ -38,7 +48,7 @@ func TestPublisherRoundTripThroughRuntimeBundleLoader(t *testing.T) {
 		Name: "Supervisor", Provider: "openai", Model: "gpt-4o", SystemPrompt: "supervise",
 		Tools:      []string{"web_search"},
 		Delegates:  []agent.DelegateConfig{{AgentID: child.ID, ToolName: "ask_researcher", Description: "research"}},
-		MCPServers: []agent.MCPServerConfig{{Alias: "context7", URL: "https://context7.example/mcp", BearerEnv: "CONTEXT7_TOKEN"}},
+		MCPServers: []agent.MCPServerSelection{{ServerID: "context7"}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -49,12 +59,12 @@ func TestPublisherRoundTripThroughRuntimeBundleLoader(t *testing.T) {
 	}
 	svc, err := publisher.NewService(publisher.Config{
 		Agents: agents, Revisions: revisions, Platform: &agent.PlatformConfig{Body: "<platform>published</platform>"},
-		Catalog: tools.NewCatalogRegistry(),
+		Catalog: tools.NewCatalogRegistry(), MCPServers: mcpServers,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := svc.Publish(ctx, userA, root.ID)
+	first, err := svc.Publish(ctx, userA, root.ID, "roundtrip-publication-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,11 +78,17 @@ func TestPublisherRoundTripThroughRuntimeBundleLoader(t *testing.T) {
 	}}}); err != nil {
 		t.Fatal(err)
 	}
-	second, err := svc.Publish(ctx, userA, root.ID)
+	second, err := svc.Publish(ctx, userA, root.ID, "roundtrip-publication-2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.WasExisting || !second.WasExisting || first.Revision.Revision != second.Revision.Revision || first.Revision.ConfigHash != second.Revision.ConfigHash {
+	replay, err := svc.Publish(ctx, userA, root.ID, "roundtrip-publication-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.WasExisting || second.WasExisting || !replay.WasExisting ||
+		first.Revision.Revision != 1 || second.Revision.Revision != 2 || replay.Revision.Revision != 2 ||
+		first.Revision.ConfigHash != second.Revision.ConfigHash {
 		t.Fatalf("first/second = %+v/%+v", first, second)
 	}
 	stored, err := svc.GetBundle(ctx, userA, root.ID, first.Revision.Revision)
@@ -102,8 +118,10 @@ func TestPublisherRoundTripThroughRuntimeBundleLoader(t *testing.T) {
 	if frozenRoot.ModelContextLimit != 128000 || frozenRoot.MaxSteps != agent.DefaultMaxSteps || frozenRoot.MaxTokens != agent.DefaultMaxTokens || frozenRoot.MaxRuns != agent.DefaultMaxTaskRuns || frozenRoot.ContextWindow != agent.DefaultContextWindow || frozenRoot.SummarizationModel != "gpt-4o" {
 		t.Fatalf("resolved root values = %+v", frozenRoot)
 	}
-	if frozenRoot.MCPServers[0].BearerEnv != "CONTEXT7_TOKEN" {
-		t.Fatalf("bearer env changed: %+v", frozenRoot.MCPServers)
+	if len(frozenRoot.MCPServers) != 1 || frozenRoot.MCPServers[0].ServerID != "context7" ||
+		frozenRoot.MCPServers[0].Alias != "context7" ||
+		frozenRoot.MCPServers[0].URL != "http://context7.mcp-system.svc.cluster.local/mcp" {
+		t.Fatalf("resolved MCP server changed: %+v", frozenRoot.MCPServers)
 	}
 	reader := deployment.NewAgentReader(bundle, bundle.SyntheticUserID())
 	if _, err := reader.GetByID(ctx, child.ID, bundle.SyntheticUserID()); err != nil {

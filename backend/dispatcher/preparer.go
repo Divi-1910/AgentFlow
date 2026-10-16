@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"backend/agent"
+	"backend/mcp"
 	"backend/runtimectx"
 	"backend/tools"
 )
@@ -20,9 +21,14 @@ type RunPreparerConfig struct {
 	Summarizer   Summarizer
 	Runtime      Runtime
 	ToolRegistry *tools.ToolRegistry
+	MCPServers   MCPServerCatalog
 	Tasks        taskBudgetStore
 	Background   context.Context
 	Capabilities agent.ToolCapabilities
+}
+
+type MCPServerCatalog interface {
+	GetEnabledByIDs(ctx context.Context, serverIDs []string) (map[string]mcp.CatalogEntry, error)
 }
 
 type RunPreparer struct {
@@ -33,6 +39,7 @@ type RunPreparer struct {
 	summarizer   Summarizer
 	runtime      Runtime
 	toolRegistry *tools.ToolRegistry
+	mcpServers   MCPServerCatalog
 	tasks        taskBudgetStore
 	background   context.Context
 	capabilities agent.ToolCapabilities
@@ -58,6 +65,7 @@ func NewRunPreparer(cfg RunPreparerConfig) *RunPreparer {
 		summarizer:   cfg.Summarizer,
 		runtime:      cfg.Runtime,
 		toolRegistry: cfg.ToolRegistry,
+		mcpServers:   cfg.MCPServers,
 		tasks:        cfg.Tasks,
 		background:   background,
 		capabilities: cfg.Capabilities,
@@ -76,6 +84,10 @@ func (p *RunPreparer) EstimateSystemPromptTokens(ctx context.Context, req Estima
 		return 0
 	}
 	ag, err := p.agents.GetByID(ctx, req.AgentID, req.UserID)
+	if err != nil {
+		return 0
+	}
+	ag, err = p.resolveMCPConnections(ctx, ag)
 	if err != nil {
 		return 0
 	}
@@ -108,6 +120,10 @@ func (p *RunPreparer) prepareFresh(ctx context.Context, req DispatchRequest) (Pr
 	ag, err := p.agents.GetByID(ctx, threadAgentID, req.UserID)
 	if err != nil {
 		return PreparedRun{}, fmt.Errorf("dispatcher: load agent: %w", err)
+	}
+	ag, err = p.resolveMCPConnections(ctx, ag)
+	if err != nil {
+		return PreparedRun{}, err
 	}
 
 	rawMessages, err := p.messages.ListRecentByThread(ctx, req.ThreadID, 500)
@@ -225,6 +241,10 @@ func (p *RunPreparer) prepareResume(ctx context.Context, req DispatchRequest) (P
 	if err != nil {
 		return PreparedRun{}, fmt.Errorf("dispatcher: load agent for resume: %w", err)
 	}
+	ag, err = p.resolveMCPConnections(ctx, ag)
+	if err != nil {
+		return PreparedRun{}, err
+	}
 
 	if p.toolRegistry != nil {
 		toolSet, err := agent.BuildToolSetForValidation(p.toolRegistry, ag, p.capabilities)
@@ -277,6 +297,49 @@ func (p *RunPreparer) prepareResume(ctx context.Context, req DispatchRequest) (P
 			SystemContext:   snapshot.Meta.SystemContext,
 		},
 	}, nil
+}
+
+func (p *RunPreparer) resolveMCPConnections(ctx context.Context, ag *agent.Agent) (*agent.Agent, error) {
+	if p.mcpServers == nil {
+		return ag, nil
+	}
+	copy := *ag
+	copy.Tools = append([]string(nil), ag.Tools...)
+	copy.Delegates = append([]agent.DelegateConfig(nil), ag.Delegates...)
+	copy.MCPServers = append([]agent.MCPServerSelection(nil), ag.MCPServers...)
+	copy.MCPConnections = nil
+	if len(copy.MCPServers) == 0 {
+		return &copy, nil
+	}
+
+	serverIDs := make([]string, len(copy.MCPServers))
+	for i, selection := range copy.MCPServers {
+		serverIDs[i] = selection.ServerID
+	}
+	entries, err := p.mcpServers.GetEnabledByIDs(ctx, serverIDs)
+	if err != nil {
+		return nil, fmt.Errorf("dispatcher: resolve MCP catalog: %w", err)
+	}
+	copy.MCPConnections = make([]agent.MCPServerConnection, len(copy.MCPServers))
+	for i, selection := range copy.MCPServers {
+		entry, exists := entries[selection.ServerID]
+		if !exists {
+			return nil, fmt.Errorf("dispatcher: unknown or disabled MCP server %q", selection.ServerID)
+		}
+		if entry.ServerID != selection.ServerID {
+			return nil, fmt.Errorf("dispatcher: MCP catalog returned mismatched server_id %q for %q", entry.ServerID, selection.ServerID)
+		}
+		if err := mcp.ValidateCatalogIdentity(entry); err != nil {
+			return nil, fmt.Errorf("dispatcher: invalid MCP catalog entry %q: %w", selection.ServerID, err)
+		}
+		if err := tools.ValidateManagedMCPServerURL(entry.StudioURL); err != nil {
+			return nil, fmt.Errorf("dispatcher: invalid Studio URL for MCP server %q: %w", selection.ServerID, err)
+		}
+		copy.MCPConnections[i] = agent.MCPServerConnection{
+			ServerID: entry.ServerID, Alias: entry.Alias, URL: entry.StudioURL,
+		}
+	}
+	return &copy, nil
 }
 
 func (p *RunPreparer) kickSummarization(threadID, userID string, ag *agent.Agent, currentSummary string, drop []agent.Turn) {

@@ -47,6 +47,24 @@ func TestNewLLMRegistryUsesSupportedProviderTable(t *testing.T) {
 	}
 }
 
+func TestCredentialEnvNameUsesSupportedProviderTable(t *testing.T) {
+	t.Parallel()
+	want := map[string]string{
+		"openai":    "OPENAI_API_KEY",
+		"nvidia":    "NVIDIA_API_KEY",
+		"anthropic": "ANTHROPIC_API_KEY",
+	}
+	for provider, envName := range want {
+		got, ok := llm.CredentialEnvName(provider)
+		if !ok || got != envName {
+			t.Fatalf("CredentialEnvName(%q) = %q, %v; want %q, true", provider, got, ok, envName)
+		}
+	}
+	if got, ok := llm.CredentialEnvName("unsupported"); ok || got != "" {
+		t.Fatalf("CredentialEnvName(unsupported) = %q, %v; want empty, false", got, ok)
+	}
+}
+
 func TestNewEmptyLLMRegistryHasNoProviders(t *testing.T) {
 	t.Parallel()
 	r := llm.NewEmptyLLMRegistry()

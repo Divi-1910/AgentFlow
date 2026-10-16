@@ -72,7 +72,7 @@ func TestBuildToolSetForValidation_IgnoresMCPServers(t *testing.T) {
 	ag := &Agent{
 		ID:         "a",
 		Tools:      []string{"calculator"},
-		MCPServers: []MCPServerConfig{{Alias: "demo", URL: "https://example.com/mcp"}},
+		MCPServers: []MCPServerSelection{{ServerID: "demo"}},
 	}
 	ts, err := BuildToolSetForValidation(toolsetTestRegistry(), ag, ToolCapabilities{AsyncJobs: true})
 	if err != nil {

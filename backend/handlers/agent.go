@@ -1,15 +1,17 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
-	"strings"
 	"time"
 
 	"backend/agent"
+	"backend/mcp"
 	"backend/tools"
 )
 
@@ -25,13 +27,22 @@ type DelegateConfigJSON struct {
 	Instructions string `json:"instructions,omitempty"`
 }
 
-// MCPServerConfigJSON is the request/response form of an MCP server config.
-// bearer_env is the env-var NAME holding the token — the token value itself is
-// never accepted or returned here (no secrets cross the API or live in Mongo).
-type MCPServerConfigJSON struct {
-	Alias     string `json:"alias"`
-	URL       string `json:"url"`
-	BearerEnv string `json:"bearer_env,omitempty"`
+// MCPServerSelectionJSON is the request/response form of a catalog selection.
+// Connection details are owned by AgentFlow and are never accepted here.
+type MCPServerSelectionJSON struct {
+	ServerID string `json:"server_id"`
+}
+
+func (s *MCPServerSelectionJSON) UnmarshalJSON(data []byte) error {
+	type selectionWire MCPServerSelectionJSON
+	var decoded selectionWire
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	*s = MCPServerSelectionJSON(decoded)
+	return nil
 }
 
 // agentReader is the read-only subset used by the thread/message/run handlers,
@@ -52,71 +63,79 @@ type agentStore interface {
 	Delete(ctx context.Context, agentID, userID string) error
 }
 
+type mcpServerLookup interface {
+	GetEnabledByIDs(ctx context.Context, serverIDs []string) (map[string]mcp.CatalogEntry, error)
+}
+
+var errMCPServerCatalog = errors.New("MCP server catalog unavailable")
+
 type AgentHandler struct {
 	agentRepo    agentStore
 	toolRegistry *tools.ToolRegistry
+	mcpCatalog   mcpServerLookup
 }
 
-func NewAgentHandler(agentRepo agentStore, toolRegistry *tools.ToolRegistry) *AgentHandler {
+func NewAgentHandler(agentRepo agentStore, toolRegistry *tools.ToolRegistry, mcpCatalog mcpServerLookup) *AgentHandler {
 	return &AgentHandler{
 		agentRepo:    agentRepo,
 		toolRegistry: toolRegistry,
+		mcpCatalog:   mcpCatalog,
 	}
 }
 
 type CreateAgentRequest struct {
-	Name               string                `json:"name"`
-	Description        string                `json:"description"`
-	Provider           string                `json:"provider"`
-	Model              string                `json:"model"`
-	SystemPrompt       string                `json:"system_prompt"`
-	Tools              []string              `json:"tools"`
-	Delegates          []DelegateConfigJSON  `json:"delegates"`
-	MCPServers         []MCPServerConfigJSON `json:"mcp_servers"`
-	ContextWindow      *int                  `json:"context_window"`
-	ContextKeepRatio   *float64              `json:"context_keep_ratio"`
-	SummarizationModel string                `json:"summarization_model"`
-	MaxSteps           *int                  `json:"max_steps"`
-	Temperature        *float64              `json:"temperature"`
-	MaxTokens          *int                  `json:"max_tokens"`
-	MaxRuns            *int                  `json:"max_runs"`
+	Name               string                   `json:"name"`
+	Description        string                   `json:"description"`
+	Provider           string                   `json:"provider"`
+	Model              string                   `json:"model"`
+	SystemPrompt       string                   `json:"system_prompt"`
+	Tools              []string                 `json:"tools"`
+	Delegates          []DelegateConfigJSON     `json:"delegates"`
+	MCPServers         []MCPServerSelectionJSON `json:"mcp_servers"`
+	ContextWindow      *int                     `json:"context_window"`
+	ContextKeepRatio   *float64                 `json:"context_keep_ratio"`
+	SummarizationModel string                   `json:"summarization_model"`
+	MaxSteps           *int                     `json:"max_steps"`
+	Temperature        *float64                 `json:"temperature"`
+	MaxTokens          *int                     `json:"max_tokens"`
+	MaxRuns            *int                     `json:"max_runs"`
 }
 
 type UpdateAgentRequest struct {
-	Name               *string                `json:"name"`
-	Description        *string                `json:"description"`
-	Provider           *string                `json:"provider"`
-	Model              *string                `json:"model"`
-	SystemPrompt       *string                `json:"system_prompt"`
-	Tools              *[]string              `json:"tools"`
-	Delegates          *[]DelegateConfigJSON  `json:"delegates"`
-	MCPServers         *[]MCPServerConfigJSON `json:"mcp_servers"`
-	ContextKeepRatio   *float64               `json:"context_keep_ratio"`
-	SummarizationModel *string                `json:"summarization_model"`
-	MaxSteps           *int                   `json:"max_steps"`
-	Temperature        *float64               `json:"temperature"`
-	MaxTokens          *int                   `json:"max_tokens"`
-	MaxRuns            *int                   `json:"max_runs"`
+	Name               *string                   `json:"name"`
+	Description        *string                   `json:"description"`
+	Provider           *string                   `json:"provider"`
+	Model              *string                   `json:"model"`
+	SystemPrompt       *string                   `json:"system_prompt"`
+	Tools              *[]string                 `json:"tools"`
+	Delegates          *[]DelegateConfigJSON     `json:"delegates"`
+	MCPServers         *[]MCPServerSelectionJSON `json:"mcp_servers"`
+	ContextKeepRatio   *float64                  `json:"context_keep_ratio"`
+	SummarizationModel *string                   `json:"summarization_model"`
+	MaxSteps           *int                      `json:"max_steps"`
+	Temperature        *float64                  `json:"temperature"`
+	MaxTokens          *int                      `json:"max_tokens"`
+	MaxRuns            *int                      `json:"max_runs"`
 }
 
 type AgentResponse struct {
-	ID                 string                `json:"id"`
-	Name               string                `json:"name"`
-	Description        string                `json:"description,omitempty"`
-	Provider           string                `json:"provider"`
-	Model              string                `json:"model"`
-	SystemPrompt       string                `json:"system_prompt"`
-	Tools              []string              `json:"tools"`
-	Delegates          []DelegateConfigJSON  `json:"delegates,omitempty"`
-	MCPServers         []MCPServerConfigJSON `json:"mcp_servers,omitempty"`
-	ContextWindow      int                   `json:"context_window"`
-	ContextKeepRatio   float64               `json:"context_keep_ratio"`
-	SummarizationModel string                `json:"summarization_model,omitempty"`
-	MaxSteps           int                   `json:"max_steps"`
-	Temperature        float64               `json:"temperature"`
-	MaxTokens          int                   `json:"max_tokens"`
-	MaxRuns            int                   `json:"max_runs"`
-	CreatedAt          string                `json:"created_at"`
+	ID                 string                   `json:"id"`
+	Name               string                   `json:"name"`
+	Description        string                   `json:"description,omitempty"`
+	Provider           string                   `json:"provider"`
+	Model              string                   `json:"model"`
+	SystemPrompt       string                   `json:"system_prompt"`
+	Tools              []string                 `json:"tools"`
+	Delegates          []DelegateConfigJSON     `json:"delegates,omitempty"`
+	MCPServers         []MCPServerSelectionJSON `json:"mcp_servers,omitempty"`
+	ContextWindow      int                      `json:"context_window"`
+	ContextKeepRatio   float64                  `json:"context_keep_ratio"`
+	SummarizationModel string                   `json:"summarization_model,omitempty"`
+	MaxSteps           int                      `json:"max_steps"`
+	Temperature        float64                  `json:"temperature"`
+	MaxTokens          int                      `json:"max_tokens"`
+	MaxRuns            int                      `json:"max_runs"`
+	CreatedAt          string                   `json:"created_at"`
 }
 
 func toAgentResponse(a *agent.Agent) AgentResponse {
@@ -205,9 +224,9 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	mcpServers := toMCPServerConfigs(req.MCPServers)
-	if err := validateMCPServers(mcpServers); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	mcpServers := toMCPServerSelections(req.MCPServers)
+	if err := h.validateMCPServers(r.Context(), mcpServers); err != nil {
+		h.writeMCPValidationError(w, err)
 		return
 	}
 
@@ -330,9 +349,9 @@ func (h *AgentHandler) Update(w http.ResponseWriter, r *http.Request) {
 		input.Delegates = &delegates
 	}
 	if req.MCPServers != nil {
-		mcpServers := toMCPServerConfigs(*req.MCPServers)
-		if err := validateMCPServers(mcpServers); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+		mcpServers := toMCPServerSelections(*req.MCPServers)
+		if err := h.validateMCPServers(r.Context(), mcpServers); err != nil {
+			h.writeMCPValidationError(w, err)
 			return
 		}
 		input.MCPServers = &mcpServers
@@ -414,50 +433,79 @@ func delegatesToJSON(in []agent.DelegateConfig) []DelegateConfigJSON {
 	return out
 }
 
-func toMCPServerConfigs(in []MCPServerConfigJSON) []agent.MCPServerConfig {
+func toMCPServerSelections(in []MCPServerSelectionJSON) []agent.MCPServerSelection {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make([]agent.MCPServerConfig, len(in))
+	out := make([]agent.MCPServerSelection, len(in))
 	for i, m := range in {
-		out[i] = agent.MCPServerConfig{Alias: m.Alias, URL: m.URL, BearerEnv: m.BearerEnv}
+		out[i] = agent.MCPServerSelection{ServerID: m.ServerID}
 	}
 	return out
 }
 
-func mcpServersToJSON(in []agent.MCPServerConfig) []MCPServerConfigJSON {
+func mcpServersToJSON(in []agent.MCPServerSelection) []MCPServerSelectionJSON {
 	if len(in) == 0 {
 		return nil
 	}
-	out := make([]MCPServerConfigJSON, len(in))
+	out := make([]MCPServerSelectionJSON, len(in))
 	for i, m := range in {
-		// Only alias/url/bearer_env are ever returned — never a resolved token.
-		out[i] = MCPServerConfigJSON{Alias: m.Alias, URL: m.URL, BearerEnv: m.BearerEnv}
+		out[i] = MCPServerSelectionJSON{ServerID: m.ServerID}
 	}
 	return out
 }
 
-// validateMCPServers enforces provider-safe, unique aliases (so the namespaced
-// mcp__<alias>__<tool> stays valid) and a non-empty url. It does NOT require
-// bearer_env to resolve — the env var may only be present in the runtime.
-func validateMCPServers(servers []agent.MCPServerConfig) error {
+func (h *AgentHandler) validateMCPServers(ctx context.Context, servers []agent.MCPServerSelection) error {
 	if len(servers) == 0 {
 		return nil
 	}
-	seen := make(map[string]bool, len(servers))
+	serverIDs := make([]string, len(servers))
+	seen := make(map[string]struct{}, len(servers))
 	for _, s := range servers {
-		if !toolNameRe.MatchString(s.Alias) {
-			return fmt.Errorf("mcp server alias %q must match [A-Za-z0-9_-]{1,64}", s.Alias)
+		if err := mcp.ValidateServerID(s.ServerID); err != nil {
+			return err
 		}
-		if seen[s.Alias] {
-			return fmt.Errorf("duplicate mcp server alias %q", s.Alias)
+		if _, exists := seen[s.ServerID]; exists {
+			return fmt.Errorf("duplicate MCP server_id %q", s.ServerID)
 		}
-		seen[s.Alias] = true
-		if strings.TrimSpace(s.URL) == "" {
-			return fmt.Errorf("mcp server %q requires a url", s.Alias)
+		seen[s.ServerID] = struct{}{}
+	}
+	for i, server := range servers {
+		serverIDs[i] = server.ServerID
+	}
+	if h.mcpCatalog == nil {
+		return errMCPServerCatalog
+	}
+	entries, err := h.mcpCatalog.GetEnabledByIDs(ctx, serverIDs)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errMCPServerCatalog, err)
+	}
+	seenAliases := make(map[string]struct{}, len(serverIDs))
+	for _, serverID := range serverIDs {
+		entry, exists := entries[serverID]
+		if !exists {
+			return fmt.Errorf("unknown or disabled MCP server %q", serverID)
 		}
+		if entry.ServerID != serverID {
+			return fmt.Errorf("%w: mismatched server_id", errMCPServerCatalog)
+		}
+		if err := mcp.ValidateCatalogIdentity(entry); err != nil {
+			return fmt.Errorf("%w: invalid entry for %q", errMCPServerCatalog, serverID)
+		}
+		if _, exists := seenAliases[entry.Alias]; exists {
+			return fmt.Errorf("%w: duplicate alias", errMCPServerCatalog)
+		}
+		seenAliases[entry.Alias] = struct{}{}
 	}
 	return nil
+}
+
+func (h *AgentHandler) writeMCPValidationError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errMCPServerCatalog) {
+		writeError(w, http.StatusInternalServerError, "failed to validate MCP servers")
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error())
 }
 
 // effectiveToolsForUpdate returns the tool list to validate delegate-name

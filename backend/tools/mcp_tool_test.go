@@ -63,25 +63,27 @@ func TestMCPDiscoverHappyPath(t *testing.T) {
 	}
 }
 
-func TestValidateMCPServerURLSyntax(t *testing.T) {
+func TestValidateManagedMCPServerURL(t *testing.T) {
 	valid := []string{
+		"http://localhost:8101/mcp",
+		"http://fetch.mcp-system.svc.cluster.local/mcp",
 		"https://example.com/mcp",
 		"https://example.com:8443/mcp?tenant=a",
 	}
 	for _, raw := range valid {
-		if err := ValidateMCPServerURLSyntax(raw); err != nil {
-			t.Errorf("ValidateMCPServerURLSyntax(%q): %v", raw, err)
+		if err := ValidateManagedMCPServerURL(raw); err != nil {
+			t.Errorf("ValidateManagedMCPServerURL(%q): %v", raw, err)
 		}
 	}
 	invalid := []string{
-		"http://example.com/mcp",
+		"ftp://example.com/mcp",
 		"/relative/mcp",
 		"https:///missing-host",
 		"https://token@example.com/mcp",
 	}
 	for _, raw := range invalid {
-		if err := ValidateMCPServerURLSyntax(raw); err == nil {
-			t.Errorf("ValidateMCPServerURLSyntax(%q) succeeded", raw)
+		if err := ValidateManagedMCPServerURL(raw); err == nil {
+			t.Errorf("ValidateManagedMCPServerURL(%q) succeeded", raw)
 		}
 	}
 }
@@ -124,19 +126,19 @@ func TestMCPDiscoverDeterministicOrder(t *testing.T) {
 	}
 }
 
-func TestMCPManagerValidateRejectsHTTPAndLoopback(t *testing.T) {
+func TestMCPManagerValidateAcceptsManagedHTTPAndRejectsUserinfo(t *testing.T) {
 	m := NewMCPManager(http.DefaultClient) // real validator
-	if err := m.validate("http://example.com/mcp"); err == nil {
-		t.Error("expected https-only rejection for http URL")
+	if err := m.validate("http://localhost:8101/mcp"); err != nil {
+		t.Fatalf("managed local URL rejected: %v", err)
 	}
-	if err := m.validate("https://localhost/mcp"); err == nil {
-		t.Error("expected localhost rejection")
+	if err := m.validate("http://token@localhost:8101/mcp"); err == nil {
+		t.Error("expected userinfo rejection")
 	}
 }
 
 func newEchoMCPTool(t *testing.T, srv *httptest.Server) *MCPTool {
 	t.Helper()
-	return newMCPTool(mcp.NewClient(srv.Client(), srv.URL, ""), "demo", mcp.ToolSpec{Name: "echo"})
+	return newMCPTool(mcp.NewClient(srv.Client(), srv.URL), "demo", mcp.ToolSpec{Name: "echo"})
 }
 
 func TestMCPToolExecuteSuccess(t *testing.T) {
@@ -188,7 +190,7 @@ func TestMCPToolExecuteTransportErrorIsSoft(t *testing.T) {
 }
 
 func TestMCPToolDefinitionSchemaFallback(t *testing.T) {
-	cli := mcp.NewClient(http.DefaultClient, "https://x", "")
+	cli := mcp.NewClient(http.DefaultClient, "https://x")
 	// empty / null / whitespace / oversized / non-object → {"type":"object"}
 	fallbackCases := []mcp.ToolSpec{
 		{Name: "a", InputSchema: nil},

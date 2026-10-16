@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentflow-backend
+  namespace: agentflow-system
+  labels:
+    app.kubernetes.io/name: agentflow-backend
+    app.kubernetes.io/part-of: agentflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentflow-backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentflow-backend
+        app.kubernetes.io/part-of: agentflow
+    spec:
+      serviceAccountName: agentflow-backend
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: backend
+          # Replace this placeholder with the immutable digest produced from backend/Dockerfile.
+          image: registry.example/agentflow-backend@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: public-http
+              containerPort: 9090
+            - name: artifact-http
+              containerPort: 9091
+          env:
+            - name: PORT
+              value: "9090"
+            - name: ARTIFACT_LISTEN_ADDR
+              value: ":9091"
+            - name: MANAGED_DEPLOYMENTS_ENABLED
+              value: "true"
+            - name: DEPLOYMENT_NAMESPACE
+              value: agentflow-runtimes
+            - name: DEPLOYMENT_RUNTIME_IMAGE
+              # Replace with the immutable digest produced from backend/Dockerfile.runtime.
+              value: registry.example/agentflow-runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000
+            - name: DEPLOYMENT_ARTIFACT_BASE_URL
+              # Must match the TLS host in 04-artifact-ingress.yaml.
+              value: https://artifacts.agentflow.example.com
+            - name: DEPLOYMENT_CREDENTIAL_SECRET_NAMESPACE
+              value: agentflow-system
+            - name: DEPLOYMENT_CREDENTIAL_SECRET_NAME
+              value: agentflow-provider-credentials
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: MONGO_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agentflow-backend-config
+                  key: MONGO_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agentflow-backend-config
+                  key: REDIS_URL
+                  optional: true
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: agentflow-backend-config
+                  key: JWT_SECRET
+          envFrom:
+            - secretRef:
+                name: agentflow-provider-credentials
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: public-http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: public-http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: temporary-files
+              mountPath: /tmp
+      volumes:
+        - name: temporary-files
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentflow-backend
+  namespace: agentflow-system
+spec:
+  selector:
+    app.kubernetes.io/name: agentflow-backend
+  ports:
+    - name: http
+      port: 80
+      targetPort: public-http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentflow-artifacts
+  namespace: agentflow-system
+spec:
+  selector:
+    app.kubernetes.io/name: agentflow-backend
+  ports:
+    - name: http
+      port: 80
+      targetPort: artifact-http

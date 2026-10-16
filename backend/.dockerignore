@@ -1,0 +1,10 @@
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+coverage.out
+/agentflow-runtime
+/runtime-data/
+/tmp/

@@ -35,7 +35,8 @@ type Agent struct {
 	SystemPrompt       string
 	Tools              []string
 	Delegates          []DelegateConfig
-	MCPServers         []MCPServerConfig
+	MCPServers         []MCPServerSelection
+	MCPConnections     []MCPServerConnection
 	ModelContextLimit  int
 	ContextWindow      int
 	ContextKeepRatio   float64
@@ -58,15 +59,20 @@ type DelegateConfig struct {
 	Instructions string
 }
 
-// MCPServerConfig declares one remote MCP server this agent connects to. At run
-// start the runtime discovers the server's tools (tools/list) and exposes them
-// as mcp__<alias>__<tool>. Alias namespaces those tools; URL is the remote
-// Streamable-HTTP endpoint; BearerEnv names an OS env var holding a static
-// bearer token (empty for no-auth) — the token itself is never persisted.
-type MCPServerConfig struct {
-	Alias     string
-	URL       string
-	BearerEnv string
+// MCPServerSelection is the mutable, persisted MCP configuration chosen for an
+// agent. The catalog owns all connection details; users store only its stable
+// identifier.
+type MCPServerSelection struct {
+	ServerID string
+}
+
+// MCPServerConnection is resolved execution input. Studio preparation fills it
+// from the catalog's studio URL, while published bundles carry the frozen
+// deployment URL. It is never persisted in mutable agent documents.
+type MCPServerConnection struct {
+	ServerID string
+	Alias    string
+	URL      string
 }
 
 // UpdateAgentInput is the storage-neutral patch contract for an agent update: a
@@ -79,7 +85,7 @@ type UpdateAgentInput struct {
 	SystemPrompt       *string
 	Tools              *[]string
 	Delegates          *[]DelegateConfig
-	MCPServers         *[]MCPServerConfig
+	MCPServers         *[]MCPServerSelection
 	Provider           *string
 	Model              *string
 	Temperature        *float64

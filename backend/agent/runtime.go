@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -69,23 +68,16 @@ func (r *AgentRuntime) SetAsyncJobStore(store AsyncJobStore) {
 }
 
 // SetMCPManager wires the MCP discovery manager after construction (optional).
-// When set, a run whose agent has MCPServers discovers their tools at run start
-// and merges them into the tool set. A nil manager disables MCP entirely.
+// When set, a run whose agent has resolved MCPConnections discovers their tools
+// at run start and merges them into the tool set. A nil manager disables MCP.
 func (r *AgentRuntime) SetMCPManager(m *tools.MCPManager) {
 	r.mcpManager = m
 }
 
-// toMCPServerSpecs resolves each agent MCP config into a connection spec,
-// reading the static bearer token from its env var (empty for no-auth). The
-// token is never logged or persisted — only the env var name lives in config.
-func toMCPServerSpecs(cfgs []MCPServerConfig) []tools.MCPServerSpec {
+func toMCPServerSpecs(cfgs []MCPServerConnection) []tools.MCPServerSpec {
 	specs := make([]tools.MCPServerSpec, 0, len(cfgs))
 	for _, c := range cfgs {
-		token := ""
-		if c.BearerEnv != "" {
-			token = os.Getenv(c.BearerEnv)
-		}
-		specs = append(specs, tools.MCPServerSpec{Alias: c.Alias, URL: c.URL, BearerToken: token})
+		specs = append(specs, tools.MCPServerSpec{Alias: c.Alias, URL: c.URL})
 	}
 	return specs
 }
@@ -229,8 +221,8 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 	// for definitions/execution. They are excluded from the resume identity
 	// (ToolSet.Refs/Version), so a down or drifted server never blocks a resume.
 	// Discovery never fails the run: an unreachable server degrades to a note.
-	if r.mcpManager != nil && len(agent.MCPServers) > 0 {
-		mcpTools, unavailable := r.mcpManager.Discover(ctx, toMCPServerSpecs(agent.MCPServers))
+	if r.mcpManager != nil && len(agent.MCPConnections) > 0 {
+		mcpTools, unavailable := r.mcpManager.Discover(ctx, toMCPServerSpecs(agent.MCPConnections))
 		toolSet.AddMCPTools(mcpTools)
 		runCtx.MCPUnavailable = unavailable
 	}

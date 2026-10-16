@@ -2,14 +2,12 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,13 +35,13 @@ type appConfig struct {
 	logger         *slog.Logger
 	providers      *llm.LLMRegistry
 	mcpManager     *tools.MCPManager
-	lookupEnv      func(string) (string, bool)
 	validateMCPURL func(string) error
+	managedStorage *managedStorageContext
 }
 
 type runtimeApp struct {
 	server          *http.Server
-	db              *sql.DB
+	storage         *runtimeStorage
 	bus             *bus.InProcBus
 	pools           *dispatcher.PoolManager
 	cancelRuntime   context.CancelFunc
@@ -71,7 +69,10 @@ func newRuntimeApp(parent context.Context, cfg appConfig) (_ *runtimeApp, err er
 	if err := cfg.bundle.VerifyHash(); err != nil {
 		return nil, err
 	}
-	if err := cfg.bundle.ValidateEnvironmentWith(cfg.lookupEnv, cfg.validateMCPURL); err != nil {
+	if err := cfg.bundle.ValidateMCPConnections(cfg.validateMCPURL); err != nil {
+		return nil, err
+	}
+	if err := cfg.managedStorage.validate(cfg.bundle); err != nil {
 		return nil, err
 	}
 	providers := cfg.providers
@@ -89,26 +90,19 @@ func newRuntimeApp(parent context.Context, cfg appConfig) (_ *runtimeApp, err er
 		return nil, fmt.Errorf("runtime: create data directory: %w", err)
 	}
 
-	database, err := sqliterepo.Open(filepath.Join(cfg.dataDir, "state.db"), sqliterepo.Options{})
+	storage, err := openRuntimeStorage(parent, cfg.dataDir, cfg.bundle, cfg.managedStorage)
 	if err != nil {
 		return nil, err
 	}
-	app := &runtimeApp{db: database}
+	app := &runtimeApp{storage: storage}
 	defer func() {
 		if err != nil {
 			_ = app.closeResources(context.Background())
 		}
 	}()
 
-	userID := cfg.bundle.SyntheticUserID()
-	identityRepo := sqliterepo.NewDeploymentIdentityRepo(database)
-	if err = identityRepo.Bind(parent, sqliterepo.DeploymentBinding{
-		DeploymentID: cfg.bundle.DeploymentID, ConfigHash: cfg.bundle.ConfigHash, SyntheticUserID: userID,
-	}); err != nil {
-		return nil, err
-	}
-
-	runRepo := sqliterepo.NewRunRepo(database)
+	userID := storage.runtimePrincipalID
+	runRepo := sqliterepo.NewRunRepo(storage.executionDB)
 	recovery, err := runRepo.RecoverOrphanedRuns(parent, userID)
 	if err != nil {
 		return nil, err
@@ -116,25 +110,25 @@ func newRuntimeApp(parent context.Context, cfg appConfig) (_ *runtimeApp, err er
 	if recovery.Interrupted > 0 || recovery.Failed > 0 {
 		cfg.logger.Info("recovered orphaned runs", "interrupted", recovery.Interrupted, "failed", recovery.Failed)
 	}
-	threadRepo := sqliterepo.NewThreadRepo(database)
-	messageRepo := sqliterepo.NewMessageRepo(database)
-	taskRepo := sqliterepo.NewTaskRepo(database)
-	jobRepo := sqliterepo.NewJobRepo(database)
+	threadRepo := sqliterepo.NewThreadRepo(storage.sharedDB)
+	messageRepo := sqliterepo.NewMessageRepo(storage.sharedDB)
+	taskRepo := sqliterepo.NewTaskRepo(storage.executionDB)
+	jobRepo := sqliterepo.NewJobRepo(storage.executionDB)
 	jobRepo.SetTaskBudgetStore(taskRepo)
-	memoryMetaRepo := sqliterepo.NewMemoryMetaRepo(database)
-	memoryRevisionRepo := sqliterepo.NewMemoryRevisionRepo(database)
+	memoryMetaRepo := sqliterepo.NewMemoryMetaRepo(storage.sharedDB)
+	memoryRevisionRepo := sqliterepo.NewMemoryRevisionRepo(storage.sharedDB)
 
 	runtimeCtx, cancelRuntime := context.WithCancel(parent)
 	app.cancelRuntime = cancelRuntime
 	memorySvc := memory.NewService(memory.Config{
-		Root: filepath.Join(cfg.dataDir, "memory"), RGPath: os.Getenv("RG_PATH"),
+		Root: storage.memoryRoot, RGPath: os.Getenv("RG_PATH"),
 	}, memoryMetaRepo, memoryRevisionRepo)
 	if err = memorySvc.ValidateStartup(); err != nil {
 		return nil, err
 	}
 	memorySvc.StartCleanupWorker(runtimeCtx, 7*24*time.Hour)
 	scratchpadSvc := scratchpad.NewService(scratchpad.Config{
-		Root: filepath.Join(cfg.dataDir, "scratchpad"), RGPath: os.Getenv("RG_PATH"),
+		Root: storage.scratchpadRoot, RGPath: os.Getenv("RG_PATH"),
 	})
 	if err = scratchpadSvc.ValidateStartup(); err != nil {
 		return nil, err
@@ -249,8 +243,8 @@ func (a *runtimeApp) closeResources(ctx context.Context) error {
 		if a.bus != nil {
 			closeErr = errors.Join(closeErr, a.bus.Close())
 		}
-		if a.db != nil {
-			closeErr = errors.Join(closeErr, a.db.Close())
+		if a.storage != nil {
+			closeErr = errors.Join(closeErr, a.storage.close(ctx))
 		}
 	})
 	return closeErr
@@ -267,7 +261,7 @@ func (a *runtimeApp) readiness(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
 	defer cancel()
-	if err := a.db.PingContext(ctx); err != nil {
+	if a.storage == nil || a.storage.ping(ctx) != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
 		return
 	}

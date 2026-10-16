@@ -13,6 +13,7 @@ import (
 
 	"backend/agent"
 	"backend/llm"
+	"backend/mcp"
 	"backend/tools"
 )
 
@@ -23,7 +24,6 @@ const (
 
 var (
 	providerNameRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	envNameRE      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	hashRE         = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
@@ -64,9 +64,9 @@ type BundleDelegate struct {
 }
 
 type BundleMCPServer struct {
-	Alias     string `json:"alias"`
-	URL       string `json:"url"`
-	BearerEnv string `json:"bearer_env"`
+	ServerID string `json:"server_id"`
+	Alias    string `json:"alias"`
+	URL      string `json:"url"`
 }
 
 // Read decodes and statically validates a bundle without checking its declared
@@ -265,17 +265,22 @@ func validateAgent(a BundleAgent) error {
 		seenDelegates[d.ToolName] = struct{}{}
 	}
 	seenAliases := map[string]struct{}{}
+	seenServerIDs := map[string]struct{}{}
 	for _, s := range a.MCPServers {
+		if err := mcp.ValidateServerID(s.ServerID); err != nil {
+			return fmt.Errorf("deployment: agent %q has invalid MCP server: %w", a.ID, err)
+		}
 		if !providerNameRE.MatchString(s.Alias) || strings.TrimSpace(s.URL) == "" {
 			return fmt.Errorf("deployment: agent %q has invalid MCP server %q", a.ID, s.Alias)
 		}
+		if _, ok := seenServerIDs[s.ServerID]; ok {
+			return fmt.Errorf("deployment: agent %q has duplicate MCP server_id %q", a.ID, s.ServerID)
+		}
+		seenServerIDs[s.ServerID] = struct{}{}
 		if _, ok := seenAliases[s.Alias]; ok {
 			return fmt.Errorf("deployment: agent %q has duplicate MCP alias %q", a.ID, s.Alias)
 		}
 		seenAliases[s.Alias] = struct{}{}
-		if s.BearerEnv != "" && !envNameRE.MatchString(s.BearerEnv) {
-			return fmt.Errorf("deployment: agent %q has invalid bearer_env %q", a.ID, s.BearerEnv)
-		}
 	}
 	return nil
 }
@@ -324,29 +329,14 @@ func validateGraph(root string, agents map[string]BundleAgent) error {
 	return nil
 }
 
-func (b *Bundle) ValidateEnvironment(lookup func(string) (string, bool)) error {
-	return b.ValidateEnvironmentWith(lookup, tools.ValidateMCPServerURL)
-}
-
-// ValidateEnvironmentWith validates secret references and MCP URLs using
-// caller-supplied process/environment boundaries. Production passes the real
-// OS lookup and HTTPS/SSRF validator; composition tests inject equivalents
-// without weakening the builder's single validation choke point.
-func (b *Bundle) ValidateEnvironmentWith(lookup func(string) (string, bool), validateURL func(string) error) error {
-	if lookup == nil {
-		lookup = os.LookupEnv
-	}
+// ValidateMCPConnections validates the trusted URLs frozen into the bundle.
+// It performs no environment lookup because managed MCP is explicitly no-auth.
+func (b *Bundle) ValidateMCPConnections(validateURL func(string) error) error {
 	if validateURL == nil {
-		validateURL = tools.ValidateMCPServerURL
+		validateURL = tools.ValidateManagedMCPServerURL
 	}
 	for _, a := range b.Agents {
 		for _, s := range a.MCPServers {
-			if s.BearerEnv != "" {
-				value, ok := lookup(s.BearerEnv)
-				if !ok || strings.TrimSpace(value) == "" {
-					return fmt.Errorf("deployment: agent %q MCP server %q requires nonempty environment variable %s", a.ID, s.Alias, s.BearerEnv)
-				}
-			}
 			if err := validateURL(s.URL); err != nil {
 				return fmt.Errorf("deployment: agent %q MCP server %q: %w", a.ID, s.Alias, err)
 			}
@@ -377,7 +367,7 @@ func (b *Bundle) ValidateForPublication(registry *tools.ToolRegistry, capabiliti
 			return fmt.Errorf("deployment: agent %q uses unsupported provider %q", cfg.ID, cfg.Provider)
 		}
 		for _, server := range cfg.MCPServers {
-			if err := tools.ValidateMCPServerURLSyntax(server.URL); err != nil {
+			if err := tools.ValidateManagedMCPServerURL(server.URL); err != nil {
 				return fmt.Errorf("deployment: agent %q MCP server %q: %w", cfg.ID, server.Alias, err)
 			}
 		}
@@ -388,7 +378,7 @@ func (b *Bundle) ValidateForPublication(registry *tools.ToolRegistry, capabiliti
 	return nil
 }
 
-func BundleAgentFromAgent(a *agent.Agent) (BundleAgent, error) {
+func BundleAgentFromAgent(a *agent.Agent, connections []agent.MCPServerConnection) (BundleAgent, error) {
 	if a == nil {
 		return BundleAgent{}, fmt.Errorf("deployment: agent is nil")
 	}
@@ -429,9 +419,9 @@ func BundleAgentFromAgent(a *agent.Agent) (BundleAgent, error) {
 	for i, d := range a.Delegates {
 		delegates[i] = BundleDelegate{AgentID: d.AgentID, ToolName: d.ToolName, Description: d.Description, Instructions: d.Instructions}
 	}
-	servers := make([]BundleMCPServer, len(a.MCPServers))
-	for i, server := range a.MCPServers {
-		servers[i] = BundleMCPServer{Alias: server.Alias, URL: server.URL, BearerEnv: server.BearerEnv}
+	servers := make([]BundleMCPServer, len(connections))
+	for i, server := range connections {
+		servers[i] = BundleMCPServer{ServerID: server.ServerID, Alias: server.Alias, URL: server.URL}
 	}
 	toolsCopy := append([]string{}, a.Tools...)
 	return BundleAgent{
@@ -448,13 +438,16 @@ func (a BundleAgent) Agent() *agent.Agent {
 	for i, d := range a.Delegates {
 		delegates[i] = agent.DelegateConfig{AgentID: d.AgentID, ToolName: d.ToolName, Description: d.Description, Instructions: d.Instructions}
 	}
-	servers := make([]agent.MCPServerConfig, len(a.MCPServers))
+	selections := make([]agent.MCPServerSelection, len(a.MCPServers))
+	connections := make([]agent.MCPServerConnection, len(a.MCPServers))
 	for i, s := range a.MCPServers {
-		servers[i] = agent.MCPServerConfig{Alias: s.Alias, URL: s.URL, BearerEnv: s.BearerEnv}
+		selections[i] = agent.MCPServerSelection{ServerID: s.ServerID}
+		connections[i] = agent.MCPServerConnection{ServerID: s.ServerID, Alias: s.Alias, URL: s.URL}
 	}
 	return &agent.Agent{
 		ID: a.ID, Name: a.Name, Description: a.Description, Provider: a.Provider, Model: a.Model,
-		SystemPrompt: a.SystemPrompt, Tools: append([]string(nil), a.Tools...), Delegates: delegates, MCPServers: servers,
+		SystemPrompt: a.SystemPrompt, Tools: append([]string(nil), a.Tools...), Delegates: delegates,
+		MCPServers: selections, MCPConnections: connections,
 		ModelContextLimit: a.ModelContextLimit, ContextWindow: a.ContextWindow, ContextKeepRatio: a.ContextKeepRatio,
 		SummarizationModel: a.SummarizationModel, MaxSteps: a.MaxSteps, Temperature: a.Temperature,
 		MaxTokens: a.MaxTokens, MaxRuns: a.MaxRuns,

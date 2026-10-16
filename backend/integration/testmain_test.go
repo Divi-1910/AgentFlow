@@ -108,7 +108,7 @@ func newTestEnvWithRuntime(t *testing.T, rt runtimeFn) *testEnv {
 
 	// Handlers ────────────────────────────────────────────────────────────────
 	authHandler := handlers.NewAuthHandler(userRepo, nil) // nil → real auth.GenerateToken
-	agentHandler := handlers.NewAgentHandler(agentRepo, toolReg)
+	agentHandler := handlers.NewAgentHandler(agentRepo, toolReg, nil)
 	threadHandler := handlers.NewThreadHandler(threadRepo, agentRepo)
 	msgHandler := handlers.NewMessageHandler(
 		agentRepo, threadRepo, messageRepo, rt, runRepo,

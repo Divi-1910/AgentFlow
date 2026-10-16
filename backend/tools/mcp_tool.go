@@ -33,12 +33,11 @@ const (
 // whose mcp__<alias>__<tool> name has invalid chars or is too long is skipped.
 var mcpToolNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
-// MCPServerSpec is a resolved MCP connection (bearer already pulled from the
-// env; empty for no-auth). Alias namespaces the tools as mcp__<alias>__<tool>.
+// MCPServerSpec is a resolved connection to an AgentFlow-managed no-auth MCP
+// endpoint. Alias namespaces the tools as mcp__<alias>__<tool>.
 type MCPServerSpec struct {
-	Alias       string
-	URL         string
-	BearerToken string
+	Alias string
+	URL   string
 }
 
 // MCPTool adapts one discovered MCP tool to the Tool interface; Execute proxies
@@ -114,50 +113,35 @@ func (t *MCPTool) Execute(ctx context.Context, call ToolCall) (*ToolResult, erro
 // MCPManager discovers tools from remote MCP servers at run start.
 type MCPManager struct {
 	httpClient *http.Client
-	validate   func(rawURL string) error // https + SSRF guard; overridable in tests
+	validate   func(rawURL string) error
 }
 
 func NewMCPManager(httpClient *http.Client) *MCPManager {
-	return NewMCPManagerWithURLValidator(httpClient, ValidateMCPServerURL)
+	return NewMCPManagerWithURLValidator(httpClient, ValidateManagedMCPServerURL)
 }
 
 // NewMCPManagerWithURLValidator permits composition tests to use local MCP
-// servers while production continues to call NewMCPManager's HTTPS/SSRF
-// policy. A nil validator falls back to the production policy.
+// servers. A nil validator falls back to the managed-endpoint policy.
 func NewMCPManagerWithURLValidator(httpClient *http.Client, validate func(string) error) *MCPManager {
 	if validate == nil {
-		validate = ValidateMCPServerURL
+		validate = ValidateManagedMCPServerURL
 	}
 	return &MCPManager{
 		httpClient: httpClient,
-		// validate requires https + the shared SSRF guard. NOTE: like the HTTP
-		// tool, the SSRF check resolves DNS at check time, not dial time — a
-		// DNS-rebinding host could pass here and resolve to a private IP at the
-		// actual request. Accepted inherited risk for v1 (the operator controls
-		// these URLs); a dial-time IP guard would close it later.
-		validate: validate,
+		validate:   validate,
 	}
 }
 
-// ValidateMCPServerURL applies the same transport and SSRF policy used by live
-// MCP discovery. Deployment loaders call it at boot so a frozen bundle cannot
-// contain a URL the runtime will deterministically refuse later.
-func ValidateMCPServerURL(rawURL string) error {
-	if err := ValidateMCPServerURLSyntax(rawURL); err != nil {
-		return err
-	}
-	return checkSSRF(rawURL, defaultBlockedCIDRs())
-}
-
-// ValidateMCPServerURLSyntax performs publication-safe validation without DNS
-// or network access. Full runtime validation adds the SSRF resolution check.
-func ValidateMCPServerURLSyntax(rawURL string) error {
+// ValidateManagedMCPServerURL validates trusted catalog-produced Studio and
+// deployment URLs. HTTP is intentionally allowed for local processes and
+// cluster Services; user-controlled arbitrary MCP URLs are not a product path.
+func ValidateManagedMCPServerURL(rawURL string) error {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid MCP url: %w", err)
 	}
-	if parsed.Scheme != "https" {
-		return fmt.Errorf("MCP url must be https, got %q", parsed.Scheme)
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("MCP url must use http or https, got %q", parsed.Scheme)
 	}
 	if parsed.Host == "" || parsed.Hostname() == "" {
 		return fmt.Errorf("MCP url requires a host")
@@ -208,7 +192,7 @@ func (m *MCPManager) discoverOne(ctx context.Context, spec MCPServerSpec) ([]Too
 	}
 	cctx, cancel := context.WithTimeout(ctx, mcpDiscoverTimeout)
 	defer cancel()
-	client := mcp.NewClient(m.httpClient, spec.URL, spec.BearerToken)
+	client := mcp.NewClient(m.httpClient, spec.URL)
 	if err := client.Initialize(cctx); err != nil {
 		return nil, err
 	}

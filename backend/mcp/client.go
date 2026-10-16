@@ -34,18 +34,15 @@ const (
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
-	bearer     string
 
 	sessionID       string
 	protocolVersion string
 	nextID          atomic.Int64
 }
 
-// NewClient builds a client for one MCP endpoint. bearer is the static token
-// (empty for no-auth servers); it is sent as Authorization: Bearer and is never
-// logged or placed in the URL.
-func NewClient(httpClient *http.Client, baseURL, bearer string) *Client {
-	return &Client{httpClient: httpClient, baseURL: baseURL, bearer: bearer}
+// NewClient builds a client for one AgentFlow-managed, no-auth MCP endpoint.
+func NewClient(httpClient *http.Client, baseURL string) *Client {
+	return &Client{httpClient: httpClient, baseURL: baseURL}
 }
 
 // Initialize performs the MCP handshake: initialize → capture session id +
@@ -207,9 +204,6 @@ func (c *Client) post(ctx context.Context, body []byte) (*http.Response, error) 
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if c.bearer != "" {
-		req.Header.Set("Authorization", "Bearer "+c.bearer)
-	}
 	if c.sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", c.sessionID)
 	}

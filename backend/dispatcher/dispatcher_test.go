@@ -11,6 +11,7 @@ import (
 	"backend/agent"
 	"backend/bus"
 	"backend/llm"
+	"backend/mcp"
 	"backend/tools"
 )
 
@@ -439,8 +440,59 @@ func (f *fakeRuntime) EstimateSystemPromptTokens(ctx context.Context, ag *agent.
 	return 0
 }
 
+func TestRunPreparerResolvesStudioMCPConnections(t *testing.T) {
+	agentObj := &agent.Agent{
+		ID: testAgentID, Provider: "fake", Model: "fake", MaxSteps: 5,
+		MCPServers: []agent.MCPServerSelection{{ServerID: "fetch"}},
+	}
+	preparer := NewRunPreparer(RunPreparerConfig{
+		Agents:   &fakeAgentStore{agent: agentObj},
+		Threads:  &fakeThreadStore{thread: &agent.ThreadRecord{ID: testThreadID, AgentID: testAgentID, UserID: testUserID}},
+		Messages: &fakeMessageStore{}, Runtime: &fakeRuntime{},
+		MCPServers: fakeMCPServerCatalog{entries: map[string]mcp.CatalogEntry{
+			"fetch": {ServerID: "fetch", Name: "Fetch", Alias: "fetch", StudioURL: "http://localhost:8102/mcp", Enabled: true},
+		}},
+	})
+	prepared, err := preparer.Prepare(context.Background(), freshDispatchRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	connections := prepared.Agent.MCPConnections
+	if len(connections) != 1 || connections[0].ServerID != "fetch" || connections[0].Alias != "fetch" ||
+		connections[0].URL != "http://localhost:8102/mcp" {
+		t.Fatalf("resolved connections = %+v", connections)
+	}
+	if len(agentObj.MCPConnections) != 0 {
+		t.Fatalf("source agent was mutated: %+v", agentObj.MCPConnections)
+	}
+}
+
+func TestRunPreparerRejectsMissingMCPSelection(t *testing.T) {
+	agentObj := &agent.Agent{
+		ID: testAgentID, Provider: "fake", Model: "fake", MaxSteps: 5,
+		MCPServers: []agent.MCPServerSelection{{ServerID: "missing"}},
+	}
+	preparer := NewRunPreparer(RunPreparerConfig{
+		Agents:   &fakeAgentStore{agent: agentObj},
+		Threads:  &fakeThreadStore{thread: &agent.ThreadRecord{ID: testThreadID, AgentID: testAgentID, UserID: testUserID}},
+		Messages: &fakeMessageStore{}, Runtime: &fakeRuntime{},
+		MCPServers: fakeMCPServerCatalog{entries: map[string]mcp.CatalogEntry{}},
+	})
+	if _, err := preparer.Prepare(context.Background(), freshDispatchRequest()); err == nil {
+		t.Fatal("Prepare accepted a missing MCP catalog selection")
+	}
+}
+
 type fakeAgentStore struct {
 	agent *agent.Agent
+}
+
+type fakeMCPServerCatalog struct {
+	entries map[string]mcp.CatalogEntry
+}
+
+func (f fakeMCPServerCatalog) GetEnabledByIDs(context.Context, []string) (map[string]mcp.CatalogEntry, error) {
+	return f.entries, nil
 }
 
 func (f *fakeAgentStore) Create(context.Context, string, *agent.Agent) (*agent.Agent, error) {

@@ -58,6 +58,28 @@ func TestAgentRepoCreateAndGetByID(t *testing.T) {
 	}
 }
 
+func TestAgentRepoRoundTripsMCPServerSelections(t *testing.T) {
+	r := agentRepo(t)
+	ctx := context.Background()
+	input := testAgent("with-mcp")
+	input.MCPServers = []agent.MCPServerSelection{{ServerID: "fetch"}, {ServerID: "open-meteo"}}
+	created, err := r.Create(ctx, userA, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created.MCPServers) != 2 || created.MCPServers[0].ServerID != "fetch" || created.MCPServers[1].ServerID != "open-meteo" {
+		t.Fatalf("created selections = %+v", created.MCPServers)
+	}
+	replacement := []agent.MCPServerSelection{{ServerID: "math-utilities"}}
+	updated, err := r.Update(ctx, created.ID, userA, agent.UpdateAgentInput{MCPServers: &replacement})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.MCPServers) != 1 || updated.MCPServers[0].ServerID != "math-utilities" {
+		t.Fatalf("updated selections = %+v", updated.MCPServers)
+	}
+}
+
 func TestAgentRepoGetByIDWrongUserReturnsNotFound(t *testing.T) {
 	r := agentRepo(t)
 	ctx := context.Background()

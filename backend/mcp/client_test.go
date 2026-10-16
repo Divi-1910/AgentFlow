@@ -29,9 +29,9 @@ func decodeReq(t *testing.T, r *http.Request) rpcReq {
 	return req
 }
 
-func newClient(t *testing.T, url, bearer string) *Client {
+func newClient(t *testing.T, url string) *Client {
 	t.Helper()
-	return NewClient(&http.Client{Timeout: 5 * time.Second}, url, bearer)
+	return NewClient(&http.Client{Timeout: 5 * time.Second}, url)
 }
 
 // A full handshake + tools/list (application/json) + the header/session contract.
@@ -72,7 +72,7 @@ func TestInitializeListToolsJSON(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newClient(t, srv.URL, "")
+	c := newClient(t, srv.URL)
 	ctx := context.Background()
 	if err := c.Initialize(ctx); err != nil {
 		t.Fatalf("Initialize: %v", err)
@@ -102,8 +102,8 @@ func TestInitializeListToolsJSON(t *testing.T) {
 }
 
 // tools/call delivered as text/event-stream, with an interleaved server
-// notification the client must skip, plus the bearer header.
-func TestCallToolEventStreamAndBearer(t *testing.T) {
+// notification the client must skip. Managed MCP never sends Authorization.
+func TestCallToolEventStreamWithoutAuthorization(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req := decodeReq(t, r)
@@ -122,7 +122,7 @@ func TestCallToolEventStreamAndBearer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newClient(t, srv.URL, "secret-token")
+	c := newClient(t, srv.URL)
 	res, err := c.CallTool(context.Background(), "echo", json.RawMessage(`{"msg":"hi"}`))
 	if err != nil {
 		t.Fatalf("CallTool: %v", err)
@@ -133,8 +133,8 @@ func TestCallToolEventStreamAndBearer(t *testing.T) {
 	if res.IsError {
 		t.Fatal("unexpected IsError")
 	}
-	if gotAuth != "Bearer secret-token" {
-		t.Fatalf("Authorization = %q", gotAuth)
+	if gotAuth != "" {
+		t.Fatalf("Authorization must be absent, got %q", gotAuth)
 	}
 }
 
@@ -147,7 +147,7 @@ func TestCallToolRPCError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newClient(t, srv.URL, "")
+	c := newClient(t, srv.URL)
 	if _, err := c.CallTool(context.Background(), "echo", nil); err == nil {
 		t.Fatal("expected error from JSON-RPC error object")
 	}
@@ -162,7 +162,7 @@ func TestCallToolToolError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newClient(t, srv.URL, "")
+	c := newClient(t, srv.URL)
 	res, err := c.CallTool(context.Background(), "echo", nil)
 	if err != nil {
 		t.Fatalf("tool-level error must not be a transport error: %v", err)
@@ -189,7 +189,7 @@ func TestListToolsPagination(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newClient(t, srv.URL, "")
+	c := newClient(t, srv.URL)
 	tools, err := c.ListTools(context.Background())
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
@@ -207,7 +207,7 @@ func TestJSONResponseIDMismatchRejected(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newClient(t, srv.URL, "")
+	c := newClient(t, srv.URL)
 	if err := c.Initialize(context.Background()); err == nil {
 		t.Fatal("expected rejection of a mismatched response id")
 	}
@@ -221,7 +221,7 @@ func TestJSONResultMissingIDRejected(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newClient(t, srv.URL, "")
+	c := newClient(t, srv.URL)
 	if err := c.Initialize(context.Background()); err == nil {
 		t.Fatal("expected rejection of a successful result with no id")
 	}
@@ -236,7 +236,7 @@ func TestJSONErrorNullIDTolerated(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newClient(t, srv.URL, "")
+	c := newClient(t, srv.URL)
 	err := c.Initialize(context.Background())
 	if err == nil {
 		t.Fatal("expected the rpc error to surface")
@@ -253,7 +253,7 @@ func TestHTTPErrorStatus(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newClient(t, srv.URL, "")
+	c := newClient(t, srv.URL)
 	if err := c.Initialize(context.Background()); err == nil {
 		t.Fatal("expected error on 401")
 	}

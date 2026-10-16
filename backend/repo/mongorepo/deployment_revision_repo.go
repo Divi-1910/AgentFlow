@@ -1,6 +1,7 @@
 package mongorepo
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -25,21 +26,30 @@ func NewDeploymentRevisionRepo(col *mongo.Collection) *DeploymentRevisionRepo {
 }
 
 type deploymentRevisionBSON struct {
-	ID            bson.ObjectID `bson:"_id,omitempty"`
-	UserID        bson.ObjectID `bson:"user_id"`
-	DeploymentID  string        `bson:"deployment_id"`
-	RootAgentID   string        `bson:"root_agent_id"`
-	Revision      int           `bson:"revision"`
-	ConfigHash    string        `bson:"config_hash"`
-	SchemaVersion int           `bson:"schema_version"`
-	BundleJSON    []byte        `bson:"bundle_json"`
-	CreatedAt     time.Time     `bson:"created_at"`
+	ID             bson.ObjectID `bson:"_id,omitempty"`
+	UserID         bson.ObjectID `bson:"user_id"`
+	DeploymentID   string        `bson:"deployment_id"`
+	RootAgentID    string        `bson:"root_agent_id"`
+	Revision       int           `bson:"revision"`
+	IdempotencyKey string        `bson:"idempotency_key,omitempty"`
+	SourceRevision int           `bson:"source_revision,omitempty"`
+	ConfigHash     string        `bson:"config_hash"`
+	SchemaVersion  int           `bson:"schema_version"`
+	BundleJSON     []byte        `bson:"bundle_json"`
+	CreatedAt      time.Time     `bson:"created_at"`
 }
 
 func (r *DeploymentRevisionRepo) EnsureIndexes(ctx context.Context) error {
 	// Phase 4 initially shipped deployment-global unique indexes. Remove those
 	// named definitions before installing the tenant-qualified replacements.
-	for _, name := range []string{"deployment_revisions_revision_unique", "deployment_revisions_hash_unique"} {
+	// The first owner-qualified hash index was also unique. Forward-only
+	// revisions deliberately allow repeated content, so that definition must be
+	// removed before the non-unique lookup index can be created.
+	for _, name := range []string{
+		"deployment_revisions_revision_unique",
+		"deployment_revisions_hash_unique",
+		"deployment_revisions_owner_hash_unique",
+	} {
 		if err := r.col.Indexes().DropOne(ctx, name); err != nil && !isIndexNotFound(err) {
 			return fmt.Errorf("deployment_revision_repo: drop legacy index %s: %w", name, err)
 		}
@@ -51,7 +61,14 @@ func (r *DeploymentRevisionRepo) EnsureIndexes(ctx context.Context) error {
 		},
 		{
 			Keys:    bson.D{{Key: "user_id", Value: 1}, {Key: "deployment_id", Value: 1}, {Key: "config_hash", Value: 1}},
-			Options: options.Index().SetUnique(true).SetName("deployment_revisions_owner_hash_unique"),
+			Options: options.Index().SetName("deployment_revisions_owner_hash"),
+		},
+		{
+			Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "deployment_id", Value: 1}, {Key: "idempotency_key", Value: 1}},
+			Options: options.Index().
+				SetUnique(true).
+				SetName("deployment_revisions_owner_idempotency_unique").
+				SetPartialFilterExpression(bson.D{{Key: "idempotency_key", Value: bson.D{{Key: "$type", Value: "string"}}}}),
 		},
 	}
 	if _, err := r.col.Indexes().CreateMany(ctx, indexes); err != nil {
@@ -70,10 +87,10 @@ func (r *DeploymentRevisionRepo) Append(ctx context.Context, input deployment.Re
 	if err != nil {
 		return nil, false, err
 	}
-	if existing, err := r.findByHash(ctx, uid, input.DeploymentID, input.ConfigHash); err != nil {
+	if existing, err := r.findByIdempotencyKey(ctx, uid, input.DeploymentID, input.IdempotencyKey); err != nil {
 		return nil, false, err
 	} else if existing != nil {
-		return existing, true, nil
+		return replayedRevision(existing, input)
 	}
 
 	for attempt := 0; attempt < maxRevisionInsertAttempts; attempt++ {
@@ -86,7 +103,8 @@ func (r *DeploymentRevisionRepo) Append(ctx context.Context, input deployment.Re
 		}
 		raw := deploymentRevisionBSON{
 			ID: bson.NewObjectID(), UserID: uid, DeploymentID: input.DeploymentID, RootAgentID: input.RootAgentID,
-			Revision: latest + 1, ConfigHash: input.ConfigHash, SchemaVersion: input.SchemaVersion,
+			Revision: latest + 1, IdempotencyKey: input.IdempotencyKey, SourceRevision: input.SourceRevision,
+			ConfigHash: input.ConfigHash, SchemaVersion: input.SchemaVersion,
 			BundleJSON: append([]byte(nil), input.BundleJSON...), CreatedAt: time.Now().UTC().Truncate(time.Millisecond),
 		}
 		if _, err := r.col.InsertOne(ctx, raw); err == nil {
@@ -95,10 +113,10 @@ func (r *DeploymentRevisionRepo) Append(ctx context.Context, input deployment.Re
 		} else if !mongo.IsDuplicateKeyError(err) {
 			return nil, false, fmt.Errorf("deployment_revision_repo: append: %w", err)
 		}
-		if existing, err := r.findByHash(ctx, uid, input.DeploymentID, input.ConfigHash); err != nil {
+		if existing, err := r.findByIdempotencyKey(ctx, uid, input.DeploymentID, input.IdempotencyKey); err != nil {
 			return nil, false, err
 		} else if existing != nil {
-			return existing, true, nil
+			return replayedRevision(existing, input)
 		}
 	}
 	return nil, false, fmt.Errorf("deployment_revision_repo: allocate revision after %d attempts", maxRevisionInsertAttempts)
@@ -163,6 +181,12 @@ func validateRevisionInput(input deployment.RevisionInput) (bson.ObjectID, error
 	if input.DeploymentID == "" || input.RootAgentID == "" {
 		return bson.NilObjectID, fmt.Errorf("deployment_revision_repo: deployment and root agent ids are required")
 	}
+	if err := deployment.ValidateRevisionIdempotencyKey(input.IdempotencyKey); err != nil {
+		return bson.NilObjectID, fmt.Errorf("deployment_revision_repo: %w", err)
+	}
+	if input.SourceRevision < 0 {
+		return bson.NilObjectID, fmt.Errorf("deployment_revision_repo: source revision cannot be negative")
+	}
 	if !deploymentHashRE.MatchString(input.ConfigHash) {
 		return bson.NilObjectID, fmt.Errorf("deployment_revision_repo: invalid config hash")
 	}
@@ -178,20 +202,29 @@ func validateRevisionInput(input deployment.RevisionInput) (bson.ObjectID, error
 	return uid, nil
 }
 
-func (r *DeploymentRevisionRepo) findByHash(ctx context.Context, uid bson.ObjectID, deploymentID, hash string) (*deployment.Revision, error) {
+func (r *DeploymentRevisionRepo) findByIdempotencyKey(ctx context.Context, uid bson.ObjectID, deploymentID, key string) (*deployment.Revision, error) {
 	var raw deploymentRevisionBSON
 	err := r.col.FindOne(ctx, bson.D{
 		{Key: "user_id", Value: uid},
 		{Key: "deployment_id", Value: deploymentID},
-		{Key: "config_hash", Value: hash},
+		{Key: "idempotency_key", Value: key},
 	}).Decode(&raw)
 	if err == mongo.ErrNoDocuments {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("deployment_revision_repo: find hash: %w", err)
+		return nil, fmt.Errorf("deployment_revision_repo: find idempotency key: %w", err)
 	}
 	return toDeploymentRevision(raw), nil
+}
+
+func replayedRevision(existing *deployment.Revision, input deployment.RevisionInput) (*deployment.Revision, bool, error) {
+	if existing.RootAgentID != input.RootAgentID || existing.SourceRevision != input.SourceRevision ||
+		existing.ConfigHash != input.ConfigHash || existing.SchemaVersion != input.SchemaVersion ||
+		!bytes.Equal(existing.BundleJSON, input.BundleJSON) {
+		return nil, false, deployment.ErrRevisionIdempotencyConflict
+	}
+	return existing, true, nil
 }
 
 func (r *DeploymentRevisionRepo) latestRevision(ctx context.Context, uid bson.ObjectID, deploymentID string) (int, error) {
@@ -215,7 +248,8 @@ func (r *DeploymentRevisionRepo) latestRevision(ctx context.Context, uid bson.Ob
 func toDeploymentRevision(raw deploymentRevisionBSON) *deployment.Revision {
 	return &deployment.Revision{
 		UserID: raw.UserID.Hex(), DeploymentID: raw.DeploymentID, RootAgentID: raw.RootAgentID,
-		Revision: raw.Revision, ConfigHash: raw.ConfigHash, SchemaVersion: raw.SchemaVersion,
+		Revision: raw.Revision, IdempotencyKey: raw.IdempotencyKey, SourceRevision: raw.SourceRevision,
+		ConfigHash: raw.ConfigHash, SchemaVersion: raw.SchemaVersion,
 		BundleJSON: append([]byte(nil), raw.BundleJSON...), CreatedAt: raw.CreatedAt.UTC(),
 	}
 }

@@ -35,11 +35,12 @@ func revisionHash(value string) string {
 func revisionInput(hash, body string) deployment.RevisionInput {
 	return deployment.RevisionInput{
 		UserID: userA, DeploymentID: "507f1f77bcf86cd799439099", RootAgentID: "507f1f77bcf86cd799439099",
-		ConfigHash: hash, SchemaVersion: deployment.SchemaVersion, BundleJSON: []byte(body),
+		IdempotencyKey: "request-" + revisionHash(hash)[:16], ConfigHash: hash,
+		SchemaVersion: deployment.SchemaVersion, BundleJSON: []byte(body),
 	}
 }
 
-func TestDeploymentRevisionAppendReplayAndIncrement(t *testing.T) {
+func TestDeploymentRevisionAppendReplaysByIdempotencyKeyAndIncrements(t *testing.T) {
 	r := deploymentRevisionRepo(t)
 	ctx := context.Background()
 	firstInput := revisionInput(revisionHash("first"), `{"revision":1}`)
@@ -72,6 +73,39 @@ func TestDeploymentRevisionAppendReplayAndIncrement(t *testing.T) {
 	again, _ := r.Get(ctx, userA, first.DeploymentID, 1)
 	if string(again.BundleJSON) != string(firstInput.BundleJSON) {
 		t.Fatalf("Get returned shared bytes: %q", again.BundleJSON)
+	}
+}
+
+func TestDeploymentRevisionSameHashWithDifferentKeysCreatesNewRevisions(t *testing.T) {
+	r := deploymentRevisionRepo(t)
+	ctx := context.Background()
+	firstInput := revisionInput(revisionHash("same-content"), `{"same":true}`)
+	firstInput.IdempotencyKey = "same-content-request-1"
+	first, existing, err := r.Append(ctx, firstInput)
+	if err != nil || existing || first.Revision != 1 {
+		t.Fatalf("first = %+v existing=%v err=%v", first, existing, err)
+	}
+	secondInput := firstInput
+	secondInput.IdempotencyKey = "same-content-request-2"
+	secondInput.SourceRevision = first.Revision
+	second, existing, err := r.Append(ctx, secondInput)
+	if err != nil || existing || second.Revision != 2 || second.SourceRevision != first.Revision || second.ConfigHash != first.ConfigHash {
+		t.Fatalf("second = %+v existing=%v err=%v", second, existing, err)
+	}
+}
+
+func TestDeploymentRevisionIdempotencyKeyConflict(t *testing.T) {
+	r := deploymentRevisionRepo(t)
+	ctx := context.Background()
+	firstInput := revisionInput(revisionHash("first"), `{"value":1}`)
+	firstInput.IdempotencyKey = "one-logical-request"
+	if _, _, err := r.Append(ctx, firstInput); err != nil {
+		t.Fatal(err)
+	}
+	conflicting := revisionInput(revisionHash("second"), `{"value":2}`)
+	conflicting.IdempotencyKey = firstInput.IdempotencyKey
+	if _, _, err := r.Append(ctx, conflicting); !errors.Is(err, deployment.ErrRevisionIdempotencyConflict) {
+		t.Fatalf("conflicting replay error = %v", err)
 	}
 }
 
@@ -117,6 +151,50 @@ func TestDeploymentRevisionConcurrentIdenticalConverges(t *testing.T) {
 	}
 	if created != 1 {
 		t.Fatalf("new revision results = %d, want 1", created)
+	}
+}
+
+func TestDeploymentRevisionConcurrentSameHashDifferentKeysAllocateUniqueRevisions(t *testing.T) {
+	r := deploymentRevisionRepo(t)
+	const workers = 8
+	var wg sync.WaitGroup
+	revisions := make(chan int, workers)
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			input := revisionInput(revisionHash("shared-content"), `{"same":true}`)
+			input.IdempotencyKey = fmt.Sprintf("shared-content-request-%d", i)
+			revision, existing, err := r.Append(context.Background(), input)
+			if err == nil {
+				if existing {
+					err = fmt.Errorf("distinct request reported existing")
+				} else {
+					revisions <- revision.Revision
+				}
+			}
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(revisions)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := make([]int, 0, workers)
+	for revision := range revisions {
+		got = append(got, revision)
+	}
+	sort.Ints(got)
+	for i, revision := range got {
+		if revision != i+1 {
+			t.Fatalf("revisions = %v", got)
+		}
 	}
 }
 
@@ -190,6 +268,12 @@ func TestDeploymentRevisionOwnerScopeAndValidation(t *testing.T) {
 		revisionInput(revisionHash("empty"), ""),
 		revisionInput(revisionHash("large"), string(make([]byte, deployment.MaxBundleBytes+1))),
 	}
+	invalidKey := revisionInput(revisionHash("invalid-key"), `{}`)
+	invalidKey.IdempotencyKey = "contains space"
+	cases = append(cases, invalidKey)
+	negativeSource := revisionInput(revisionHash("negative-source"), `{}`)
+	negativeSource.SourceRevision = -1
+	cases = append(cases, negativeSource)
 	for i, tc := range cases {
 		if _, _, err := r.Append(context.Background(), tc); err == nil {
 			t.Fatalf("invalid case %d succeeded", i)
@@ -204,6 +288,17 @@ func TestDeploymentRevisionIndexes(t *testing.T) {
 	if _, err := collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "deployment_id", Value: 1}, {Key: "revision", Value: 1}}, Options: options.Index().SetUnique(true).SetName("deployment_revisions_revision_unique")},
 		{Keys: bson.D{{Key: "deployment_id", Value: 1}, {Key: "config_hash", Value: 1}}, Options: options.Index().SetUnique(true).SetName("deployment_revisions_hash_unique")},
+		{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "deployment_id", Value: 1}, {Key: "config_hash", Value: 1}}, Options: options.Index().SetUnique(true).SetName("deployment_revisions_owner_hash_unique")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	uid, err := bson.ObjectIDFromHex(userA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collection.InsertMany(ctx, []any{
+		bson.D{{Key: "user_id", Value: uid}, {Key: "deployment_id", Value: "legacy"}, {Key: "revision", Value: 1}, {Key: "config_hash", Value: revisionHash("legacy-1")}},
+		bson.D{{Key: "user_id", Value: uid}, {Key: "deployment_id", Value: "legacy"}, {Key: "revision", Value: 2}, {Key: "config_hash", Value: revisionHash("legacy-2")}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +328,7 @@ func TestDeploymentRevisionIndexes(t *testing.T) {
 			unique bool
 		}{index.Key, index.Unique}
 	}
-	for _, name := range []string{"deployment_revisions_owner_revision_unique", "deployment_revisions_owner_hash_unique"} {
+	for _, name := range []string{"deployment_revisions_owner_revision_unique", "deployment_revisions_owner_idempotency_unique"} {
 		index, ok := byName[name]
 		if !ok {
 			t.Fatalf("missing index %q in %v", name, byName)
@@ -242,7 +337,11 @@ func TestDeploymentRevisionIndexes(t *testing.T) {
 			t.Fatalf("index %q = %+v", name, index)
 		}
 	}
-	for _, legacy := range []string{"deployment_revisions_revision_unique", "deployment_revisions_hash_unique"} {
+	hashIndex, ok := byName["deployment_revisions_owner_hash"]
+	if !ok || hashIndex.unique || len(hashIndex.keys) != 3 || hashIndex.keys[0].Key != "user_id" || hashIndex.keys[1].Key != "deployment_id" || hashIndex.keys[2].Key != "config_hash" {
+		t.Fatalf("hash lookup index = %+v present=%v", hashIndex, ok)
+	}
+	for _, legacy := range []string{"deployment_revisions_revision_unique", "deployment_revisions_hash_unique", "deployment_revisions_owner_hash_unique"} {
 		if _, ok := byName[legacy]; ok {
 			t.Fatalf("legacy deployment-global index %q remains", legacy)
 		}

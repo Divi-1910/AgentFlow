@@ -12,6 +12,7 @@ import (
 
 	"backend/agent"
 	"backend/handlers"
+	"backend/mcp"
 	"backend/middleware"
 	"backend/tools"
 )
@@ -89,9 +90,35 @@ func withUser(r *http.Request) *http.Request {
 }
 
 func newAgentHandler(store *fakeAgentStore) *handlers.AgentHandler {
+	return newAgentHandlerWithCatalog(store, fakeMCPServerLookup{})
+}
+
+type fakeMCPServerLookup struct {
+	entries map[string]mcp.CatalogEntry
+	err     error
+}
+
+func (f fakeMCPServerLookup) GetEnabledByIDs(_ context.Context, serverIDs []string) (map[string]mcp.CatalogEntry, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	result := make(map[string]mcp.CatalogEntry, len(serverIDs))
+	for _, serverID := range serverIDs {
+		if f.entries != nil {
+			if entry, exists := f.entries[serverID]; exists {
+				result[serverID] = entry
+			}
+			continue
+		}
+		result[serverID] = mcp.CatalogEntry{ServerID: serverID, Name: serverID, Alias: serverID, Enabled: true}
+	}
+	return result, nil
+}
+
+func newAgentHandlerWithCatalog(store *fakeAgentStore, catalog fakeMCPServerLookup) *handlers.AgentHandler {
 	reg := tools.NewEmptyRegistry()
 	reg.Register(tools.NewCalculatorTool())
-	return handlers.NewAgentHandler(store, reg)
+	return handlers.NewAgentHandler(store, reg, catalog)
 }
 
 func decodeJSON(t *testing.T, body []byte, v any) {

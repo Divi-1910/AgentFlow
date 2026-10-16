@@ -146,7 +146,7 @@ func TestRuntimeHistorySurvivesCloseAndReopen(t *testing.T) {
 	if err := json.Unmarshal(created.Body.Bytes(), &thread); err != nil {
 		t.Fatal(err)
 	}
-	messages := sqliterepo.NewMessageRepo(app.db)
+	messages := sqliterepo.NewMessageRepo(app.storage.sharedDB)
 	if _, err := messages.InsertMany(context.Background(), thread.ID, bundle.RootAgentID, bundle.SyntheticUserID(), []llm.ChatMessage{{
 		Role: "assistant", Content: "persisted answer", Metadata: map[string]any{"source": "restart-test"},
 	}}); err != nil {
@@ -171,6 +171,111 @@ func TestRuntimeHistorySurvivesCloseAndReopen(t *testing.T) {
 	}
 }
 
+func TestManagedRuntimeSharesHistoryAndIsolatesRevisionExecution(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	dataDir := filepath.Join(t.TempDir(), "managed")
+	storageID := strings.Repeat("a", 64)
+	revision1 := runtimeTestBundle(t)
+	context1 := &managedStorageContext{
+		storageID:          storageID,
+		deploymentID:       revision1.DeploymentID,
+		revision:           1,
+		generation:         1,
+		expectedConfigHash: revision1.ConfigHash,
+	}
+	app1, err := newRuntimeApp(context.Background(), appConfig{
+		bundle: revision1, dataDir: dataDir, auth: authConfig{mode: authModeNone}, managedStorage: context1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	created := httptest.NewRecorder()
+	app1.server.Handler.ServeHTTP(
+		created,
+		httptest.NewRequest(http.MethodPost, "/v1/threads", bytes.NewBufferString(`{"title":"Shared"}`)),
+	)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var thread agent.ThreadRecord
+	if err := json.Unmarshal(created.Body.Bytes(), &thread); err != nil {
+		t.Fatal(err)
+	}
+	principalID := app1.storage.runtimePrincipalID
+	messages := sqliterepo.NewMessageRepo(app1.storage.sharedDB)
+	if _, err := messages.InsertMany(
+		context.Background(),
+		thread.ID,
+		revision1.RootAgentID,
+		principalID,
+		[]llm.ChatMessage{{Role: "assistant", Content: "shared across revisions"}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqliterepo.NewRunRepo(app1.storage.executionDB).CreateRun(
+		context.Background(),
+		"revision-1-run",
+		thread.ID,
+		revision1.RootAgentID,
+		principalID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	revision1Scratchpad := filepath.Join(app1.storage.scratchpadRoot, "revision-1.txt")
+	if err := os.WriteFile(revision1Scratchpad, []byte("revision one workspace"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app1.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	revision2 := *revision1
+	revision2.Agents = append([]deployment.BundleAgent(nil), revision1.Agents...)
+	revision2.Agents[0].SystemPrompt = "changed in revision two"
+	hash, err := revision2.CanonicalHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision2.ConfigHash = hash
+	context2 := &managedStorageContext{
+		storageID:          storageID,
+		deploymentID:       revision2.DeploymentID,
+		revision:           2,
+		generation:         2,
+		expectedConfigHash: revision2.ConfigHash,
+	}
+	app2, err := newRuntimeApp(context.Background(), appConfig{
+		bundle: &revision2, dataDir: dataDir, auth: authConfig{mode: authModeNone}, managedStorage: context2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = app2.Shutdown(context.Background()) })
+
+	listed := httptest.NewRecorder()
+	app2.server.Handler.ServeHTTP(
+		listed,
+		httptest.NewRequest(http.MethodGet, "/v1/threads/"+thread.ID+"/messages", nil),
+	)
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), "shared across revisions") {
+		t.Fatalf("shared history status=%d body=%s", listed.Code, listed.Body.String())
+	}
+	var currentRuns int
+	if err := app2.storage.executionDB.QueryRow(`SELECT count(*) FROM runs`).Scan(&currentRuns); err != nil {
+		t.Fatal(err)
+	}
+	if currentRuns != 0 {
+		t.Fatalf("revision 2 execution contains %d old runs", currentRuns)
+	}
+	if app2.storage.scratchpadRoot == filepath.Dir(revision1Scratchpad) {
+		t.Fatal("revision 2 reused revision 1 scratchpad root")
+	}
+	if _, err := os.Stat(revision1Scratchpad); err != nil {
+		t.Fatalf("revision 1 scratchpad was not preserved: %v", err)
+	}
+}
+
 func TestRuntimeStage2SupervisorResearcherMCPAndScratchpad(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "stage2")
 	bundle := &deployment.Bundle{
@@ -184,7 +289,7 @@ func TestRuntimeStage2SupervisorResearcherMCPAndScratchpad(t *testing.T) {
 			},
 			{
 				ID: "researcher", Name: "Researcher", Provider: "fake", Model: "researcher", SystemPrompt: "research",
-				Tools: []string{"scratchpad_create"}, Delegates: []deployment.BundleDelegate{}, MCPServers: []deployment.BundleMCPServer{{Alias: "context7", URL: "http://mcp.test"}},
+				Tools: []string{"scratchpad_create"}, Delegates: []deployment.BundleDelegate{}, MCPServers: []deployment.BundleMCPServer{{ServerID: "context7", Alias: "context7", URL: "http://mcp.test"}},
 				ModelContextLimit: 1000, ContextWindow: 6, ContextKeepRatio: .5, MaxSteps: 8, Temperature: .1, MaxTokens: 100, MaxRuns: 10,
 			},
 		},
@@ -221,20 +326,20 @@ func TestRuntimeStage2SupervisorResearcherMCPAndScratchpad(t *testing.T) {
 	}
 
 	var childCount, subThreadCount, budgetUsed int
-	if err := app.db.QueryRow(`SELECT count(*) FROM runs WHERE parent_run_id <> '' AND originator_run_id = (SELECT run_id FROM runs WHERE parent_run_id = '' LIMIT 1)`).Scan(&childCount); err != nil {
+	if err := app.storage.executionDB.QueryRow(`SELECT count(*) FROM runs WHERE parent_run_id <> '' AND originator_run_id = (SELECT run_id FROM runs WHERE parent_run_id = '' LIMIT 1)`).Scan(&childCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.db.QueryRow(`SELECT count(*) FROM threads WHERE kind = 'sub'`).Scan(&subThreadCount); err != nil {
+	if err := app.storage.sharedDB.QueryRow(`SELECT count(*) FROM threads WHERE kind = 'sub'`).Scan(&subThreadCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.db.QueryRow(`SELECT runs_used FROM tasks LIMIT 1`).Scan(&budgetUsed); err != nil {
+	if err := app.storage.executionDB.QueryRow(`SELECT runs_used FROM tasks LIMIT 1`).Scan(&budgetUsed); err != nil {
 		t.Fatal(err)
 	}
 	if childCount != 1 || subThreadCount != 1 || budgetUsed != 1 {
 		t.Fatalf("child/sub-thread/budget = %d/%d/%d", childCount, subThreadCount, budgetUsed)
 	}
 	var subMessages int
-	if err := app.db.QueryRow(`SELECT count(*) FROM messages WHERE thread_id = (SELECT id FROM threads WHERE kind = 'sub' LIMIT 1)`).Scan(&subMessages); err != nil {
+	if err := app.storage.sharedDB.QueryRow(`SELECT count(*) FROM messages WHERE thread_id = (SELECT id FROM threads WHERE kind = 'sub' LIMIT 1)`).Scan(&subMessages); err != nil {
 		t.Fatal(err)
 	}
 	if subMessages == 0 {
