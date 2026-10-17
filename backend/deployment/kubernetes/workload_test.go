@@ -129,6 +129,23 @@ func TestRenderProducesSinglePodRecreateWorkload(t *testing.T) {
 	}
 }
 
+func TestRenderLabelsRuntimePodsForNetworkPolicy(t *testing.T) {
+	t.Parallel()
+
+	workload, err := kubernetes.Render(validWorkloadInput(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		managedByLabel = "app.kubernetes.io/managed-by"
+		managedByValue = "agentflow"
+	)
+	if got := workload.Deployment.Spec.Template.Labels[managedByLabel]; got != managedByValue {
+		t.Fatalf("runtime pod label %q = %q, want %q so the runtime NetworkPolicy selects the pod", managedByLabel, got, managedByValue)
+	}
+}
+
 func TestRenderKeepsLogicalResourcesStableAcrossRevisions(t *testing.T) {
 	t.Parallel()
 	firstInput := validWorkloadInput(t)

@@ -85,7 +85,7 @@ func Render(input WorkloadInput) (*Workload, error) {
 		"app.kubernetes.io/name":     "agentflow-runtime",
 		"app.kubernetes.io/instance": name,
 	}
-	podLabels := cloneMap(selector)
+	podLabels := mergeStringMap(selector, managedLabels)
 	podLabels["agentflow.dev/config-hash"] = input.ConfigHash[:12]
 	podLabels["agentflow.dev/revision"] = strconv.Itoa(input.Revision)
 	podAnnotations := mergeStringMap(managedAnnotations, map[string]string{
