@@ -7,6 +7,7 @@ import (
 
 	"backend/agent"
 	"backend/model"
+	"backend/pagination"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -84,7 +85,7 @@ func (r *ThreadRepo) ListByAgent(ctx context.Context, agentID, userID string) ([
 		return nil, fmt.Errorf("invalid user_id: %w", err)
 	}
 
-	opts := options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}})
+	opts := options.Find().SetSort(bson.D{{Key: "updated_at", Value: -1}, {Key: "_id", Value: -1}})
 	// Exclude delegation sub-threads (kind == "sub") from user-facing lists.
 	cursor, err := r.col.Find(ctx, bson.M{
 		"agent_id": aid,
@@ -106,6 +107,85 @@ func (r *ThreadRepo) ListByAgent(ctx context.Context, agentID, userID string) ([
 		records[i] = toThreadRecord(doc)
 	}
 	return records, nil
+}
+
+func (r *ThreadRepo) ListByAgentPage(ctx context.Context, agentID, userID string, request pagination.Request) (pagination.Page[*agent.ThreadRecord], error) {
+	aid, err := bson.ObjectIDFromHex(agentID)
+	if err != nil {
+		return pagination.Page[*agent.ThreadRecord]{}, fmt.Errorf("invalid agent_id: %w", err)
+	}
+	uid, err := bson.ObjectIDFromHex(userID)
+	if err != nil {
+		return pagination.Page[*agent.ThreadRecord]{}, fmt.Errorf("invalid user_id: %w", err)
+	}
+	return r.listPage(ctx, bson.M{"agent_id": aid, "user_id": uid, "kind": bson.M{"$ne": "sub"}}, request)
+}
+
+// ListByUserPage returns user-facing threads for an owner. A nil resourceIDs
+// slice means every owned resource; a non-nil empty slice means no resources.
+func (r *ThreadRepo) ListByUserPage(ctx context.Context, userID string, resourceIDs []string, request pagination.Request) (pagination.Page[*agent.ThreadRecord], error) {
+	uid, err := bson.ObjectIDFromHex(userID)
+	if err != nil {
+		return pagination.Page[*agent.ThreadRecord]{}, fmt.Errorf("invalid user_id: %w", err)
+	}
+	filter := bson.M{"user_id": uid, "kind": bson.M{"$ne": "sub"}}
+	if resourceIDs != nil {
+		if len(resourceIDs) == 0 {
+			return pagination.Page[*agent.ThreadRecord]{Items: []*agent.ThreadRecord{}}, nil
+		}
+		ids := make(bson.A, len(resourceIDs))
+		for i, id := range resourceIDs {
+			parsed, err := bson.ObjectIDFromHex(id)
+			if err != nil {
+				return pagination.Page[*agent.ThreadRecord]{}, fmt.Errorf("invalid resource_id: %w", err)
+			}
+			ids[i] = parsed
+		}
+		filter["agent_id"] = bson.M{"$in": ids}
+	}
+	return r.listPage(ctx, filter, request)
+}
+
+func (r *ThreadRepo) listPage(ctx context.Context, filter bson.M, request pagination.Request) (pagination.Page[*agent.ThreadRecord], error) {
+	if request.Limit <= 0 {
+		request.Limit = 50
+	}
+	if request.Cursor != nil {
+		cursorID, err := bson.ObjectIDFromHex(request.Cursor.ID)
+		if err != nil {
+			return pagination.Page[*agent.ThreadRecord]{}, pagination.ErrInvalidCursor
+		}
+		filter["$or"] = bson.A{
+			bson.M{"updated_at": bson.M{"$lt": request.Cursor.Time}},
+			bson.M{"updated_at": request.Cursor.Time, "_id": bson.M{"$lt": cursorID}},
+		}
+	}
+	opts := options.Find().
+		SetSort(bson.D{{Key: "updated_at", Value: -1}, {Key: "_id", Value: -1}}).
+		SetLimit(int64(request.Limit + 1))
+	cursor, err := r.col.Find(ctx, filter, opts)
+	if err != nil {
+		return pagination.Page[*agent.ThreadRecord]{}, fmt.Errorf("thread_repo: page find failed: %w", err)
+	}
+	defer cursor.Close(ctx)
+	var docs []model.ThreadDocument
+	if err := cursor.All(ctx, &docs); err != nil {
+		return pagination.Page[*agent.ThreadRecord]{}, fmt.Errorf("thread_repo: page decode failed: %w", err)
+	}
+	hasMore := len(docs) > request.Limit
+	if hasMore {
+		docs = docs[:request.Limit]
+	}
+	items := make([]*agent.ThreadRecord, len(docs))
+	for i, doc := range docs {
+		items[i] = toThreadRecord(doc)
+	}
+	page := pagination.Page[*agent.ThreadRecord]{Items: items, HasMore: hasMore}
+	if hasMore && len(docs) > 0 {
+		last := docs[len(docs)-1]
+		page.Next = &pagination.Cursor{Kind: "threads", Time: last.UpdatedAt, ID: last.ID.Hex()}
+	}
+	return page, nil
 }
 
 // FindOrCreateSubThread returns the sub-thread for (userID, originatorRunID,
@@ -180,6 +260,32 @@ func (r *ThreadRepo) EnsureIndexes(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("thread_repo: sub-thread index: %w", err)
 	}
+	_, err = r.col.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "kind", Value: 1}, {Key: "updated_at", Value: -1}, {Key: "_id", Value: -1}}, Options: options.Index().SetName("thread_owner_activity")},
+		{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "agent_id", Value: 1}, {Key: "kind", Value: 1}, {Key: "updated_at", Value: -1}, {Key: "_id", Value: -1}}, Options: options.Index().SetName("thread_resource_activity")},
+	})
+	if err != nil {
+		return fmt.Errorf("thread_repo: activity indexes: %w", err)
+	}
+	return nil
+}
+
+func (r *ThreadRepo) Touch(ctx context.Context, threadID, userID string) error {
+	tid, err := bson.ObjectIDFromHex(threadID)
+	if err != nil {
+		return fmt.Errorf("invalid thread_id: %w", err)
+	}
+	uid, err := bson.ObjectIDFromHex(userID)
+	if err != nil {
+		return fmt.Errorf("invalid user_id: %w", err)
+	}
+	result, err := r.col.UpdateOne(ctx, bson.M{"_id": tid, "user_id": uid}, bson.M{"$set": bson.M{"updated_at": time.Now()}})
+	if err != nil {
+		return fmt.Errorf("thread_repo: touch failed: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return fmt.Errorf("thread not found")
+	}
 	return nil
 }
 
@@ -205,6 +311,30 @@ func (r *ThreadRepo) UpdateSummary(ctx context.Context, threadID, userID, summar
 		return fmt.Errorf("thread_repo: update summary failed: %w", err)
 	}
 
+	return nil
+}
+
+func (r *ThreadRepo) UpdateTitle(ctx context.Context, threadID, userID, title string) error {
+	tid, err := bson.ObjectIDFromHex(threadID)
+	if err != nil {
+		return fmt.Errorf("invalid thread_id: %w", err)
+	}
+	uid, err := bson.ObjectIDFromHex(userID)
+	if err != nil {
+		return fmt.Errorf("invalid user_id: %w", err)
+	}
+
+	result, err := r.col.UpdateOne(
+		ctx,
+		bson.M{"_id": tid, "user_id": uid},
+		bson.M{"$set": bson.M{"title": title, "updated_at": time.Now()}},
+	)
+	if err != nil {
+		return fmt.Errorf("thread_repo: update title failed: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return fmt.Errorf("thread not found")
+	}
 	return nil
 }
 

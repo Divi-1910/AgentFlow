@@ -1,14 +1,12 @@
-import { useAtom, useAtomValue } from 'jotai'
+import { useSetAtom, useAtomValue } from 'jotai'
 import {
-  globalSearchAtom,
   sidebarCollapsedAtom,
   sidebarOpenAtom,
 } from '../../store/atoms/appAtoms'
 import { useAuth } from '../../hooks/useAuth'
 
 function TopNav() {
-  const [searchQuery, setSearchQuery] = useAtom(globalSearchAtom)
-  const [, setSidebarOpen] = useAtom(sidebarOpenAtom)
+  const setSidebarOpen = useSetAtom(sidebarOpenAtom)
   const sidebarCollapsed = useAtomValue(sidebarCollapsedAtom)
   const { user } = useAuth()
 
@@ -29,7 +27,7 @@ function TopNav() {
           <button
             type="button"
             onClick={() => setSidebarOpen(true)}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-white/10 text-white/50 transition-colors hover:bg-white/5 hover:text-white lg:hidden"
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-white/10 text-content-supporting transition-colors hover:bg-white/5 hover:text-white lg:hidden"
             aria-label="Open navigation"
           >
             <span className="material-symbols-outlined text-[20px]">menu</span>
@@ -45,18 +43,18 @@ function TopNav() {
                 <span className="font-headline text-[11px] font-bold uppercase tracking-[0.15em] text-white">
                   {user.first_name} {user.last_name}
                 </span>
-                <span className="text-[10px] font-medium tracking-wide text-white/30">
+                <span className="text-[10px] font-medium tracking-wide text-content-supporting">
                   {user.email}
                 </span>
               </div>
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-white/20 bg-white/5 text-white/90 shadow-[0_0_16px_rgba(255,255,255,0.05)] transition-all hover:bg-white/10 cursor-pointer hover:shadow-[0_0_24px_rgba(255,255,255,0.1)]">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-white/20 bg-white/5 text-white/90 shadow-[0_0_16px_rgba(255,255,255,0.05)]" aria-label="Signed-in user">
                 <span className="font-headline text-[13px] font-bold tracking-widest ml-[2px]">
                   {getInitials()}
                 </span>
               </div>
             </div>
           ) : (
-            <div className="flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-white/5 text-white/70 shadow-[0_0_12px_rgba(255,255,255,0.05)] cursor-pointer hover:bg-white/10 transition-colors">
+            <div className="flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-white/5 text-white/70 shadow-[0_0_12px_rgba(255,255,255,0.05)]" aria-label="User profile unavailable">
               <div className="relative">
                 <span className="material-symbols-outlined text-[18px]">person</span>
                 <div className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-white shadow-[0_0_8px_rgba(255,255,255,1)]" />

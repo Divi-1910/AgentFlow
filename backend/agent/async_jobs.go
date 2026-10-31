@@ -50,6 +50,7 @@ const (
 )
 
 type DispatchAgentRequest struct {
+	TeamID              string
 	ParentRunID         string
 	OriginatorRunID     string
 	ParentThreadID      string

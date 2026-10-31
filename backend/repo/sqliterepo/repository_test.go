@@ -40,6 +40,54 @@ func TestRunCheckpointRetentionTimestamps(t *testing.T) {
 	}
 }
 
+func TestThreadRepoUpdateTitlePersistsAndEnforcesOwnership(t *testing.T) {
+	db := testDBInternal(t)
+	repo := NewThreadRepo(db)
+	ctx := context.Background()
+	thread, err := repo.Create(ctx, "user1", "agent1", "old title")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpdateTitle(ctx, thread.ID, "user2", "intruder title"); err == nil {
+		t.Fatal("UpdateTitle accepted a non-owner")
+	}
+	if err := repo.UpdateTitle(ctx, thread.ID, "user1", "new title"); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := repo.GetByID(ctx, thread.ID, "user1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Title != "new title" || !updated.UpdatedAt.After(thread.UpdatedAt) {
+		t.Fatalf("updated thread = %#v", updated)
+	}
+}
+
+func TestRunRepoListTopLevelByThreadForUser(t *testing.T) {
+	db := testDBInternal(t)
+	repo := NewRunRepo(db)
+	ctx := context.Background()
+	if err := repo.CreateRun(ctx, "root", "thread1", "agent1", "user1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateChildRun(ctx, "child", "thread1", "agent2", "user1", "root", "root"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateRun(ctx, "other-owner", "thread1", "agent1", "user2"); err != nil {
+		t.Fatal(err)
+	}
+	infos, err := repo.ListTopLevelByThreadForUser(ctx, "thread1", "user1", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 || infos[0].RunID != "root" || infos[0].InvocationKind != agent.InvocationTopLevel {
+		t.Fatalf("listed runs = %#v", infos)
+	}
+	if infos[0].CreatedAt.IsZero() || infos[0].UpdatedAt.IsZero() {
+		t.Fatalf("run timestamps were not projected: %#v", infos[0])
+	}
+}
+
 func TestRejectedTaskKeyIsNotStored(t *testing.T) {
 	db := testDBInternal(t)
 	repo := NewTaskRepo(db)

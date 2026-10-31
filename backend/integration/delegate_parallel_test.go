@@ -223,6 +223,7 @@ func TestSameTargetDelegateBatchUsesMongoSubThreadHistory(t *testing.T) {
 
 	userID := bson.NewObjectID().Hex()
 	worker, err := agentRepo.Create(ctx, userID, &agent.Agent{
+		Kind:         agent.ResourceKindStandaloneAgent,
 		Name:         "Worker",
 		Provider:     "fake",
 		Model:        "worker-model",
@@ -233,26 +234,37 @@ func TestSameTargetDelegateBatchUsesMongoSubThreadHistory(t *testing.T) {
 		t.Fatalf("create worker: %v", err)
 	}
 	supervisor, err := agentRepo.Create(ctx, userID, &agent.Agent{
+		Kind:         agent.ResourceKindStandaloneAgent,
 		Name:         "Supervisor",
 		Provider:     "fake",
 		Model:        "supervisor-model",
 		SystemPrompt: "Delegate to the worker.",
-		Delegates: []agent.DelegateConfig{{
-			AgentID:     worker.ID,
-			ToolName:    "ask_worker",
-			Description: "ask the worker",
-		}},
-		MaxSteps: 3,
+		MaxSteps:     3,
 	})
 	if err != nil {
 		t.Fatalf("create supervisor: %v", err)
 	}
-	thread, err := threadRepo.Create(ctx, userID, supervisor.ID, "pineapple")
+	team, err := agentRepo.Create(ctx, userID, &agent.Agent{
+		Kind: agent.ResourceKindAgentTeam,
+		Name: "Pineapple Team",
+		TeamGraph: &agent.TeamGraph{
+			EntryAgentID: supervisor.ID,
+			Nodes:        []agent.TeamNode{{AgentID: supervisor.ID}, {AgentID: worker.ID}},
+			Edges: []agent.TeamEdge{{
+				SourceAgentID: supervisor.ID, TargetAgentID: worker.ID,
+				ToolName: "ask_worker", Description: "ask the worker",
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create team: %v", err)
+	}
+	thread, err := threadRepo.Create(ctx, userID, team.ID, "pineapple")
 	if err != nil {
 		t.Fatalf("create thread: %v", err)
 	}
 	runID := uuid.NewString()
-	if err := runRepo.CreateRun(ctx, runID, thread.ID, supervisor.ID, userID); err != nil {
+	if err := runRepo.CreateRun(ctx, runID, thread.ID, team.ID, userID); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 
@@ -272,7 +284,7 @@ func TestSameTargetDelegateBatchUsesMongoSubThreadHistory(t *testing.T) {
 	}
 	result, err := disp.Dispatch(ctx, dispatcher.DispatchRequest{
 		RunID:    runID,
-		AgentID:  supervisor.ID,
+		AgentID:  team.ID,
 		UserID:   userID,
 		ThreadID: thread.ID,
 		Input:    "store and recall pineapple",
@@ -393,6 +405,7 @@ func TestSyncDelegateRunBudgetLimitsSupervisorFanout(t *testing.T) {
 
 	userID := bson.NewObjectID().Hex()
 	worker, err := agentRepo.Create(ctx, userID, &agent.Agent{
+		Kind:         agent.ResourceKindStandaloneAgent,
 		Name:         "Worker",
 		Provider:     "fake",
 		Model:        "budget-worker",
@@ -403,27 +416,38 @@ func TestSyncDelegateRunBudgetLimitsSupervisorFanout(t *testing.T) {
 		t.Fatalf("create worker: %v", err)
 	}
 	supervisor, err := agentRepo.Create(ctx, userID, &agent.Agent{
+		Kind:         agent.ResourceKindStandaloneAgent,
 		Name:         "Supervisor",
 		Provider:     "fake",
 		Model:        "budget-supervisor",
 		SystemPrompt: "Delegate twice.",
-		Delegates: []agent.DelegateConfig{{
-			AgentID:     worker.ID,
-			ToolName:    "ask_worker",
-			Description: "ask the worker",
-		}},
-		MaxSteps: 3,
-		MaxRuns:  1,
+		MaxSteps:     3,
+		MaxRuns:      1,
 	})
 	if err != nil {
 		t.Fatalf("create supervisor: %v", err)
 	}
-	thread, err := threadRepo.Create(ctx, userID, supervisor.ID, "budget")
+	team, err := agentRepo.Create(ctx, userID, &agent.Agent{
+		Kind: agent.ResourceKindAgentTeam,
+		Name: "Budget Team",
+		TeamGraph: &agent.TeamGraph{
+			EntryAgentID: supervisor.ID,
+			Nodes:        []agent.TeamNode{{AgentID: supervisor.ID}, {AgentID: worker.ID}},
+			Edges: []agent.TeamEdge{{
+				SourceAgentID: supervisor.ID, TargetAgentID: worker.ID,
+				ToolName: "ask_worker", Description: "ask the worker",
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create team: %v", err)
+	}
+	thread, err := threadRepo.Create(ctx, userID, team.ID, "budget")
 	if err != nil {
 		t.Fatalf("create thread: %v", err)
 	}
 	runID := uuid.NewString()
-	if err := runRepo.CreateRun(ctx, runID, thread.ID, supervisor.ID, userID); err != nil {
+	if err := runRepo.CreateRun(ctx, runID, thread.ID, team.ID, userID); err != nil {
 		t.Fatalf("create run: %v", err)
 	}
 
@@ -443,7 +467,7 @@ func TestSyncDelegateRunBudgetLimitsSupervisorFanout(t *testing.T) {
 	}
 	result, err := disp.Dispatch(ctx, dispatcher.DispatchRequest{
 		RunID:    runID,
-		AgentID:  supervisor.ID,
+		AgentID:  team.ID,
 		UserID:   userID,
 		ThreadID: thread.ID,
 		Input:    "delegate twice",

@@ -39,16 +39,34 @@ func TestPublisherRoundTripThroughRuntimeBundleLoader(t *testing.T) {
 	agents := mongorepo.NewAgentRepo(agentsCol, modelsCol)
 	mcpServers := mongorepo.NewMCPServerRepo(mcpServersCol)
 	child, err := agents.Create(ctx, userA, &agent.Agent{
-		Name: "Researcher", Provider: "openai", Model: "gpt-4o", SystemPrompt: "research",
+		Kind: agent.ResourceKindStandaloneAgent, Name: "Researcher", Provider: "openai", Model: "gpt-4o", SystemPrompt: "research",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	root, err := agents.Create(ctx, userA, &agent.Agent{
+		Kind: agent.ResourceKindStandaloneAgent,
 		Name: "Supervisor", Provider: "openai", Model: "gpt-4o", SystemPrompt: "supervise",
 		Tools:      []string{"web_search"},
-		Delegates:  []agent.DelegateConfig{{AgentID: child.ID, ToolName: "ask_researcher", Description: "research"}},
 		MCPServers: []agent.MCPServerSelection{{ServerID: "context7"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	team, err := agents.Create(ctx, userA, &agent.Agent{
+		Kind: agent.ResourceKindAgentTeam,
+		Name: "Research Team",
+		TeamGraph: &agent.TeamGraph{
+			EntryAgentID: root.ID,
+			Nodes: []agent.TeamNode{
+				{AgentID: root.ID, Position: agent.TeamPosition{X: 120, Y: 80}},
+				{AgentID: child.ID, Position: agent.TeamPosition{X: 420, Y: 80}},
+			},
+			Edges: []agent.TeamEdge{{
+				SourceAgentID: root.ID, TargetAgentID: child.ID,
+				SourcePort: "right", TargetPort: "left", ToolName: "ask_researcher", Description: "research",
+			}},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -64,25 +82,27 @@ func TestPublisherRoundTripThroughRuntimeBundleLoader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := svc.Publish(ctx, userA, root.ID, "roundtrip-publication-1")
+	first, err := svc.Publish(ctx, userA, team.ID, "roundtrip-publication-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	rootObjectID, err := bson.ObjectIDFromHex(root.ID)
+	teamObjectID, err := bson.ObjectIDFromHex(team.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := agentsCol.UpdateOne(ctx, bson.D{{Key: "_id", Value: rootObjectID}}, bson.D{{Key: "$set", Value: bson.D{
+	if _, err := agentsCol.UpdateOne(ctx, bson.D{{Key: "_id", Value: teamObjectID}}, bson.D{{Key: "$set", Value: bson.D{
 		{Key: "updated_at", Value: time.Now().UTC().Add(time.Hour)},
-		{Key: "studio_layout", Value: bson.D{{Key: "x", Value: 120}, {Key: "y", Value: 80}}},
+		{Key: "team_graph.nodes.0.position", Value: bson.D{{Key: "x", Value: 240}, {Key: "y", Value: 160}}},
+		{Key: "team_graph.edges.0.source_port", Value: "bottom"},
+		{Key: "team_graph.edges.0.target_port", Value: "top"},
 	}}}); err != nil {
 		t.Fatal(err)
 	}
-	second, err := svc.Publish(ctx, userA, root.ID, "roundtrip-publication-2")
+	second, err := svc.Publish(ctx, userA, team.ID, "roundtrip-publication-2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	replay, err := svc.Publish(ctx, userA, root.ID, "roundtrip-publication-2")
+	replay, err := svc.Publish(ctx, userA, team.ID, "roundtrip-publication-2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +111,7 @@ func TestPublisherRoundTripThroughRuntimeBundleLoader(t *testing.T) {
 		first.Revision.ConfigHash != second.Revision.ConfigHash {
 		t.Fatalf("first/second = %+v/%+v", first, second)
 	}
-	stored, err := svc.GetBundle(ctx, userA, root.ID, first.Revision.Revision)
+	stored, err := svc.GetBundle(ctx, userA, team.ID, first.Revision.Revision)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +123,7 @@ func TestPublisherRoundTripThroughRuntimeBundleLoader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bundle.DeploymentID != root.ID || bundle.RootAgentID != root.ID || bundle.PlatformXML != "<platform>published</platform>" || len(bundle.Agents) != 2 {
+	if bundle.DeploymentID != team.ID || bundle.RootAgentID != root.ID || bundle.PlatformXML != "<platform>published</platform>" || len(bundle.Agents) != 2 {
 		t.Fatalf("bundle identity/graph = %+v", bundle)
 	}
 	var frozenRoot *deployment.BundleAgent

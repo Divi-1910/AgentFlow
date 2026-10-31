@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,6 +87,9 @@ func (f *fakeAgentStore) Delete(ctx context.Context, agentID, userID string) err
 
 // withUser injects the shared test user ID into the request context.
 func withUser(r *http.Request) *http.Request {
+	if r.Header.Get("Idempotency-Key") == "" {
+		r.Header.Set("Idempotency-Key", "test-submission")
+	}
 	return r.WithContext(context.WithValue(r.Context(), middleware.UserIDKey, testUserID))
 }
 
@@ -96,6 +100,40 @@ func newAgentHandler(store *fakeAgentStore) *handlers.AgentHandler {
 type fakeMCPServerLookup struct {
 	entries map[string]mcp.CatalogEntry
 	err     error
+}
+
+type fakeLLMModelLookup struct {
+	existsBySelection map[string]bool
+	err               error
+}
+
+func (f fakeLLMModelLookup) Exists(_ context.Context, provider, modelID string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	// The zero value is deliberately permissive for existing handler tests.
+	if f.existsBySelection == nil {
+		return true, nil
+	}
+	return f.existsBySelection[provider+"/"+modelID], nil
+}
+
+type fakeProviderAvailability struct{ providers []string }
+
+type fakeResourceDependencyChecker struct {
+	dependencies []string
+	err          error
+}
+
+func (f fakeResourceDependencyChecker) BlockingDependencies(context.Context, string, string) ([]string, error) {
+	return f.dependencies, f.err
+}
+
+func (f fakeProviderAvailability) Available() []string {
+	if f.providers == nil {
+		return []string{"openai"}
+	}
+	return f.providers
 }
 
 func (f fakeMCPServerLookup) GetEnabledByIDs(_ context.Context, serverIDs []string) (map[string]mcp.CatalogEntry, error) {
@@ -116,9 +154,22 @@ func (f fakeMCPServerLookup) GetEnabledByIDs(_ context.Context, serverIDs []stri
 }
 
 func newAgentHandlerWithCatalog(store *fakeAgentStore, catalog fakeMCPServerLookup) *handlers.AgentHandler {
+	return newAgentHandlerWithConfiguration(
+		store, catalog, fakeLLMModelLookup{}, fakeProviderAvailability{},
+	)
+}
+
+func newAgentHandlerWithConfiguration(
+	store *fakeAgentStore,
+	mcpCatalog fakeMCPServerLookup,
+	modelCatalog fakeLLMModelLookup,
+	providers fakeProviderAvailability,
+) *handlers.AgentHandler {
 	reg := tools.NewEmptyRegistry()
 	reg.Register(tools.NewCalculatorTool())
-	return handlers.NewAgentHandler(store, reg, catalog)
+	return handlers.NewAgentHandler(
+		store, reg, reg, mcpCatalog, modelCatalog, providers,
+	)
 }
 
 func decodeJSON(t *testing.T, body []byte, v any) {
@@ -187,6 +238,97 @@ func TestAgentHandlerCreateRejectsMissingRequiredFields(t *testing.T) {
 	}
 }
 
+func TestAgentHandlerCreateRejectsUnavailableProviderOrUnknownModel(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		models    fakeLLMModelLookup
+		providers fakeProviderAvailability
+		wantCode  int
+	}{
+		{
+			name: "provider unavailable", providers: fakeProviderAvailability{providers: []string{}},
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "model unknown", providers: fakeProviderAvailability{providers: []string{"openai"}},
+			models: fakeLLMModelLookup{existsBySelection: map[string]bool{}}, wantCode: http.StatusBadRequest,
+		},
+		{
+			name: "catalog failure", providers: fakeProviderAvailability{providers: []string{"openai"}},
+			models: fakeLLMModelLookup{err: errors.New("database unavailable")}, wantCode: http.StatusInternalServerError,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			recorder := httptest.NewRecorder()
+			newAgentHandlerWithConfiguration(
+				&fakeAgentStore{}, fakeMCPServerLookup{}, test.models, test.providers,
+			).Create(recorder, withUser(httptest.NewRequest(http.MethodPost, "/api/agents", validCreateBody(t))))
+			if recorder.Code != test.wantCode {
+				t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestAgentHandlerCreateRejectsUnknownSummarizationModel(t *testing.T) {
+	t.Parallel()
+	body, _ := json.Marshal(map[string]any{
+		"name": "a", "provider": "openai", "model": "gpt-4", "system_prompt": "x",
+		"summarization_model": "missing-summary-model",
+	})
+	recorder := httptest.NewRecorder()
+	newAgentHandlerWithConfiguration(
+		&fakeAgentStore{}, fakeMCPServerLookup{},
+		fakeLLMModelLookup{existsBySelection: map[string]bool{"openai/gpt-4": true}},
+		fakeProviderAvailability{providers: []string{"openai"}},
+	).Create(
+		recorder,
+		withUser(httptest.NewRequest(http.MethodPost, "/api/agents", bytes.NewReader(body))),
+	)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestAgentHandlerCreateRejectsInvalidTuning(t *testing.T) {
+	t.Parallel()
+	tests := []map[string]any{
+		{"context_window": 0},
+		{"context_keep_ratio": 0},
+		{"context_keep_ratio": 1.1},
+		{"max_steps": 0},
+		{"temperature": 0},
+		{"temperature": 1.1},
+		{"max_tokens": -1},
+		{"max_runs": 0},
+	}
+	for _, invalid := range tests {
+		invalid := invalid
+		t.Run("invalid", func(t *testing.T) {
+			t.Parallel()
+			body := map[string]any{
+				"name": "a", "provider": "openai", "model": "gpt-4", "system_prompt": "x",
+			}
+			for key, value := range invalid {
+				body[key] = value
+			}
+			encoded, _ := json.Marshal(body)
+			recorder := httptest.NewRecorder()
+			newAgentHandler(&fakeAgentStore{}).Create(
+				recorder,
+				withUser(httptest.NewRequest(http.MethodPost, "/api/agents", bytes.NewReader(encoded))),
+			)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("input=%v status=%d body=%s", invalid, recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestAgentHandlerCreateRejectsUnknownTool(t *testing.T) {
 	t.Parallel()
 	b, _ := json.Marshal(map[string]any{
@@ -222,6 +364,24 @@ func TestAgentHandlerCreateRejectsDuplicateTool(t *testing.T) {
 	h.Create(w, r)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("got %d, want 400", w.Code)
+	}
+}
+
+func TestAgentHandlerCreateRejectsDelegatesOwnedByTeamAPI(t *testing.T) {
+	t.Parallel()
+	body, _ := json.Marshal(map[string]any{
+		"name": "a", "provider": "openai", "model": "gpt-4", "system_prompt": "x",
+		"delegates": []map[string]string{{
+			"agent_id": testAgentID, "tool_name": "researcher", "description": "research",
+		}},
+	})
+	recorder := httptest.NewRecorder()
+	newAgentHandler(&fakeAgentStore{}).Create(
+		recorder,
+		withUser(httptest.NewRequest(http.MethodPost, "/api/agents", bytes.NewBuffer(body))),
+	)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -351,6 +511,23 @@ func TestAgentHandlerListReturnsEmptyArray(t *testing.T) {
 	}
 }
 
+func TestAgentHandlerListExcludesAgentTeams(t *testing.T) {
+	t.Parallel()
+	store := &fakeAgentStore{listFn: func(_ context.Context, _ string) ([]*agent.Agent, error) {
+		return []*agent.Agent{
+			{ID: testAgentID, Kind: agent.ResourceKindStandaloneAgent, Name: "standalone"},
+			{ID: "507f1f77bcf86cd799439013", Kind: agent.ResourceKindAgentTeam, Name: "team"},
+		}, nil
+	}}
+	recorder := httptest.NewRecorder()
+	newAgentHandler(store).List(recorder, withUser(httptest.NewRequest(http.MethodGet, "/api/agents", nil)))
+	var response []handlers.AgentResponse
+	decodeJSON(t, recorder.Body.Bytes(), &response)
+	if recorder.Code != http.StatusOK || len(response) != 1 || response[0].Name != "standalone" {
+		t.Fatalf("status = %d response = %+v", recorder.Code, response)
+	}
+}
+
 func TestAgentHandlerListForwardsRepoError(t *testing.T) {
 	t.Parallel()
 	store := &fakeAgentStore{
@@ -431,7 +608,7 @@ func TestAgentHandlerUpdateReturns200WithPatchedName(t *testing.T) {
 	}
 	b, _ := json.Marshal(map[string]any{"name": newName})
 	h := newAgentHandler(store)
-	r := httptest.NewRequest(http.MethodPut, "/api/agents/"+testAgentID, bytes.NewBuffer(b))
+	r := httptest.NewRequest(http.MethodPatch, "/api/agents/"+testAgentID, bytes.NewBuffer(b))
 	r.SetPathValue("id", testAgentID)
 	r = withUser(r)
 	w := httptest.NewRecorder()
@@ -459,7 +636,7 @@ func TestAgentHandlerUpdateAcceptsMaxRuns(t *testing.T) {
 	}
 	b, _ := json.Marshal(map[string]any{"max_runs": maxRuns})
 	h := newAgentHandler(store)
-	r := httptest.NewRequest(http.MethodPut, "/api/agents/"+testAgentID, bytes.NewBuffer(b))
+	r := httptest.NewRequest(http.MethodPatch, "/api/agents/"+testAgentID, bytes.NewBuffer(b))
 	r.SetPathValue("id", testAgentID)
 	r = withUser(r)
 	w := httptest.NewRecorder()
@@ -478,7 +655,7 @@ func TestAgentHandlerUpdateRejectsInvalidMaxRuns(t *testing.T) {
 	t.Parallel()
 	b, _ := json.Marshal(map[string]any{"max_runs": -1})
 	h := newAgentHandler(&fakeAgentStore{})
-	r := httptest.NewRequest(http.MethodPut, "/api/agents/"+testAgentID, bytes.NewBuffer(b))
+	r := httptest.NewRequest(http.MethodPatch, "/api/agents/"+testAgentID, bytes.NewBuffer(b))
 	r.SetPathValue("id", testAgentID)
 	r = withUser(r)
 	w := httptest.NewRecorder()
@@ -491,7 +668,7 @@ func TestAgentHandlerUpdateRejectsInvalidMaxRuns(t *testing.T) {
 func TestAgentHandlerUpdateRejectsBadJSON(t *testing.T) {
 	t.Parallel()
 	h := newAgentHandler(&fakeAgentStore{})
-	r := httptest.NewRequest(http.MethodPut, "/api/agents/"+testAgentID, bytes.NewBufferString("{bad json"))
+	r := httptest.NewRequest(http.MethodPatch, "/api/agents/"+testAgentID, bytes.NewBufferString("{bad json"))
 	r.SetPathValue("id", testAgentID)
 	r = withUser(r)
 	w := httptest.NewRecorder()
@@ -505,13 +682,35 @@ func TestAgentHandlerUpdateRejectsUnknownTool(t *testing.T) {
 	t.Parallel()
 	b, _ := json.Marshal(map[string]any{"tools": []string{"ghost_tool"}})
 	h := newAgentHandler(&fakeAgentStore{})
-	r := httptest.NewRequest(http.MethodPut, "/api/agents/"+testAgentID, bytes.NewBuffer(b))
+	r := httptest.NewRequest(http.MethodPatch, "/api/agents/"+testAgentID, bytes.NewBuffer(b))
 	r.SetPathValue("id", testAgentID)
 	r = withUser(r)
 	w := httptest.NewRecorder()
 	h.Update(w, r)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("got %d, want 400", w.Code)
+	}
+}
+
+func TestAgentHandlerUpdateValidatesEffectiveModelSelection(t *testing.T) {
+	t.Parallel()
+	store := &fakeAgentStore{getByIDFn: func(_ context.Context, id, _ string) (*agent.Agent, error) {
+		return &agent.Agent{
+			ID: id, Kind: agent.ResourceKindStandaloneAgent,
+			Provider: "openai", Model: "gpt-4",
+		}, nil
+	}}
+	body, _ := json.Marshal(map[string]any{"model": "unknown-model"})
+	request := withUser(httptest.NewRequest(http.MethodPatch, "/api/agents/"+testAgentID, bytes.NewReader(body)))
+	request.SetPathValue("id", testAgentID)
+	recorder := httptest.NewRecorder()
+	newAgentHandlerWithConfiguration(
+		store, fakeMCPServerLookup{},
+		fakeLLMModelLookup{existsBySelection: map[string]bool{"openai/gpt-4": true}},
+		fakeProviderAvailability{providers: []string{"openai"}},
+	).Update(recorder, request)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -524,7 +723,7 @@ func TestAgentHandlerUpdateReturns404WhenNotFound(t *testing.T) {
 	}
 	b, _ := json.Marshal(map[string]any{"name": "x"})
 	h := newAgentHandler(store)
-	r := httptest.NewRequest(http.MethodPut, "/api/agents/"+testAgentID, bytes.NewBuffer(b))
+	r := httptest.NewRequest(http.MethodPatch, "/api/agents/"+testAgentID, bytes.NewBuffer(b))
 	r.SetPathValue("id", testAgentID)
 	r = withUser(r)
 	w := httptest.NewRecorder()
@@ -546,6 +745,27 @@ func TestAgentHandlerDeleteReturns200(t *testing.T) {
 	h.Delete(w, r)
 	if w.Code != http.StatusOK {
 		t.Errorf("got %d, want 200 — body: %s", w.Code, w.Body)
+	}
+}
+
+func TestAgentHandlerDeleteBlocksDurableDependencies(t *testing.T) {
+	t.Parallel()
+	deleted := false
+	store := &fakeAgentStore{deleteFn: func(context.Context, string, string) error {
+		deleted = true
+		return nil
+	}}
+	registry := tools.NewEmptyRegistry()
+	h := handlers.NewAgentHandler(
+		store, registry, registry, fakeMCPServerLookup{}, fakeLLMModelLookup{}, fakeProviderAvailability{},
+		fakeResourceDependencyChecker{dependencies: []string{"threads", "publications"}},
+	)
+	r := withUser(httptest.NewRequest(http.MethodDelete, "/api/agents/"+testAgentID, nil))
+	r.SetPathValue("id", testAgentID)
+	w := httptest.NewRecorder()
+	h.Delete(w, r)
+	if w.Code != http.StatusConflict || deleted || !strings.Contains(w.Body.String(), `"threads"`) {
+		t.Fatalf("status/deleted/body = %d/%v/%s", w.Code, deleted, w.Body.String())
 	}
 }
 

@@ -146,6 +146,31 @@ func TestRuntimeHistorySurvivesCloseAndReopen(t *testing.T) {
 	if err := json.Unmarshal(created.Body.Bytes(), &thread); err != nil {
 		t.Fatal(err)
 	}
+	listThreads := httptest.NewRequest(http.MethodGet, "/v1/threads", nil)
+	listedThreads := httptest.NewRecorder()
+	app.server.Handler.ServeHTTP(listedThreads, listThreads)
+	if listedThreads.Code != http.StatusOK || !bytes.Contains(listedThreads.Body.Bytes(), []byte("Persistent")) {
+		t.Fatalf("thread list status=%d body=%s", listedThreads.Code, listedThreads.Body.String())
+	}
+	update := httptest.NewRequest(http.MethodPatch, "/v1/threads/"+thread.ID, bytes.NewBufferString(`{"title":"Renamed"}`))
+	update.Header.Set("Content-Type", "application/json")
+	updated := httptest.NewRecorder()
+	app.server.Handler.ServeHTTP(updated, update)
+	if updated.Code != http.StatusOK || !bytes.Contains(updated.Body.Bytes(), []byte("Renamed")) {
+		t.Fatalf("thread update status=%d body=%s", updated.Code, updated.Body.String())
+	}
+	listRuns := httptest.NewRequest(http.MethodGet, "/v1/threads/"+thread.ID+"/runs", nil)
+	listedRuns := httptest.NewRecorder()
+	app.server.Handler.ServeHTTP(listedRuns, listRuns)
+	var runPage struct {
+		Items []json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(listedRuns.Body.Bytes(), &runPage); err != nil {
+		t.Fatalf("decode run list: %v body=%s", err, listedRuns.Body.String())
+	}
+	if listedRuns.Code != http.StatusOK || len(runPage.Items) != 0 {
+		t.Fatalf("run list status=%d body=%s", listedRuns.Code, listedRuns.Body.String())
+	}
 	messages := sqliterepo.NewMessageRepo(app.storage.sharedDB)
 	if _, err := messages.InsertMany(context.Background(), thread.ID, bundle.RootAgentID, bundle.SyntheticUserID(), []llm.ChatMessage{{
 		Role: "assistant", Content: "persisted answer", Metadata: map[string]any{"source": "restart-test"},
@@ -320,7 +345,9 @@ func TestRuntimeStage2SupervisorResearcherMCPAndScratchpad(t *testing.T) {
 		t.Fatal(err)
 	}
 	sent := httptest.NewRecorder()
-	app.server.Handler.ServeHTTP(sent, httptest.NewRequest(http.MethodPost, "/v1/threads/"+thread.ID+"/messages", bytes.NewBufferString(`{"content":"Please research SQLite"}`)))
+	sendReq := httptest.NewRequest(http.MethodPost, "/v1/threads/"+thread.ID+"/messages", bytes.NewBufferString(`{"content":"Please research SQLite"}`))
+	sendReq.Header.Set("Idempotency-Key", "stage-2-message")
+	app.server.Handler.ServeHTTP(sent, sendReq)
 	if sent.Code != http.StatusOK || !strings.Contains(sent.Body.String(), "supervisor final answer") {
 		t.Fatalf("send status=%d body=%s", sent.Code, sent.Body.String())
 	}
@@ -406,6 +433,9 @@ func TestRuntimeShutdownWaitsForTopLevelWorkerCleanup(t *testing.T) {
 	blocking := &shutdownBlockingLLM{
 		entered: make(chan struct{}), canceled: make(chan struct{}), release: make(chan struct{}),
 	}
+	var releaseOnce sync.Once
+	releaseWorker := func() { releaseOnce.Do(func() { close(blocking.release) }) }
+	defer releaseWorker()
 	providers := llm.NewEmptyLLMRegistry()
 	providers.Register("fake", blocking)
 	dataDir := filepath.Join(t.TempDir(), "shutdown")
@@ -431,38 +461,48 @@ func TestRuntimeShutdownWaitsForTopLevelWorkerCleanup(t *testing.T) {
 	go func() {
 		defer close(handlerDone)
 		req := httptest.NewRequest(http.MethodPost, "/v1/threads/"+thread.ID+"/messages", bytes.NewBufferString(`{"content":"block"}`)).WithContext(requestCtx)
+		req.Header.Set("Idempotency-Key", "shutdown-message")
 		app.server.Handler.ServeHTTP(sent, req)
 	}()
 	select {
 	case <-blocking.entered:
 	case <-time.After(5 * time.Second):
 		cancelRequest()
-		close(blocking.release)
+		releaseWorker()
 		t.Fatal("top-level worker did not reach the LLM")
 	}
-	cancelRequest() // models server.Close cancelling the in-flight HTTP request
+	// A client disconnect only detaches its observer; the backend-owned run must
+	// continue until an explicit cancel or the runtime lifecycle ends.
+	cancelRequest()
+	select {
+	case <-handlerDone:
+	case <-time.After(5 * time.Second):
+		releaseWorker()
+		t.Fatal("message handler did not detach after request cancellation")
+	}
 	select {
 	case <-blocking.canceled:
-	case <-time.After(5 * time.Second):
-		close(blocking.release)
-		t.Fatal("worker context was not cancelled")
+		releaseWorker()
+		t.Fatal("request cancellation propagated into the runtime-owned worker")
+	case <-time.After(100 * time.Millisecond):
 	}
 	shutdownDone := make(chan error, 1)
 	go func() { shutdownDone <- app.Shutdown(context.Background()) }()
 	select {
+	case <-blocking.canceled:
+	case <-time.After(5 * time.Second):
+		releaseWorker()
+		t.Fatal("runtime shutdown did not cancel the top-level worker")
+	}
+	select {
 	case err := <-shutdownDone:
-		close(blocking.release)
+		releaseWorker()
 		t.Fatalf("shutdown returned before worker cleanup was released: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	close(blocking.release)
+	releaseWorker()
 	if err := <-shutdownDone; err != nil {
 		t.Fatal(err)
-	}
-	select {
-	case <-handlerDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("message handler did not exit after shutdown")
 	}
 
 	db, err := sqliterepo.Open(filepath.Join(dataDir, "state.db"), sqliterepo.Options{})

@@ -116,7 +116,7 @@ func TestAgentPool_HonorsPreCanceledTask(t *testing.T) {
 	}
 	preparer := newTestPreparer(rt)
 	status := &recordingStatusUpdater{}
-	pool := NewAgentPool(context.Background(), testAgentID, b, preparer, rt, status, nil, nil, nil, nil, 1, cancels)
+	pool := NewAgentPool(context.Background(), testAgentID, b, preparer, rt, status, nil, nil, nil, nil, nil, 1, cancels)
 	if err := pool.Start(); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -243,6 +243,77 @@ func TestRunPreparerFreshTopLevelEnsuresTaskBudgetFromRootAgent(t *testing.T) {
 	}
 }
 
+func TestRunPreparerResolvesTeamEntryAndOutgoingEdges(t *testing.T) {
+	t.Parallel()
+
+	teamID := "team-1"
+	entryID := "entry-1"
+	workerID := "worker-1"
+	team := &agent.Agent{
+		ID: teamID, Kind: agent.ResourceKindAgentTeam,
+		TeamGraph: &agent.TeamGraph{
+			EntryAgentID: entryID,
+			Nodes:        []agent.TeamNode{{AgentID: entryID}, {AgentID: workerID}},
+			Edges: []agent.TeamEdge{{
+				SourceAgentID: entryID, TargetAgentID: workerID, ToolName: "ask_worker", Description: "Ask the worker.",
+			}},
+		},
+	}
+	entry := &agent.Agent{ID: entryID, Kind: agent.ResourceKindStandaloneAgent, Provider: "fake", Model: "fake", MaxSteps: 5, MaxRuns: 10}
+	worker := &agent.Agent{ID: workerID, Kind: agent.ResourceKindStandaloneAgent, Provider: "fake", Model: "fake", MaxSteps: 5, MaxRuns: 10}
+	preparer := NewRunPreparer(RunPreparerConfig{
+		Agents:   &fakeAgentStore{agents: map[string]*agent.Agent{teamID: team, entryID: entry, workerID: worker}},
+		Threads:  &fakeThreadStore{thread: &agent.ThreadRecord{ID: testThreadID, AgentID: teamID, UserID: testUserID}},
+		Messages: &fakeMessageStore{}, Runtime: &fakeRuntime{}, ToolRegistry: tools.NewEmptyRegistry(),
+	})
+	prepared, err := preparer.Prepare(context.Background(), DispatchRequest{
+		RunID: "team-run", AgentID: teamID, TeamID: teamID, UserID: testUserID, ThreadID: testThreadID, Input: "hello",
+	})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if prepared.Agent.ID != entryID || prepared.RunCtx.TeamID != teamID || prepared.RunCtx.Memory.AgentID != entryID {
+		t.Fatalf("prepared identity = agent %q team %q memory %q", prepared.Agent.ID, prepared.RunCtx.TeamID, prepared.RunCtx.Memory.AgentID)
+	}
+	if len(prepared.Agent.Delegates) != 1 || prepared.Agent.Delegates[0].AgentID != workerID {
+		t.Fatalf("effective delegates = %+v", prepared.Agent.Delegates)
+	}
+	if len(entry.Delegates) != 0 {
+		t.Fatalf("standalone entry was mutated: %+v", entry.Delegates)
+	}
+}
+
+func TestRunPreparerFreshExcludesDurableAcceptedPromptFromHistory(t *testing.T) {
+	t.Parallel()
+
+	rt := &fakeRuntime{}
+	agentObj := &agent.Agent{ID: testAgentID, Provider: "fake", Model: "fake", MaxSteps: 5}
+	thread := &agent.ThreadRecord{ID: testThreadID, AgentID: testAgentID, UserID: testUserID}
+	messages := []llm.ChatMessage{
+		{Role: "user", Content: "previous question"},
+		{Role: "assistant", Content: "previous answer"},
+		{Role: "user", Content: "current question", Metadata: map[string]any{"run_id": "run-1", "attempt": 1}},
+	}
+	preparer := NewRunPreparer(RunPreparerConfig{
+		Agents: &fakeAgentStore{agent: agentObj}, Threads: &fakeThreadStore{thread: thread},
+		Messages: &fakeMessageStore{messages: messages}, Runtime: rt,
+		ToolRegistry: tools.NewEmptyRegistry(), Capabilities: agent.ToolCapabilities{AsyncJobs: true},
+	})
+
+	request := freshDispatchRequest()
+	request.Input = "current question"
+	prepared, err := preparer.Prepare(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if prepared.RunCtx.Input != "current question" {
+		t.Fatalf("fresh input = %q", prepared.RunCtx.Input)
+	}
+	if len(prepared.RunCtx.History) != 2 || prepared.RunCtx.History[0].Content != "previous question" || prepared.RunCtx.History[1].Content != "previous answer" {
+		t.Fatalf("history = %#v, want only the completed previous turn", prepared.RunCtx.History)
+	}
+}
+
 func TestDirectDispatcher_PrepareErrorClosesEvents(t *testing.T) {
 	t.Parallel()
 
@@ -279,8 +350,15 @@ func TestAgentPool_ForwardWorkerEventsKeepsDrainingOnPublishError(t *testing.T) 
 
 	workerEvents := make(chan agent.StreamEvent, 4)
 	forwarderDone := make(chan struct{})
+	deferredTerminal := make(chan *agent.StreamEvent, 1)
 
-	go pool.forwardWorkerEvents(context.Background(), "task-fail", workerEvents, forwarderDone)
+	go pool.forwardWorkerEvents(
+		context.Background(),
+		DispatchPayload{RunID: "task-fail"},
+		workerEvents,
+		forwarderDone,
+		deferredTerminal,
+	)
 
 	// Send well beyond the buffer capacity. If the forwarder stops draining
 	// on the first publish failure, every send past the buffer will block.
@@ -304,6 +382,38 @@ func TestAgentPool_ForwardWorkerEventsKeepsDrainingOnPublishError(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("forwarder did not exit after workerEvents was closed")
 	}
+	<-deferredTerminal
+}
+
+func TestAgentPool_ForwardWorkerEventsPublishesTaskActivityWhenRunTopicFails(t *testing.T) {
+	t.Parallel()
+
+	hub := agent.NewTaskEventHub()
+	subscription := hub.Subscribe("root-run")
+	defer subscription.Close()
+	pool := &AgentPool{bus: &alwaysFailPublishBus{}, taskEvents: hub}
+	workerEvents := make(chan agent.StreamEvent, 1)
+	forwarderDone := make(chan struct{})
+	deferredTerminal := make(chan *agent.StreamEvent, 1)
+	payload := DispatchPayload{
+		RunID: "child-run", OriginatorRunID: "root-run", PublishTaskEvents: true,
+	}
+	go pool.forwardWorkerEvents(context.Background(), payload, workerEvents, forwarderDone, deferredTerminal)
+	workerEvents <- agent.StreamEvent{
+		RunID: "child-run", OriginatorRunID: "root-run", Type: agent.EventStepStarted,
+	}
+	close(workerEvents)
+
+	select {
+	case event := <-subscription.Events:
+		if event.RunID != "child-run" || event.Type != agent.EventStepStarted {
+			t.Fatalf("task event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("task event was coupled to failed per-run bus publication")
+	}
+	<-forwarderDone
+	<-deferredTerminal
 }
 
 // alwaysFailPublishBus satisfies bus.MessageBus and returns an error from
@@ -373,7 +483,7 @@ func TestAgentPool_CancelDuringPrepareAbortsRun(t *testing.T) {
 		Capabilities: agent.ToolCapabilities{AsyncJobs: true},
 	})
 
-	pool := NewAgentPool(context.Background(), testAgentID, b, preparer, rt, nil, nil, nil, nil, nil, 1, NewCancelRegistry(0))
+	pool := NewAgentPool(context.Background(), testAgentID, b, preparer, rt, nil, nil, nil, nil, nil, nil, 1, NewCancelRegistry(0))
 	if err := pool.Start(); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -484,7 +594,8 @@ func TestRunPreparerRejectsMissingMCPSelection(t *testing.T) {
 }
 
 type fakeAgentStore struct {
-	agent *agent.Agent
+	agent  *agent.Agent
+	agents map[string]*agent.Agent
 }
 
 type fakeMCPServerCatalog struct {
@@ -498,10 +609,17 @@ func (f fakeMCPServerCatalog) GetEnabledByIDs(context.Context, []string) (map[st
 func (f *fakeAgentStore) Create(context.Context, string, *agent.Agent) (*agent.Agent, error) {
 	return f.agent, nil
 }
-func (f *fakeAgentStore) GetByID(context.Context, string, string) (*agent.Agent, error) {
+
+func (f *fakeAgentStore) GetByID(_ context.Context, agentID, _ string) (*agent.Agent, error) {
+	if f.agents != nil {
+		return f.agents[agentID], nil
+	}
 	return f.agent, nil
 }
-func (f *fakeAgentStore) GetByIDSystem(context.Context, string) (*agent.Agent, error) {
+func (f *fakeAgentStore) GetByIDSystem(_ context.Context, agentID string) (*agent.Agent, error) {
+	if f.agents != nil {
+		return f.agents[agentID], nil
+	}
 	return f.agent, nil
 }
 func (f *fakeAgentStore) ListByUser(context.Context, string) ([]*agent.Agent, error) {

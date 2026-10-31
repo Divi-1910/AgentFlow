@@ -31,10 +31,12 @@ func TestMessageListEmptyThreadReturns200(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	var messages []any
-	decodeBody(t, resp, &messages)
-	if len(messages) != 0 {
-		t.Errorf("expected 0 messages, got %d", len(messages))
+	var page struct {
+		Items []any `json:"items"`
+	}
+	decodeBody(t, resp, &page)
+	if len(page.Items) != 0 {
+		t.Errorf("expected 0 messages, got %d", len(page.Items))
 	}
 }
 
@@ -97,18 +99,20 @@ func TestMessageSendThenListShowsMessages(t *testing.T) {
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("list: expected 200, got %d", resp2.StatusCode)
 	}
-	var messages []struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
+	var page struct {
+		Items []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"items"`
 	}
-	decodeBody(t, resp2, &messages)
-	if len(messages) < 2 {
-		t.Fatalf("expected at least 2 messages (user + assistant), got %d", len(messages))
+	decodeBody(t, resp2, &page)
+	if len(page.Items) < 2 {
+		t.Fatalf("expected at least 2 messages (user + assistant), got %d", len(page.Items))
 	}
 	// User and assistant messages are inserted in a single InsertMany call so they share
 	// the same millisecond timestamp; sort order is non-deterministic. Check presence only.
 	roleSet := map[string]bool{}
-	for _, m := range messages {
+	for _, m := range page.Items {
 		roleSet[m.Role] = true
 	}
 	if !roleSet["user"] {

@@ -6,40 +6,43 @@ import (
 	"sync"
 	"time"
 
+	"backend/agent"
 	"backend/bus"
 )
 
 const defaultWorkerCount = 4
 
 type PoolManager struct {
-	rootCtx  context.Context
-	bus      bus.MessageBus
-	preparer *RunPreparer
-	runtime  Runtime
-	status   runStatusUpdater
-	messages MessageStore
-	jobs     WorkerJobStore
-	tasks    DurableCancelStore
-	hub      *JobHub
-	workers  int
-	cancels  *CancelRegistry
+	rootCtx    context.Context
+	bus        bus.MessageBus
+	preparer   *RunPreparer
+	runtime    Runtime
+	status     runStatusUpdater
+	messages   MessageStore
+	jobs       WorkerJobStore
+	tasks      DurableCancelStore
+	hub        *JobHub
+	taskEvents *agent.TaskEventHub
+	workers    int
+	cancels    *CancelRegistry
 
 	mu    sync.Mutex
 	pools map[string]*AgentPool
 }
 
 type PoolManagerConfig struct {
-	RootCtx   context.Context
-	Bus       bus.MessageBus
-	Preparer  *RunPreparer
-	Runtime   Runtime
-	Status    runStatusUpdater // run-status store for worker pre-RunStream bail paths
-	Messages  MessageStore
-	Jobs      WorkerJobStore
-	Tasks     DurableCancelStore
-	Hub       *JobHub
-	Workers   int
-	CancelTTL time.Duration // 0 → DefaultCancelTTL
+	RootCtx    context.Context
+	Bus        bus.MessageBus
+	Preparer   *RunPreparer
+	Runtime    Runtime
+	Status     runStatusUpdater // run-status store for worker pre-RunStream bail paths
+	Messages   MessageStore
+	Jobs       WorkerJobStore
+	Tasks      DurableCancelStore
+	Hub        *JobHub
+	TaskEvents *agent.TaskEventHub
+	Workers    int
+	CancelTTL  time.Duration // 0 → DefaultCancelTTL
 }
 
 func NewPoolManager(cfg PoolManagerConfig) *PoolManager {
@@ -52,18 +55,19 @@ func NewPoolManager(cfg PoolManagerConfig) *PoolManager {
 		workers = defaultWorkerCount
 	}
 	return &PoolManager{
-		rootCtx:  rootCtx,
-		bus:      cfg.Bus,
-		preparer: cfg.Preparer,
-		runtime:  cfg.Runtime,
-		status:   cfg.Status,
-		messages: cfg.Messages,
-		jobs:     cfg.Jobs,
-		tasks:    cfg.Tasks,
-		hub:      cfg.Hub,
-		workers:  workers,
-		cancels:  NewCancelRegistry(cfg.CancelTTL),
-		pools:    make(map[string]*AgentPool),
+		rootCtx:    rootCtx,
+		bus:        cfg.Bus,
+		preparer:   cfg.Preparer,
+		runtime:    cfg.Runtime,
+		status:     cfg.Status,
+		messages:   cfg.Messages,
+		jobs:       cfg.Jobs,
+		tasks:      cfg.Tasks,
+		hub:        cfg.Hub,
+		taskEvents: cfg.TaskEvents,
+		workers:    workers,
+		cancels:    NewCancelRegistry(cfg.CancelTTL),
+		pools:      make(map[string]*AgentPool),
 	}
 }
 
@@ -81,7 +85,7 @@ func (m *PoolManager) Ensure(ctx context.Context, agentID string) error {
 		return nil
 	}
 
-	pool := NewAgentPool(m.rootCtx, agentID, m.bus, m.preparer, m.runtime, m.status, m.messages, m.jobs, m.tasks, m.hub, m.workers, m.cancels)
+	pool := NewAgentPool(m.rootCtx, agentID, m.bus, m.preparer, m.runtime, m.status, m.messages, m.jobs, m.tasks, m.hub, m.taskEvents, m.workers, m.cancels)
 	if err := pool.Start(); err != nil {
 		return err
 	}

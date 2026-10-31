@@ -9,6 +9,8 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -18,14 +20,20 @@ const (
 )
 
 type AnthropicAdapter struct {
+	baseURL    string
 	apiKey     string
 	client     *http.Client
 	maxRetries int
 }
 
 func NewAnthropicAdapter(config AdapterConfig) *AnthropicAdapter {
+	baseURL := config.BaseURL
+	if baseURL == "" {
+		baseURL = "https://api.anthropic.com/v1"
+	}
 	return &AnthropicAdapter{
-		apiKey: config.APIKey,
+		baseURL: baseURL,
+		apiKey:  config.APIKey,
 		client: &http.Client{
 			Timeout: config.Timeout,
 		},
@@ -80,8 +88,43 @@ type anthropicErrorResponse struct {
 	} `json:"error"`
 }
 
+type anthropicStreamEnvelope struct {
+	Type    string `json:"type"`
+	Index   int    `json:"index"`
+	Message *struct {
+		Model string         `json:"model"`
+		Usage anthropicUsage `json:"usage"`
+	} `json:"message"`
+	ContentBlock *struct {
+		Type  string          `json:"type"`
+		Text  string          `json:"text"`
+		ID    string          `json:"id"`
+		Name  string          `json:"name"`
+		Input json.RawMessage `json:"input"`
+	} `json:"content_block"`
+	Delta struct {
+		Type        string `json:"type"`
+		Text        string `json:"text"`
+		PartialJSON string `json:"partial_json"`
+		StopReason  string `json:"stop_reason"`
+	} `json:"delta"`
+	Usage anthropicUsage `json:"usage"`
+	Error *struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+type anthropicToolAccumulator struct {
+	id      string
+	name    string
+	initial json.RawMessage
+	partial strings.Builder
+}
+
 func (a *AnthropicAdapter) ChatCompletion(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
-	log.Printf("[anthropic] → POST https://api.anthropic.com/v1/messages model=%s messages=%d tools=%d", req.Model, len(req.Messages), len(req.Tools))
+	endpoint := a.baseURL + "/messages"
+	log.Printf("[anthropic] → POST %s model=%s messages=%d tools=%d", endpoint, req.Model, len(req.Messages), len(req.Tools))
 
 	payload := a.buildPayload(req)
 
@@ -108,7 +151,7 @@ func (a *AnthropicAdapter) ChatCompletion(ctx context.Context, req *ChatRequest)
 		}
 
 		attemptStart := time.Now()
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(bodyBytes))
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
@@ -162,6 +205,201 @@ func (a *AnthropicAdapter) ChatCompletion(ctx context.Context, req *ChatRequest)
 
 	log.Printf("[anthropic] ✗ exhausted all %d retries total_elapsed=%v", a.maxRetries, time.Since(start))
 	return nil, fmt.Errorf("request failed after %d retries: %w", a.maxRetries, lastErr)
+}
+
+// ChatCompletionStream consumes Anthropic's message event stream. Thinking
+// events and partial tool JSON are intentionally not projected to callers;
+// only text_delta content is display-safe.
+func (a *AnthropicAdapter) ChatCompletionStream(ctx context.Context, req *ChatRequest, onTextDelta TextDeltaHandler) (*ChatResponse, error) {
+	endpoint := a.baseURL + "/messages"
+	payload := a.buildPayload(req)
+	payload["stream"] = true
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal anthropic streaming request: %w", err)
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= a.maxRetries; attempt++ {
+		if err := waitForRetry(ctx, attempt); err != nil {
+			return nil, err
+		}
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create anthropic streaming request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("x-api-key", a.apiKey)
+		httpReq.Header.Set("anthropic-version", anthropicAPIVersion)
+
+		httpResp, err := a.client.Do(httpReq)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			lastErr = fmt.Errorf("anthropic streaming request failed: %w", err)
+			continue
+		}
+
+		if httpResp.StatusCode != http.StatusOK {
+			respBody, readErr := io.ReadAll(io.LimitReader(httpResp.Body, 64<<10))
+			httpResp.Body.Close()
+			if readErr != nil {
+				lastErr = fmt.Errorf("failed to read anthropic error response: %w", readErr)
+			} else {
+				lastErr = a.handleErrorStatus(httpResp.StatusCode, respBody)
+			}
+			if httpResp.StatusCode == http.StatusTooManyRequests || httpResp.StatusCode >= 500 {
+				continue
+			}
+			return nil, lastErr
+		}
+
+		response, visible, retryable, streamErr := consumeAnthropicStream(ctx, httpResp.Body, onTextDelta)
+		httpResp.Body.Close()
+		if streamErr == nil {
+			return response, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if visible {
+			return nil, fmt.Errorf("%w: %v", ErrStreamInterrupted, streamErr)
+		}
+		lastErr = streamErr
+		if !retryable {
+			return nil, streamErr
+		}
+	}
+
+	return nil, fmt.Errorf("anthropic streaming request failed after %d retries: %w", a.maxRetries, lastErr)
+}
+
+func consumeAnthropicStream(ctx context.Context, body io.Reader, onTextDelta TextDeltaHandler) (*ChatResponse, bool, bool, error) {
+	response := &ChatResponse{}
+	tools := make(map[int]*anthropicToolAccumulator)
+	visible := false
+	done := false
+	var protocolErr error
+	var providerErr error
+	var callbackErr error
+
+	emitText := func(delta string) error {
+		if delta == "" {
+			return nil
+		}
+		visible = true
+		response.Content += delta
+		if onTextDelta == nil {
+			return nil
+		}
+		if err := onTextDelta(delta); err != nil {
+			callbackErr = err
+			return err
+		}
+		return nil
+	}
+
+	err := readSSE(ctx, body, func(event sseEvent) error {
+		var envelope anthropicStreamEnvelope
+		if err := json.Unmarshal([]byte(event.Data), &envelope); err != nil {
+			protocolErr = fmt.Errorf("parse anthropic stream event: %w", err)
+			return protocolErr
+		}
+		if envelope.Type == "" {
+			envelope.Type = event.Name
+		}
+
+		switch envelope.Type {
+		case "message_start":
+			if envelope.Message != nil {
+				response.Model = envelope.Message.Model
+				response.Usage.PromptTokens = envelope.Message.Usage.InputTokens
+				response.Usage.CompletionTokens = envelope.Message.Usage.OutputTokens
+			}
+		case "content_block_start":
+			if envelope.ContentBlock == nil {
+				return nil
+			}
+			switch envelope.ContentBlock.Type {
+			case "text":
+				return emitText(envelope.ContentBlock.Text)
+			case "tool_use":
+				tools[envelope.Index] = &anthropicToolAccumulator{
+					id:      envelope.ContentBlock.ID,
+					name:    envelope.ContentBlock.Name,
+					initial: append(json.RawMessage(nil), envelope.ContentBlock.Input...),
+				}
+			}
+		case "content_block_delta":
+			switch envelope.Delta.Type {
+			case "text_delta":
+				return emitText(envelope.Delta.Text)
+			case "input_json_delta":
+				tool := tools[envelope.Index]
+				if tool == nil {
+					tool = &anthropicToolAccumulator{}
+					tools[envelope.Index] = tool
+				}
+				tool.partial.WriteString(envelope.Delta.PartialJSON)
+			}
+		case "message_delta":
+			response.Usage.CompletionTokens = envelope.Usage.OutputTokens
+		case "message_stop":
+			done = true
+		case "error":
+			if envelope.Error == nil {
+				providerErr = fmt.Errorf("anthropic stream returned an unspecified provider error")
+			} else {
+				providerErr = fmt.Errorf("anthropic stream error (%s): %s", envelope.Error.Type, envelope.Error.Message)
+			}
+			return providerErr
+		}
+		// ping, thinking_delta, signature_delta, and unknown future events do
+		// not belong in the user-visible text projection.
+		return nil
+	})
+	if err != nil {
+		switch {
+		case callbackErr != nil:
+			return nil, visible, false, callbackErr
+		case protocolErr != nil:
+			return nil, visible, false, protocolErr
+		case providerErr != nil:
+			return nil, visible, true, providerErr
+		default:
+			return nil, visible, true, err
+		}
+	}
+	if !done {
+		return nil, visible, true, io.ErrUnexpectedEOF
+	}
+
+	indices := make([]int, 0, len(tools))
+	for index := range tools {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+	for _, index := range indices {
+		tool := tools[index]
+		arguments := tool.partial.String()
+		if arguments == "" {
+			arguments = string(tool.initial)
+		}
+		if arguments == "" || arguments == "null" {
+			arguments = "{}"
+		}
+		response.ToolCalls = append(response.ToolCalls, ToolCall{
+			ID:        tool.id,
+			Name:      tool.name,
+			Arguments: json.RawMessage(arguments),
+		})
+	}
+	response.Usage.TotalTokens = response.Usage.PromptTokens + response.Usage.CompletionTokens
+	return response, visible, false, nil
 }
 
 func (a *AnthropicAdapter) buildPayload(req *ChatRequest) map[string]interface{} {

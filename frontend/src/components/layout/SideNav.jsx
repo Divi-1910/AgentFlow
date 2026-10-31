@@ -15,7 +15,7 @@ function navLinkClassName({ isActive }, sidebarCollapsed) {
   if (isActive) {
     return `${base} ${spacing} bg-white/[0.06] text-white shadow-[0_4px_24px_-8px_rgba(0,0,0,0.5)] border border-white/5`
   }
-  return `${base} ${spacing} text-white/40 border border-transparent hover:bg-white/[0.02] hover:text-white hover:border-white/5 hover:shadow-[0_4px_24px_-8px_rgba(0,0,0,0.5)]`
+  return `${base} ${spacing} text-content-supporting border border-transparent hover:bg-white/[0.02] hover:text-white hover:border-white/5 hover:shadow-[0_4px_24px_-8px_rgba(0,0,0,0.5)]`
 }
 
 function SideNav() {
@@ -46,7 +46,7 @@ function SideNav() {
         <button
           type="button"
           onClick={toggleCollapse}
-          className="absolute -right-3.5 top-8 z-[60] hidden h-7 w-7 items-center justify-center rounded-full border border-white/20 bg-black text-white/50 shadow-[0_0_16px_rgba(255,255,255,0.1)] transition-all hover:border-white/50 hover:text-white hover:scale-110 active:scale-95 lg:flex"
+          className="absolute -right-3.5 top-8 z-[60] hidden h-7 w-7 items-center justify-center rounded-full border border-white/20 bg-black text-content-supporting shadow-[0_0_16px_rgba(255,255,255,0.1)] transition-all hover:border-white/50 hover:text-white hover:scale-110 active:scale-95 lg:flex"
           aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
         >
           <span className="material-symbols-outlined text-[14px]">
@@ -74,7 +74,7 @@ function SideNav() {
             }`}
           >
             <h1 className="font-headline text-[24px] font-extrabold tracking-tight text-white leading-none whitespace-nowrap">
-              Agent<span className="italic font-light text-white/50">Flow</span>
+              Agent<span className="italic font-light text-content-supporting">Flow</span>
             </h1>
           </div>
         </div>
@@ -97,7 +97,7 @@ function SideNav() {
                     <div className="absolute left-0 top-1/2 h-[40%] w-1 -translate-y-1/2 rounded-r-full bg-white shadow-[0_0_12px_rgba(255,255,255,0.8)]" />
                   )}
                   
-                  <span className={`material-symbols-outlined shrink-0 text-[20px] transition-all duration-500 ${isActive ? 'text-white' : 'text-white/50'} ${!sidebarCollapsed && 'group-hover:-rotate-6 group-hover:scale-110 group-hover:text-white'}`}>
+                  <span className={`material-symbols-outlined shrink-0 text-[20px] transition-all duration-500 ${isActive ? 'text-white' : 'text-content-supporting'} ${!sidebarCollapsed && 'group-hover:-rotate-6 group-hover:scale-110 group-hover:text-white'}`}>
                     {link.icon}
                   </span>
                   
@@ -120,7 +120,7 @@ function SideNav() {
             <button
               type="button"
               onClick={logout}
-              className={`flex w-full items-center gap-4 rounded-2xl p-4 font-headline text-[11px] font-bold uppercase tracking-[0.15em] text-white/50 transition-all duration-300 hover:text-white ${
+              className={`flex w-full items-center gap-4 rounded-2xl p-4 font-headline text-[11px] font-bold uppercase tracking-[0.15em] text-content-supporting transition-all duration-300 hover:text-white ${
                 sidebarCollapsed ? 'lg:justify-center px-0' : ''
               }`}
               title={sidebarCollapsed ? 'Logout' : undefined}

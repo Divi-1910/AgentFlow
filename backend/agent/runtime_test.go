@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -29,6 +30,38 @@ type fakeLLM struct {
 	replies []fakeReply
 	calls   []*llm.ChatRequest
 	idx     int
+}
+
+type streamingFakeLLM struct {
+	mu            sync.Mutex
+	deltas        []string
+	resp          llm.ChatResponse
+	err           error
+	streamCalls   int
+	bufferedCalls int
+}
+
+func (f *streamingFakeLLM) ChatCompletion(_ context.Context, _ *llm.ChatRequest) (*llm.ChatResponse, error) {
+	f.mu.Lock()
+	f.bufferedCalls++
+	f.mu.Unlock()
+	return nil, errors.New("streamingFakeLLM: buffered method should not be called")
+}
+
+func (f *streamingFakeLLM) ChatCompletionStream(_ context.Context, _ *llm.ChatRequest, onTextDelta llm.TextDeltaHandler) (*llm.ChatResponse, error) {
+	f.mu.Lock()
+	f.streamCalls++
+	f.mu.Unlock()
+	for _, delta := range f.deltas {
+		if err := onTextDelta(delta); err != nil {
+			return nil, err
+		}
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	response := f.resp
+	return &response, nil
 }
 
 func (f *fakeLLM) ChatCompletion(_ context.Context, req *llm.ChatRequest) (*llm.ChatResponse, error) {
@@ -69,6 +102,31 @@ type statusUpdate struct {
 	status string
 }
 
+type transitionCall struct {
+	from string
+	to   string
+}
+
+type cancellingCheckpointStore struct {
+	fakeCheckpointStore
+	mu          sync.Mutex
+	transitions []transitionCall
+}
+
+func (s *cancellingCheckpointStore) TransitionStatus(_ context.Context, _, from, to string) (bool, error) {
+	s.mu.Lock()
+	s.transitions = append(s.transitions, transitionCall{from: from, to: to})
+	s.mu.Unlock()
+	if from == "running" {
+		return false, nil
+	}
+	return from == "cancelling" && to == "cancelled", nil
+}
+
+func (s *cancellingCheckpointStore) GetRun(_ context.Context, runID string) (*RunInfo, error) {
+	return &RunInfo{RunID: runID, Status: "cancelling"}, nil
+}
+
 func (s *fakeCheckpointStore) Save(_ context.Context, snap RunSnapshot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -104,7 +162,7 @@ func (s *fakeCheckpointStore) LoadLatest(_ context.Context, _ string) (*RunSnaps
 	return nil, nil
 }
 func (s *fakeCheckpointStore) TransitionStatus(_ context.Context, _, _, _ string) (bool, error) {
-	return false, nil
+	return true, nil
 }
 func (s *fakeCheckpointStore) TransitionStatusForUser(_ context.Context, _, _, _, _ string) (bool, error) {
 	return false, nil
@@ -278,6 +336,121 @@ func TestRunSingleStepEmitsEventsInOrder(t *testing.T) {
 	for i, et := range want {
 		if got[i] != et {
 			t.Errorf("event[%d]: got %q, want %q", i, got[i], et)
+		}
+	}
+}
+
+func TestRunStreamingResponseEmitsDeltasBeforeCompletedModel(t *testing.T) {
+	t.Parallel()
+	lm := &streamingFakeLLM{
+		deltas: []string{"Hel", "lo"},
+		resp: llm.ChatResponse{
+			Content: "Hello",
+			Model:   "resolved-model",
+			Usage:   llm.TokenUsage{PromptTokens: 4, CompletionTokens: 2, TotalTokens: 6},
+		},
+	}
+	rt, ag := newTestRuntime(lm, nil)
+	sink := &captureEventSink{}
+
+	result, err := rt.runInternal(context.Background(), ag, newTestRunCtx("hi"), sink)
+	if err != nil {
+		t.Fatalf("runInternal: %v", err)
+	}
+	if result.Output != "Hello" {
+		t.Fatalf("output = %q, want Hello", result.Output)
+	}
+
+	wantTypes := []EventType{
+		EventRunStarted,
+		EventStepStarted,
+		EventStatusUpdated,
+		EventModelDelta,
+		EventModelDelta,
+		EventModelCompleted,
+		EventStepCompleted,
+		EventRunCompleted,
+	}
+	gotTypes := sink.types()
+	if len(gotTypes) != len(wantTypes) {
+		t.Fatalf("event types = %v, want %v", gotTypes, wantTypes)
+	}
+	for i := range wantTypes {
+		if gotTypes[i] != wantTypes[i] {
+			t.Fatalf("event[%d] = %q, want %q", i, gotTypes[i], wantTypes[i])
+		}
+	}
+
+	sink.mu.Lock()
+	firstDelta := sink.events[3]
+	secondDelta := sink.events[4]
+	completed := sink.events[5]
+	sink.mu.Unlock()
+	if firstDelta.Delta != "Hel" || secondDelta.Delta != "lo" {
+		t.Fatalf("deltas = %q, %q", firstDelta.Delta, secondDelta.Delta)
+	}
+	if completed.Provider != "fake" || completed.Model != "resolved-model" || completed.Usage == nil || completed.Usage.TotalTokens != 6 {
+		t.Fatalf("model.completed = %+v", completed)
+	}
+
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	if lm.streamCalls != 1 || lm.bufferedCalls != 0 {
+		t.Fatalf("stream calls = %d, buffered calls = %d", lm.streamCalls, lm.bufferedCalls)
+	}
+}
+
+func TestRunStreamingInterruptionFailsWithoutModelCompleted(t *testing.T) {
+	t.Parallel()
+	lm := &streamingFakeLLM{
+		deltas: []string{"partial"},
+		err:    fmt.Errorf("%w: connection closed", llm.ErrStreamInterrupted),
+	}
+	rt, ag := newTestRuntime(lm, nil)
+	sink := &captureEventSink{}
+
+	result, err := rt.runInternal(context.Background(), ag, newTestRunCtx("hi"), sink)
+	if result != nil {
+		t.Fatalf("result = %+v, want nil", result)
+	}
+	if !errors.Is(err, llm.ErrStreamInterrupted) {
+		t.Fatalf("error = %v, want ErrStreamInterrupted", err)
+	}
+	if sink.has(EventModelCompleted) || sink.has(EventRunCompleted) {
+		t.Fatalf("terminal event types = %v", sink.types())
+	}
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	last := sink.events[len(sink.events)-1]
+	if last.Type != EventRunFailed || last.Error == nil || last.Error.Code != "provider.stream_interrupted" {
+		t.Fatalf("last event = %+v", last)
+	}
+}
+
+func TestRunCancellationFenceFinalizesDurableCancellation(t *testing.T) {
+	t.Parallel()
+	store := &cancellingCheckpointStore{}
+	lm := &fakeLLM{replies: []fakeReply{textReply("late success")}}
+	rt, ag := newTestRuntime(lm, store)
+	sink := &captureEventSink{}
+
+	_, err := rt.runInternal(context.Background(), ag, newTestRunCtx("hi"), sink)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !sink.has(EventRunCancelled) || sink.has(EventRunCompleted) {
+		t.Fatalf("terminal events = %v, want cancellation only", sink.types())
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	want := []transitionCall{{from: "running", to: "completed"}, {from: "cancelling", to: "cancelled"}}
+	if len(store.transitions) != len(want) {
+		t.Fatalf("transitions = %+v, want %+v", store.transitions, want)
+	}
+	for i := range want {
+		if store.transitions[i] != want[i] {
+			t.Fatalf("transition %d = %+v, want %+v", i, store.transitions[i], want[i])
 		}
 	}
 }
@@ -803,6 +976,11 @@ func TestClassifyError(t *testing.T) {
 			name: "nil returns engine.runtime_error",
 			err:  nil,
 			want: "engine.runtime_error",
+		},
+		{
+			name: "stream interrupted after visible output",
+			err:  fmt.Errorf("wrapped: %w", llm.ErrStreamInterrupted),
+			want: "provider.stream_interrupted",
 		},
 		{
 			name: "ErrMaxStepsReached",

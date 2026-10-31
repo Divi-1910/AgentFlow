@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"backend/agent"
+	"backend/llm"
 	"backend/mcp"
 	"backend/runtimectx"
 	"backend/tools"
@@ -83,7 +84,7 @@ func (p *RunPreparer) EstimateSystemPromptTokens(ctx context.Context, req Estima
 	if p == nil || p.runtime == nil || p.agents == nil {
 		return 0
 	}
-	ag, err := p.agents.GetByID(ctx, req.AgentID, req.UserID)
+	ag, err := p.resolveExecutionAgent(ctx, req.AgentID, req.TeamID, req.UserID, false)
 	if err != nil {
 		return 0
 	}
@@ -117,7 +118,17 @@ func (p *RunPreparer) prepareFresh(ctx context.Context, req DispatchRequest) (Pr
 		return PreparedRun{}, fmt.Errorf("dispatcher: request agent %s does not own thread %s", req.AgentID, req.ThreadID)
 	}
 
-	ag, err := p.agents.GetByID(ctx, threadAgentID, req.UserID)
+	teamID := req.TeamID
+	if teamID == "" {
+		resource, loadErr := p.agents.GetByID(ctx, threadAgentID, req.UserID)
+		if loadErr != nil {
+			return PreparedRun{}, fmt.Errorf("dispatcher: load agent: %w", loadErr)
+		}
+		if agent.EffectiveResourceKind(resource) == agent.ResourceKindAgentTeam {
+			teamID = resource.ID
+		}
+	}
+	ag, err := p.resolveExecutionAgent(ctx, threadAgentID, teamID, req.UserID, false)
 	if err != nil {
 		return PreparedRun{}, fmt.Errorf("dispatcher: load agent: %w", err)
 	}
@@ -130,6 +141,11 @@ func (p *RunPreparer) prepareFresh(ctx context.Context, req DispatchRequest) (Pr
 	if err != nil {
 		return PreparedRun{}, fmt.Errorf("dispatcher: load history: %w", err)
 	}
+	// Admission persists the current prompt before dispatch so a crash cannot
+	// lose accepted input. It is therefore already visible in the transcript.
+	// Keep it out of historical context because ContextBuilder appends req.Input
+	// as the fresh user message; otherwise the model would receive it twice.
+	rawMessages = withoutAcceptedPrompt(rawMessages, req.RunID)
 
 	turns := agent.GroupIntoTurns(rawMessages)
 	currentSummary := thread.Summary
@@ -203,6 +219,7 @@ func (p *RunPreparer) prepareFresh(ctx context.Context, req DispatchRequest) (Pr
 		Agent: ag,
 		RunCtx: agent.RunContext{
 			RunID:         req.RunID,
+			TeamID:        teamID,
 			ThreadID:      req.ThreadID,
 			Attempt:       1,
 			Summary:       currentSummary,
@@ -225,6 +242,21 @@ func (p *RunPreparer) prepareFresh(ctx context.Context, req DispatchRequest) (Pr
 	}, nil
 }
 
+func withoutAcceptedPrompt(messages []llm.ChatMessage, runID string) []llm.ChatMessage {
+	if runID == "" {
+		return messages
+	}
+	filtered := make([]llm.ChatMessage, 0, len(messages))
+	for _, message := range messages {
+		messageRunID, _ := message.Metadata["run_id"].(string)
+		if message.Role == "user" && messageRunID == runID {
+			continue
+		}
+		filtered = append(filtered, message)
+	}
+	return filtered
+}
+
 func (p *RunPreparer) prepareResume(ctx context.Context, req DispatchRequest) (PreparedRun, error) {
 	if p.agents == nil || p.runs == nil {
 		return PreparedRun{}, fmt.Errorf("dispatcher: run preparer is not configured")
@@ -237,7 +269,11 @@ func (p *RunPreparer) prepareResume(ctx context.Context, req DispatchRequest) (P
 
 	// Load the agent first so the effective tool set (delegates included) can
 	// be built for validation.
-	ag, err := p.agents.GetByIDSystem(ctx, snapshot.Meta.AgentID)
+	teamID := req.TeamID
+	if teamID == "" {
+		teamID = snapshot.Meta.TeamID
+	}
+	ag, err := p.resolveExecutionAgent(ctx, snapshot.Meta.AgentID, teamID, req.UserID, true)
 	if err != nil {
 		return PreparedRun{}, fmt.Errorf("dispatcher: load agent for resume: %w", err)
 	}
@@ -278,6 +314,7 @@ func (p *RunPreparer) prepareResume(ctx context.Context, req DispatchRequest) (P
 		Agent: ag,
 		RunCtx: agent.RunContext{
 			RunID:      req.RunID,
+			TeamID:     teamID,
 			ThreadID:   snapshot.Meta.ThreadID,
 			Attempt:    attempt,
 			Checkpoint: snapshot,
@@ -297,6 +334,50 @@ func (p *RunPreparer) prepareResume(ctx context.Context, req DispatchRequest) (P
 			SystemContext:   snapshot.Meta.SystemContext,
 		},
 	}, nil
+}
+
+func (p *RunPreparer) resolveExecutionAgent(ctx context.Context, requestedAgentID, teamID, userID string, system bool) (*agent.Agent, error) {
+	load := func(agentID string) (*agent.Agent, error) {
+		if system {
+			return p.agents.GetByIDSystem(ctx, agentID)
+		}
+		return p.agents.GetByID(ctx, agentID, userID)
+	}
+	var team *agent.Agent
+	if teamID == "" {
+		loaded, err := load(requestedAgentID)
+		if err != nil {
+			return nil, err
+		}
+		if agent.EffectiveResourceKind(loaded) != agent.ResourceKindAgentTeam {
+			return loaded, nil
+		}
+		teamID = loaded.ID
+		team = loaded
+	}
+	if team == nil {
+		var err error
+		team, err = load(teamID)
+		if err != nil {
+			return nil, fmt.Errorf("dispatcher: load team: %w", err)
+		}
+	}
+	if agent.EffectiveResourceKind(team) != agent.ResourceKindAgentTeam || team.TeamGraph == nil {
+		return nil, fmt.Errorf("dispatcher: team %s has no executable graph", teamID)
+	}
+	agentID := requestedAgentID
+	if requestedAgentID == teamID {
+		agentID = team.TeamGraph.EntryAgentID
+	}
+	base, err := load(agentID)
+	if err != nil {
+		return nil, fmt.Errorf("dispatcher: load team agent: %w", err)
+	}
+	resolved, err := agent.EffectiveTeamAgent(team, base, agentID)
+	if err != nil {
+		return nil, fmt.Errorf("dispatcher: resolve team agent: %w", err)
+	}
+	return resolved, nil
 }
 
 func (p *RunPreparer) resolveMCPConnections(ctx context.Context, ag *agent.Agent) (*agent.Agent, error) {

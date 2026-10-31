@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"backend/deployment"
+	"backend/pagination"
 	"backend/publisher"
 )
 
@@ -18,6 +19,10 @@ type publicationService interface {
 	Restore(ctx context.Context, userID, deploymentID string, sourceRevision int, idempotencyKey string) (*publisher.Result, error)
 	GetBundle(ctx context.Context, userID, deploymentID string, revision int) (*deployment.Revision, error)
 	ListRevisions(ctx context.Context, userID, deploymentID string, limit int) ([]deployment.Revision, error)
+}
+
+type publicationPageService interface {
+	ListRevisionPage(ctx context.Context, userID, deploymentID string, request deployment.RevisionPageRequest) (deployment.RevisionPage, error)
 }
 
 type PublicationHandler struct{ service publicationService }
@@ -49,10 +54,6 @@ type PublicationSummary struct {
 	BundleURL      string `json:"bundle_url"`
 }
 
-type ListPublicationsResponse struct {
-	Publications []PublicationSummary `json:"publications"`
-}
-
 func (h *PublicationHandler) Publish(w http.ResponseWriter, r *http.Request) {
 	userID, ok := getUserID(r)
 	if !ok {
@@ -71,7 +72,7 @@ func (h *PublicationHandler) Publish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := h.service.Publish(r.Context(), userID, agentID, idempotencyKey)
-	h.writePublicationResult(w, agentID, result, err, "publish")
+	h.writePublicationResult(w, agentID, resourceAPIBase(r), result, err, "publish")
 }
 
 func (h *PublicationHandler) Restore(w http.ResponseWriter, r *http.Request) {
@@ -97,10 +98,10 @@ func (h *PublicationHandler) Restore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result, err := h.service.Restore(r.Context(), userID, deploymentID, sourceRevision, idempotencyKey)
-	h.writePublicationResult(w, deploymentID, result, err, "restore")
+	h.writePublicationResult(w, deploymentID, resourceAPIBase(r), result, err, "restore")
 }
 
-func (h *PublicationHandler) writePublicationResult(w http.ResponseWriter, deploymentID string, result *publisher.Result, err error, operation string) {
+func (h *PublicationHandler) writePublicationResult(w http.ResponseWriter, deploymentID, resourceBase string, result *publisher.Result, err error, operation string) {
 	if err != nil {
 		switch {
 		case errors.Is(err, publisher.ErrRootAgentNotFound):
@@ -126,7 +127,7 @@ func (h *PublicationHandler) writePublicationResult(w http.ResponseWriter, deplo
 		return
 	}
 	revision := result.Revision
-	bundleURL := fmt.Sprintf("/api/agents/%s/publications/%d/bundle", deploymentID, revision.Revision)
+	bundleURL := fmt.Sprintf("%s/%s/publications/%d/bundle", resourceBase, deploymentID, revision.Revision)
 	w.Header().Set("Location", bundleURL)
 	status := http.StatusCreated
 	if result.WasExisting {
@@ -183,25 +184,33 @@ func (h *PublicationHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	limit := 50
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed <= 0 || parsed > 200 {
-			writeError(w, http.StatusBadRequest, "limit must be between 1 and 200")
-			return
-		}
-		limit = parsed
+	request, ok := parsePage(w, r, "publications", 50)
+	if !ok {
+		return
 	}
 	deploymentID := r.PathValue("id")
-	revisions, err := h.service.ListRevisions(r.Context(), userID, deploymentID, limit)
+	pageService, supportsPages := h.service.(publicationPageService)
+	var page deployment.RevisionPage
+	var err error
+	if supportsPages {
+		before := 0
+		if request.Cursor != nil {
+			before = request.Cursor.Number
+		}
+		page, err = pageService.ListRevisionPage(r.Context(), userID, deploymentID, deployment.RevisionPageRequest{Limit: request.Limit, BeforeRevision: before})
+	} else if request.Cursor == nil {
+		page.Items, err = h.service.ListRevisions(r.Context(), userID, deploymentID, request.Limit)
+	} else {
+		err = errors.New("publication pagination is unavailable")
+	}
 	if err != nil {
 		slog.Error("list deployment revisions failed", "deployment_id", deploymentID, "user_id", userID, "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to list deployment revisions")
 		return
 	}
-	response := ListPublicationsResponse{Publications: make([]PublicationSummary, len(revisions))}
-	for i, revision := range revisions {
-		response.Publications[i] = PublicationSummary{
+	items := make([]PublicationSummary, len(page.Items))
+	for i, revision := range page.Items {
+		items[i] = PublicationSummary{
 			DeploymentID:   revision.DeploymentID,
 			RootAgentID:    revision.RootAgentID,
 			Revision:       revision.Revision,
@@ -209,8 +218,17 @@ func (h *PublicationHandler) List(w http.ResponseWriter, r *http.Request) {
 			ConfigHash:     revision.ConfigHash,
 			SchemaVersion:  revision.SchemaVersion,
 			CreatedAt:      revision.CreatedAt.UTC().Format(time.RFC3339Nano),
-			BundleURL:      fmt.Sprintf("/api/agents/%s/publications/%d/bundle", deploymentID, revision.Revision),
+			BundleURL:      fmt.Sprintf("%s/%s/publications/%d/bundle", resourceAPIBase(r), deploymentID, revision.Revision),
 		}
+	}
+	var next *pagination.Cursor
+	if page.NextRevision > 0 {
+		next = &pagination.Cursor{Kind: "publications", Number: page.NextRevision}
+	}
+	response, err := pageResponse(items, next)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to encode publication page")
+		return
 	}
 	writeJSON(w, http.StatusOK, response)
 }

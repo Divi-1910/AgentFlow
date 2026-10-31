@@ -9,7 +9,7 @@ import (
 	backenddb "backend/db"
 )
 
-const schemaVersion = 3
+const schemaVersion = 5
 
 type Options = backenddb.SQLiteOptions
 
@@ -29,7 +29,7 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	return migrate(ctx, db, migrations)
 }
 
-var migrations = []string{migrationV1, migrationV2, migrationV3}
+var migrations = []string{migrationV1, migrationV2, migrationV3, migrationV4, migrationV5}
 
 func migrate(ctx context.Context, db *sql.DB, steps []string) error {
 	var current int
@@ -260,4 +260,23 @@ CREATE TABLE deployment_identity (
     synthetic_user_id TEXT NOT NULL,
     bound_at INTEGER NOT NULL
 );
+`
+
+const migrationV4 = `
+ALTER TABLE runs ADD COLUMN submission_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN accepted_input TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN prompt_persisted INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN dispatch_started INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN active_slot TEXT;
+CREATE UNIQUE INDEX runs_submission_unique ON runs(user_id, thread_id, submission_key) WHERE submission_key <> '';
+CREATE UNIQUE INDEX runs_active_slot_unique ON runs(active_slot) WHERE active_slot IS NOT NULL;
+ALTER TABLE messages ADD COLUMN dedupe_key TEXT;
+CREATE UNIQUE INDEX messages_dedupe_unique ON messages(dedupe_key) WHERE dedupe_key IS NOT NULL;
+`
+
+const migrationV5 = `
+DROP INDEX IF EXISTS threads_user_agent_idx;
+CREATE INDEX threads_user_agent_activity_idx ON threads(user_id, agent_id, updated_at DESC, id DESC);
+CREATE INDEX threads_user_activity_idx ON threads(user_id, updated_at DESC, id DESC) WHERE kind <> 'sub';
+CREATE INDEX runs_owner_timeline_idx ON runs(user_id, parent_run_id, invocation_kind, created_at DESC, run_id DESC);
 `

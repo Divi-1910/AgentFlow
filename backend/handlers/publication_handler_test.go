@@ -11,6 +11,7 @@ import (
 
 	"backend/deployment"
 	"backend/handlers"
+	"backend/pagination"
 	"backend/publisher"
 )
 
@@ -252,13 +253,13 @@ func TestPublicationHandlerListsRevisionMetadataNewestFirst(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
 	}
-	var response handlers.ListPublicationsResponse
+	var response pagination.Response[handlers.PublicationSummary]
 	decodeJSON(t, w.Body.Bytes(), &response)
-	if len(response.Publications) != 2 || response.Publications[0].Revision != 3 || response.Publications[1].Revision != 2 {
+	if len(response.Items) != 2 || response.Items[0].Revision != 3 || response.Items[1].Revision != 2 {
 		t.Fatalf("response = %+v", response)
 	}
-	if response.Publications[0].BundleURL != "/api/agents/"+testAgentID+"/publications/3/bundle" {
-		t.Fatalf("bundle URL = %q", response.Publications[0].BundleURL)
+	if response.Items[0].BundleURL != "/api/agents/"+testAgentID+"/publications/3/bundle" {
+		t.Fatalf("bundle URL = %q", response.Items[0].BundleURL)
 	}
 	if strings.Contains(w.Body.String(), "must-not-leak") {
 		t.Fatal("bundle bytes leaked into list response")

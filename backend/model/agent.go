@@ -9,6 +9,7 @@ import (
 type AgentDocument struct {
 	ID     bson.ObjectID `bson:"_id,omitempty" json:"id"`
 	UserID bson.ObjectID `bson:"user_id"       json:"user_id"`
+	Kind   string        `bson:"kind,omitempty" json:"kind,omitempty"`
 
 	Name        string `bson:"name"                  json:"name"`
 	Description string `bson:"description,omitempty" json:"description,omitempty"`
@@ -19,6 +20,7 @@ type AgentDocument struct {
 	SystemPrompt string                  `bson:"system_prompt" json:"system_prompt"`
 	Tools        []string                `bson:"tools"         json:"tools"`
 	Delegates    []DelegateConfigDoc     `bson:"delegates,omitempty" json:"delegates,omitempty"`
+	TeamGraph    *TeamGraphDoc           `bson:"team_graph,omitempty" json:"team_graph,omitempty"`
 	MCPServers   []MCPServerSelectionDoc `bson:"mcp_servers,omitempty" json:"mcp_servers,omitempty"`
 
 	ContextWindow      int     `bson:"context_window,omitempty"      json:"context_window,omitempty"`
@@ -40,6 +42,32 @@ type DelegateConfigDoc struct {
 	ToolName     string `bson:"tool_name"     json:"tool_name"`
 	Description  string `bson:"description"   json:"description"`
 	Instructions string `bson:"instructions,omitempty" json:"instructions,omitempty"`
+}
+
+type TeamGraphDoc struct {
+	EntryAgentID string        `bson:"entry_agent_id" json:"entry_agent_id"`
+	Nodes        []TeamNodeDoc `bson:"nodes" json:"nodes"`
+	Edges        []TeamEdgeDoc `bson:"edges" json:"edges"`
+}
+
+type TeamNodeDoc struct {
+	AgentID  string          `bson:"agent_id" json:"agent_id"`
+	Position TeamPositionDoc `bson:"position" json:"position"`
+}
+
+type TeamPositionDoc struct {
+	X float64 `bson:"x" json:"x"`
+	Y float64 `bson:"y" json:"y"`
+}
+
+type TeamEdgeDoc struct {
+	SourceAgentID string `bson:"source_agent_id" json:"source_agent_id"`
+	TargetAgentID string `bson:"target_agent_id" json:"target_agent_id"`
+	SourcePort    string `bson:"source_port,omitempty" json:"source_port,omitempty"`
+	TargetPort    string `bson:"target_port,omitempty" json:"target_port,omitempty"`
+	ToolName      string `bson:"tool_name" json:"tool_name"`
+	Description   string `bson:"description" json:"description"`
+	Instructions  string `bson:"instructions,omitempty" json:"instructions,omitempty"`
 }
 
 // MCPServerSelectionDoc persists only the stable catalog selection. Connection

@@ -19,6 +19,7 @@ type fakeDeploymentService struct {
 	runFn    func(context.Context, deployment.RunRequest) (*deployment.MutationResult, error)
 	deleteFn func(context.Context, deployment.DeleteRequest) (*deployment.MutationResult, error)
 	getFn    func(context.Context, string, string) (*deployment.DeployState, error)
+	listFn   func(context.Context, string, deployment.DeployStatePageRequest) (deployment.DeployStatePage, error)
 }
 
 func (f *fakeDeploymentService) RequestRun(ctx context.Context, request deployment.RunRequest) (*deployment.MutationResult, error) {
@@ -31,6 +32,10 @@ func (f *fakeDeploymentService) RequestDelete(ctx context.Context, request deplo
 
 func (f *fakeDeploymentService) Get(ctx context.Context, userID, deploymentID string) (*deployment.DeployState, error) {
 	return f.getFn(ctx, userID, deploymentID)
+}
+
+func (f *fakeDeploymentService) ListStates(ctx context.Context, userID string, request deployment.DeployStatePageRequest) (deployment.DeployStatePage, error) {
+	return f.listFn(ctx, userID, request)
 }
 
 func newDeploymentHandler(t *testing.T, service *fakeDeploymentService) *handlers.DeploymentHandler {
@@ -142,6 +147,30 @@ func TestDeploymentHandlerStatusShowsCurrentSafeFailure(t *testing.T) {
 	decodeJSON(t, w.Body.Bytes(), &response)
 	if response.LastError == nil || response.LastError.Code != "kubernetes_unavailable" || !response.LastError.Retryable ||
 		response.RuntimeAvailable || response.RuntimePath != "" || response.ReconcileAttempt != 2 || response.RetryScheduledAt == "" {
+		t.Fatalf("response = %+v", response)
+	}
+}
+
+func TestDeploymentHandlerListReturnsCursorEnvelope(t *testing.T) {
+	state := deploymentState()
+	h := newDeploymentHandler(t, &fakeDeploymentService{listFn: func(_ context.Context, userID string, request deployment.DeployStatePageRequest) (deployment.DeployStatePage, error) {
+		if userID != testUserID || request.Limit != 1 || len(request.Phases) != 1 || request.Phases[0] != deployment.DeploymentPhaseReady {
+			t.Fatalf("user/request = %q/%+v", userID, request)
+		}
+		return deployment.DeployStatePage{Items: []deployment.DeployState{state}, NextBefore: state.UpdatedAt, NextID: state.DeploymentID}, nil
+	}})
+	req := withUser(httptest.NewRequest(http.MethodGet, "/api/deployments?limit=1&phase=ready", nil))
+	w := httptest.NewRecorder()
+	h.List(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Items      []handlers.DeploymentStatusResponse `json:"items"`
+		NextCursor string                              `json:"next_cursor"`
+	}
+	decodeJSON(t, w.Body.Bytes(), &response)
+	if len(response.Items) != 1 || response.Items[0].DeploymentID != testAgentID || response.NextCursor == "" {
 		t.Fatalf("response = %+v", response)
 	}
 }

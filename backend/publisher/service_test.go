@@ -47,6 +47,12 @@ func cloneTestAgent(a *agent.Agent) *agent.Agent {
 	copy.Delegates = append([]agent.DelegateConfig(nil), a.Delegates...)
 	copy.MCPServers = append([]agent.MCPServerSelection(nil), a.MCPServers...)
 	copy.MCPConnections = append([]agent.MCPServerConnection(nil), a.MCPConnections...)
+	if a.TeamGraph != nil {
+		graph := *a.TeamGraph
+		graph.Nodes = append([]agent.TeamNode(nil), a.TeamGraph.Nodes...)
+		graph.Edges = append([]agent.TeamEdge(nil), a.TeamGraph.Edges...)
+		copy.TeamGraph = &graph
+	}
 	return &copy
 }
 
@@ -122,7 +128,7 @@ func (s *fakeRevisionStore) List(context.Context, string, string, int) ([]deploy
 
 func validAgent(id string) *agent.Agent {
 	return &agent.Agent{
-		ID: id, Name: id, Provider: "openai", Model: "gpt-4o", SystemPrompt: "prompt",
+		ID: id, Kind: agent.ResourceKindStandaloneAgent, Name: id, Provider: "openai", Model: "gpt-4o", SystemPrompt: "prompt",
 		ModelContextLimit: 128000, ContextWindow: 6, ContextKeepRatio: .5,
 		MaxSteps: 10, Temperature: .7, MaxTokens: 100, MaxRuns: 10,
 	}
@@ -185,6 +191,51 @@ func TestPublishWalksSortsFreezesAndRoundTrips(t *testing.T) {
 	}
 	if len(store.inputs) != 1 || store.inputs[0].IdempotencyKey != "publish-walk" {
 		t.Fatalf("revision input = %+v", store.inputs)
+	}
+}
+
+func TestPublishCompilesTeamGraphWithoutCanvasPositions(t *testing.T) {
+	entry := validAgent("entry")
+	worker := validAgent("worker")
+	team := &agent.Agent{
+		ID: "team", Kind: agent.ResourceKindAgentTeam,
+		TeamGraph: &agent.TeamGraph{
+			EntryAgentID: "entry",
+			Nodes: []agent.TeamNode{
+				{AgentID: "entry", Position: agent.TeamPosition{X: 10, Y: 20}},
+				{AgentID: "worker", Position: agent.TeamPosition{X: 400, Y: 80}},
+			},
+			Edges: []agent.TeamEdge{{
+				SourceAgentID: "entry", TargetAgentID: "worker", ToolName: "ask_worker",
+				Description: "Ask the worker to complete a focused task.", SourcePort: "bottom", TargetPort: "top",
+			}},
+		},
+	}
+	reader := &fakeAgentReader{agents: map[string]*agent.Agent{"team": team, "entry": entry, "worker": worker}}
+	store := &fakeRevisionStore{}
+	result, err := newTestService(t, reader, store, 0).Publish(context.Background(), "user", "team", "publish-team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := deployment.Parse(result.Revision.BundleJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bundle.DeploymentID != "team" || bundle.RootAgentID != "entry" || len(bundle.Agents) != 2 {
+		t.Fatalf("bundle identity = deployment %q root %q agents %d", bundle.DeploymentID, bundle.RootAgentID, len(bundle.Agents))
+	}
+	var compiledEntry deployment.BundleAgent
+	for _, bundled := range bundle.Agents {
+		if bundled.ID == "entry" {
+			compiledEntry = bundled
+		}
+	}
+	if len(compiledEntry.Delegates) != 1 || compiledEntry.Delegates[0].AgentID != "worker" {
+		t.Fatalf("compiled entry delegates = %+v", compiledEntry.Delegates)
+	}
+	if strings.Contains(string(result.Revision.BundleJSON), "position") || strings.Contains(string(result.Revision.BundleJSON), "\"x\"") ||
+		strings.Contains(string(result.Revision.BundleJSON), "source_port") || strings.Contains(string(result.Revision.BundleJSON), "target_port") {
+		t.Fatalf("bundle leaked canvas layout: %s", result.Revision.BundleJSON)
 	}
 }
 

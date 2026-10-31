@@ -95,16 +95,18 @@ func TestE2EMessageSendStreamToolCallAndPersist(t *testing.T) {
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("list messages: expected 200, got %d", resp2.StatusCode)
 	}
-	var msgs []struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
+	var page struct {
+		Items []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"items"`
 	}
-	decodeBody(t, resp2, &msgs)
-	if len(msgs) < 2 {
-		t.Fatalf("expected at least 2 persisted messages (user + assistant), got %d", len(msgs))
+	decodeBody(t, resp2, &page)
+	if len(page.Items) < 2 {
+		t.Fatalf("expected at least 2 persisted messages (user + assistant), got %d", len(page.Items))
 	}
 	roleSet := map[string]bool{}
-	for _, m := range msgs {
+	for _, m := range page.Items {
 		roleSet[m.Role] = true
 	}
 	if !roleSet["user"] {
@@ -124,8 +126,7 @@ func TestE2EMessageSendStreamToolCallAndPersist(t *testing.T) {
 		}
 	}
 	if runID == "" {
-		t.Log("run_id not found in SSE events; skipping GetRun check")
-		return
+		t.Fatal("run_id not found in SSE events")
 	}
 
 	resp3 := e.do(t, "GET", "/api/runs/"+runID, nil, token)
@@ -133,11 +134,11 @@ func TestE2EMessageSendStreamToolCallAndPersist(t *testing.T) {
 		t.Fatalf("GET /api/runs/%s: expected 200, got %d", runID, resp3.StatusCode)
 	}
 	var runInfo struct {
-		RunID string `json:"run_id"`
+		ID string `json:"id"`
 	}
 	decodeBody(t, resp3, &runInfo)
-	if runInfo.RunID != runID {
-		t.Errorf("run_id: got %q, want %q", runInfo.RunID, runID)
+	if runInfo.ID != runID {
+		t.Errorf("id: got %q, want %q", runInfo.ID, runID)
 	}
 }
 

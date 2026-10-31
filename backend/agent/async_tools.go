@@ -26,6 +26,7 @@ const (
 type asyncRunInfoKey struct{}
 
 type asyncRunInfo struct {
+	TeamID          string
 	RunID           string
 	OriginatorRunID string
 	ThreadID        string
@@ -127,6 +128,7 @@ func (t *dispatchAgentTool) Execute(ctx context.Context, call tools.ToolCall) (*
 	}
 
 	res, err := t.store.DispatchAgent(ctx, DispatchAgentRequest{
+		TeamID:              info.TeamID,
 		ParentRunID:         info.RunID,
 		OriginatorRunID:     info.OriginatorRunID,
 		ParentThreadID:      info.ThreadID,
@@ -285,6 +287,7 @@ func asyncRunInfoForToolContext(runCtx RunContext) asyncRunInfo {
 		kind = InvocationTopLevel
 	}
 	return asyncRunInfo{
+		TeamID:          runCtx.TeamID,
 		RunID:           runCtx.RunID,
 		OriginatorRunID: runCtx.OriginatorRunID,
 		ThreadID:        runCtx.ThreadID,

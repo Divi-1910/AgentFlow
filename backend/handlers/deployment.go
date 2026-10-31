@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"backend/agent"
 	"backend/deployment"
+	"backend/pagination"
 )
 
 type deploymentService interface {
@@ -18,13 +20,18 @@ type deploymentService interface {
 	Get(context.Context, string, string) (*deployment.DeployState, error)
 }
 
+type deploymentPageService interface {
+	ListStates(context.Context, string, deployment.DeployStatePageRequest) (deployment.DeployStatePage, error)
+}
+
 type DeploymentHandler struct {
 	service      deploymentService
 	namespace    string
 	runtimeImage string
+	resources    agentReader
 }
 
-func NewDeploymentHandler(service deploymentService, namespace, runtimeImage string) (*DeploymentHandler, error) {
+func NewDeploymentHandler(service deploymentService, namespace, runtimeImage string, resources ...agentReader) (*DeploymentHandler, error) {
 	if service == nil {
 		return nil, errors.New("deployment handler: service is required")
 	}
@@ -35,7 +42,11 @@ func NewDeploymentHandler(service deploymentService, namespace, runtimeImage str
 	if err := deployment.ValidateDeploymentTarget(probe); err != nil {
 		return nil, fmt.Errorf("deployment handler: invalid platform policy: %w", err)
 	}
-	return &DeploymentHandler{service: service, namespace: namespace, runtimeImage: runtimeImage}, nil
+	handler := &DeploymentHandler{service: service, namespace: namespace, runtimeImage: runtimeImage}
+	if len(resources) > 0 {
+		handler.resources = resources[0]
+	}
+	return handler, nil
 }
 
 type DeployRequest struct {
@@ -57,6 +68,8 @@ type DeploymentErrorResponse struct {
 
 type DeploymentStatusResponse struct {
 	DeploymentID       string                     `json:"deployment_id"`
+	ResourceID         string                     `json:"resource_id"`
+	ResourceKind       agent.ResourceKind         `json:"resource_kind,omitempty"`
 	Changed            *bool                      `json:"changed,omitempty"`
 	DesiredGeneration  int64                      `json:"desired_generation"`
 	DesiredAction      string                     `json:"desired_action"`
@@ -95,7 +108,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		ExpectedGeneration: request.ExpectedGeneration,
 		Namespace:          h.namespace, RuntimeImage: h.runtimeImage,
 	})
-	h.writeMutation(w, deploymentID, result, err)
+	h.writeMutation(w, deploymentID, resourceAPIBase(r), pathResourceKind(r), result, err)
 }
 
 func (h *DeploymentHandler) Undeploy(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +129,7 @@ func (h *DeploymentHandler) Undeploy(w http.ResponseWriter, r *http.Request) {
 	result, err := h.service.RequestDelete(r.Context(), deployment.DeleteRequest{
 		UserID: userID, DeploymentID: deploymentID, ExpectedGeneration: request.ExpectedGeneration,
 	})
-	h.writeMutation(w, deploymentID, result, err)
+	h.writeMutation(w, deploymentID, resourceAPIBase(r), pathResourceKind(r), result, err)
 }
 
 func (h *DeploymentHandler) Status(w http.ResponseWriter, r *http.Request) {
@@ -135,10 +148,57 @@ func (h *DeploymentHandler) Status(w http.ResponseWriter, r *http.Request) {
 		h.writeServiceError(w, deploymentID, deployment.ErrDeployStateNotFound)
 		return
 	}
-	writeJSON(w, http.StatusOK, deploymentStatus(state, nil))
+	writeJSON(w, http.StatusOK, deploymentStatus(state, nil, resourceAPIBase(r), pathResourceKind(r)))
 }
 
-func (h *DeploymentHandler) writeMutation(w http.ResponseWriter, deploymentID string, result *deployment.MutationResult, err error) {
+func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
+	userID, ok := getUserID(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	request, ok := parsePage(w, r, "deployments", 50)
+	if !ok {
+		return
+	}
+	phases, ok := parseDeploymentPhases(w, r.URL.Query().Get("phase"))
+	if !ok {
+		return
+	}
+	pageService, ok := h.service.(deploymentPageService)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "deployment listing is unavailable")
+		return
+	}
+	stateRequest := deployment.DeployStatePageRequest{Limit: request.Limit, Phases: phases}
+	if request.Cursor != nil {
+		stateRequest.Before = request.Cursor.Time
+		stateRequest.BeforeID = request.Cursor.ID
+	}
+	page, err := pageService.ListStates(r.Context(), userID, stateRequest)
+	if err != nil {
+		h.writeServiceError(w, "", err)
+		return
+	}
+	items := make([]DeploymentStatusResponse, 0, len(page.Items))
+	for i := range page.Items {
+		kind := h.resourceKind(r.Context(), page.Items[i].DeploymentID, userID)
+		base := resourceBaseForKind(kind)
+		items = append(items, deploymentStatus(&page.Items[i], nil, base, kind))
+	}
+	var next *pagination.Cursor
+	if !page.NextBefore.IsZero() {
+		next = &pagination.Cursor{Kind: "deployments", Time: page.NextBefore, ID: page.NextID}
+	}
+	response, err := pageResponse(items, next)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to encode deployment page")
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *DeploymentHandler) writeMutation(w http.ResponseWriter, deploymentID, resourceBase string, kind agent.ResourceKind, result *deployment.MutationResult, err error) {
 	if err != nil {
 		h.writeServiceError(w, deploymentID, err)
 		return
@@ -151,7 +211,7 @@ func (h *DeploymentHandler) writeMutation(w http.ResponseWriter, deploymentID st
 	if result.Changed {
 		status = http.StatusAccepted
 	}
-	writeJSON(w, status, deploymentStatus(&result.State, &result.Changed))
+	writeJSON(w, status, deploymentStatus(&result.State, &result.Changed, resourceBase, kind))
 }
 
 func (h *DeploymentHandler) writeServiceError(w http.ResponseWriter, deploymentID string, err error) {
@@ -173,9 +233,9 @@ func (h *DeploymentHandler) writeServiceError(w http.ResponseWriter, deploymentI
 	}
 }
 
-func deploymentStatus(state *deployment.DeployState, changed *bool) DeploymentStatusResponse {
+func deploymentStatus(state *deployment.DeployState, changed *bool, resourceBase string, kind agent.ResourceKind) DeploymentStatusResponse {
 	response := DeploymentStatusResponse{
-		DeploymentID: state.DeploymentID, Changed: changed,
+		DeploymentID: state.DeploymentID, ResourceID: state.DeploymentID, ResourceKind: kind, Changed: changed,
 		DesiredGeneration: state.Desired.Generation, DesiredAction: publicDesiredAction(state.Desired.Action),
 		DesiredRevision:    state.Desired.Target.Revision,
 		ObservedGeneration: state.Observed.Generation, Phase: state.Observed.Phase,
@@ -187,7 +247,7 @@ func deploymentStatus(state *deployment.DeployState, changed *bool) DeploymentSt
 	}
 	if state.Observed.Ready && state.Observed.Generation == state.Desired.Generation && state.Desired.Action == deployment.DesiredActionRun {
 		response.RuntimeAvailable = true
-		response.RuntimePath = fmt.Sprintf("/api/agents/%s/runtime/", state.DeploymentID)
+		response.RuntimePath = fmt.Sprintf("%s/%s/runtime/", resourceBase, state.DeploymentID)
 	}
 	if state.Reconcile.DueAt != nil {
 		response.RetryScheduledAt = formatOptionalTime(*state.Reconcile.DueAt)
@@ -200,6 +260,63 @@ func deploymentStatus(state *deployment.DeployState, changed *bool) DeploymentSt
 		}
 	}
 	return response
+}
+
+func (h *DeploymentHandler) resourceKind(ctx context.Context, resourceID, userID string) agent.ResourceKind {
+	if h.resources == nil {
+		return ""
+	}
+	resource, err := h.resources.GetByID(ctx, resourceID, userID)
+	if err != nil {
+		return ""
+	}
+	return agent.EffectiveResourceKind(resource)
+}
+
+func pathResourceKind(r *http.Request) agent.ResourceKind {
+	if strings.HasPrefix(r.URL.Path, "/api/agent-teams/") {
+		return agent.ResourceKindAgentTeam
+	}
+	return agent.ResourceKindStandaloneAgent
+}
+
+func resourceBaseForKind(kind agent.ResourceKind) string {
+	if kind == agent.ResourceKindAgentTeam {
+		return "/api/agent-teams"
+	}
+	return "/api/agents"
+}
+
+func parseDeploymentPhases(w http.ResponseWriter, raw string) ([]deployment.DeploymentPhase, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, true
+	}
+	seen := map[deployment.DeploymentPhase]struct{}{}
+	phases := []deployment.DeploymentPhase{}
+	for _, value := range strings.Split(raw, ",") {
+		phase := deployment.DeploymentPhase(strings.TrimSpace(value))
+		if !isPublicDeploymentPhase(phase) {
+			writeError(w, http.StatusBadRequest, "invalid deployment phase")
+			return nil, false
+		}
+		if _, exists := seen[phase]; !exists {
+			seen[phase] = struct{}{}
+			phases = append(phases, phase)
+		}
+	}
+	return phases, true
+}
+
+func isPublicDeploymentPhase(phase deployment.DeploymentPhase) bool {
+	switch phase {
+	case deployment.DeploymentPhasePending, deployment.DeploymentPhaseProvisioning,
+		deployment.DeploymentPhaseStarting, deployment.DeploymentPhaseReady,
+		deployment.DeploymentPhaseDegraded, deployment.DeploymentPhaseFailed,
+		deployment.DeploymentPhaseDeleting, deployment.DeploymentPhaseDeleted:
+		return true
+	default:
+		return false
+	}
 }
 
 func publicDesiredAction(action deployment.DesiredAction) string {

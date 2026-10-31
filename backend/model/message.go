@@ -18,5 +18,6 @@ type MessageDocument struct {
 	ToolCalls  []llm.ToolCall `bson:"tool_calls,omitempty" json:"tool_calls,omitempty"`
 	ToolName   string         `bson:"tool_name,omitempty" json:"tool_name,omitempty"`
 	Metadata   map[string]any `bson:"metadata,omitempty" json:"metadata,omitempty"`
+	DedupeKey  string         `bson:"dedupe_key,omitempty" json:"-"`
 	CreatedAt  time.Time      `bson:"created_at" json:"created_at"`
 }

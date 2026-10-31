@@ -4,6 +4,12 @@ export default {
   theme: {
     extend: {
       colors: {
+        'content-primary': 'var(--af-text-primary)',
+        'content-secondary': 'var(--af-text-secondary)',
+        'content-supporting': 'var(--af-text-supporting)',
+        'content-muted': 'var(--af-text-muted)',
+        'content-disabled': 'var(--af-text-disabled)',
+        'content-decorative': 'var(--af-text-decorative)',
         outline: '#525252',
         'on-surface': '#f0f0f0',
         'on-tertiary-fixed-variant': '#333333',

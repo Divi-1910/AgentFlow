@@ -144,7 +144,7 @@ func runToolCall(
 	logger.Info("executing tool", "tool", call.Name, "call_id", call.ID)
 	sink.Emit(StreamEvent{
 		Type: EventToolStarted,
-		Tool: &ToolMeta{ID: call.ID, Name: call.Name, Args: p.rawArgs},
+		Tool: toolEventMeta(runCtx, call.ID, call.Name, p.rawArgs, "", p.delegateTarget, p.isDelegate),
 		Step: step,
 	})
 	sink.Emit(StreamEvent{Type: EventStatusUpdated, Status: fmt.Sprintf("Using %s", call.Name), Step: step})
@@ -164,12 +164,12 @@ func runToolCall(
 				"error", rec,
 				"stack", string(debug.Stack()),
 			)
-			outcome = failedToolOutcome(p, latencyMs, errText)
+			outcome = failedToolOutcome(runCtx, p, latencyMs, errText)
 			sink.Emit(StreamEvent{
 				Type:       EventToolFailed,
 				Step:       step,
-				Tool:       &ToolMeta{ID: call.ID, Name: call.Name, Args: p.rawArgs},
-				Error:      &ErrMeta{Code: "tool.execution_failed", Message: errText},
+				Tool:       toolEventMeta(runCtx, call.ID, call.Name, p.rawArgs, "Tool execution failed", p.delegateTarget, p.isDelegate),
+				Error:      &ErrMeta{Code: "tool.execution_failed", Message: "tool execution failed"},
 				DurationMs: latencyMs,
 			})
 		}
@@ -193,6 +193,7 @@ func runToolCall(
 	}
 	toolCtx = runtimectx.WithMemoryScope(toolCtx, runCtx.Memory)
 	toolCtx = runtimectx.WithDelegation(toolCtx, runtimectx.DelegationInfo{
+		TeamID:          runCtx.TeamID,
 		OriginatorRunID: runCtx.OriginatorRunID,
 		RunID:           runCtx.RunID,
 		Chain:           runCtx.DelegationChain,
@@ -214,12 +215,12 @@ func runToolCall(
 	if err != nil {
 		errText := err.Error()
 		logger.Error("tool execution failed", "tool", call.Name, "error", err)
-		outcome = failedToolOutcome(p, latencyMs, errText)
+		outcome = failedToolOutcome(runCtx, p, latencyMs, errText)
 		sink.Emit(StreamEvent{
 			Type:       EventToolFailed,
 			Step:       step,
-			Tool:       &ToolMeta{ID: call.ID, Name: call.Name, Args: p.rawArgs},
-			Error:      &ErrMeta{Code: "tool.execution_failed", Message: errText},
+			Tool:       toolEventMeta(runCtx, call.ID, call.Name, p.rawArgs, "Tool execution failed", p.delegateTarget, p.isDelegate),
+			Error:      &ErrMeta{Code: "tool.execution_failed", Message: "tool execution failed"},
 			DurationMs: latencyMs,
 		})
 		return outcome
@@ -227,12 +228,12 @@ func runToolCall(
 	if toolResult == nil {
 		errText := "tool returned nil result"
 		logger.Error("tool execution failed", "tool", call.Name, "error", errText)
-		outcome = failedToolOutcome(p, latencyMs, errText)
+		outcome = failedToolOutcome(runCtx, p, latencyMs, errText)
 		sink.Emit(StreamEvent{
 			Type:       EventToolFailed,
 			Step:       step,
-			Tool:       &ToolMeta{ID: call.ID, Name: call.Name, Args: p.rawArgs},
-			Error:      &ErrMeta{Code: "tool.execution_failed", Message: errText},
+			Tool:       toolEventMeta(runCtx, call.ID, call.Name, p.rawArgs, "Tool execution failed", p.delegateTarget, p.isDelegate),
+			Error:      &ErrMeta{Code: "tool.execution_failed", Message: "tool execution failed"},
 			DurationMs: latencyMs,
 		})
 		return outcome
@@ -267,15 +268,21 @@ func runToolCall(
 		"content_len", len(content),
 		"latency_ms", latencyMs)
 
+	presentation := buildToolPresentation(
+		toolEventMeta(runCtx, call.ID, call.Name, p.rawArgs, "", p.delegateTarget, p.isDelegate),
+		p.rawArgs,
+		content,
+	)
 	toolMsg := llm.ChatMessage{
 		Role:       "tool",
 		ToolCallID: call.ID,
 		Content:    content,
 		Metadata: map[string]any{
-			"tool_name":  call.Name,
-			"arguments":  string(call.Arguments),
-			"is_error":   toolResult.IsError,
-			"latency_ms": latencyMs,
+			"tool_name":    call.Name,
+			"arguments":    string(call.Arguments),
+			"is_error":     toolResult.IsError,
+			"latency_ms":   latencyMs,
+			"presentation": presentationMetadata(presentation),
 		},
 	}
 	outcome = toolOutcome{
@@ -316,9 +323,6 @@ func runToolCall(
 	}
 
 	displayStr := fmt.Sprintf("Finished %s", call.Name)
-	if content != "" && len(content) < 50 {
-		displayStr = fmt.Sprintf("Result: %s", content)
-	}
 	if toolResult.IsError {
 		displayStr = fmt.Sprintf("Error in %s", call.Name)
 	}
@@ -339,7 +343,7 @@ func runToolCall(
 	sink.Emit(StreamEvent{
 		Type:       EventToolCompleted,
 		Step:       step,
-		Tool:       &ToolMeta{ID: call.ID, Name: call.Name, Args: p.rawArgs, Display: displayStr},
+		Tool:       toolEventMetaWithResult(runCtx, call.ID, call.Name, p.rawArgs, displayStr, p.delegateTarget, p.isDelegate, content),
 		DurationMs: latencyMs,
 	})
 
@@ -383,17 +387,19 @@ func applyToolOutcomes(
 	return thresholdErr
 }
 
-func failedToolOutcome(p plannedCall, latencyMs int64, errText string) toolOutcome {
+func failedToolOutcome(runCtx RunContext, p plannedCall, latencyMs int64, errText string) toolOutcome {
 	call := p.call
+	meta := toolEventMeta(runCtx, call.ID, call.Name, p.rawArgs, "Tool execution failed", p.delegateTarget, p.isDelegate)
 	msg := llm.ChatMessage{
 		Role:       "tool",
 		ToolCallID: call.ID,
 		Content:    fmt.Sprintf("[error] tool %q failed: %s", call.Name, errText),
 		Metadata: map[string]any{
-			"tool_name":  call.Name,
-			"arguments":  string(call.Arguments),
-			"is_error":   true,
-			"latency_ms": latencyMs,
+			"tool_name":    call.Name,
+			"arguments":    string(call.Arguments),
+			"is_error":     true,
+			"latency_ms":   latencyMs,
+			"presentation": presentationMetadata(meta.Presentation),
 		},
 	}
 	return toolOutcome{
@@ -412,8 +418,9 @@ func failedToolOutcome(p plannedCall, latencyMs int64, errText string) toolOutco
 // server went down). It is a SOFT error: the model sees it and can adapt, the
 // transcript stays consistent (every tool_call_id gets a result), and it does
 // NOT count toward the failure threshold (execFailed stays false).
-func softMissingMCPOutcome(m missingCall) toolOutcome {
+func softMissingMCPOutcome(runCtx RunContext, m missingCall) toolOutcome {
 	call := m.call
+	meta := toolEventMeta(runCtx, call.ID, call.Name, m.rawArgs, "MCP tool unavailable", "", false)
 	return toolOutcome{
 		index:    m.index,
 		toolName: call.Name,
@@ -422,9 +429,10 @@ func softMissingMCPOutcome(m missingCall) toolOutcome {
 			ToolCallID: call.ID,
 			Content:    fmt.Sprintf("[error] MCP tool %q is unavailable this run (its server could not be reached); it cannot be called now.", call.Name),
 			Metadata: map[string]any{
-				"tool_name": call.Name,
-				"arguments": string(call.Arguments),
-				"is_error":  true,
+				"tool_name":    call.Name,
+				"arguments":    string(call.Arguments),
+				"is_error":     true,
+				"presentation": presentationMetadata(meta.Presentation),
 			},
 		},
 		lastAction: fmt.Sprintf("%s → unavailable", call.Name),

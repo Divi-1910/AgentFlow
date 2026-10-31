@@ -23,6 +23,28 @@ const (
 
 var ErrCheckpointStoreUnavailable = errors.New("checkpoint store unavailable")
 
+var (
+	ErrSubmissionKeyConflict = errors.New("submission key was already used with different input")
+	ErrThreadRunActive       = errors.New("thread already has an active run")
+)
+
+type RunAdmission struct {
+	RunID         string
+	ThreadID      string
+	AgentID       string
+	UserID        string
+	TeamID        string
+	SubmissionKey string
+	AcceptedInput string
+}
+
+type RunAdmissionResult struct {
+	Run       *RunInfo
+	Created   bool
+	Replayed  bool
+	ActiveRun string
+}
+
 type RunSnapshot struct {
 	Version int          `json:"version"`
 	RunID   string       `json:"run_id"`
@@ -42,6 +64,7 @@ type RuntimeState struct {
 
 type SnapshotMeta struct {
 	AgentID        string  `json:"agent_id"`
+	TeamID         string  `json:"team_id,omitempty"`
 	ThreadID       string  `json:"thread_id"`
 	Provider       string  `json:"provider"`
 	Model          string  `json:"model"`
@@ -82,18 +105,25 @@ type CheckpointStore interface {
 }
 
 type RunInfo struct {
-	RunID           string `json:"run_id"`
-	ThreadID        string `json:"thread_id"`
-	AgentID         string `json:"agent_id,omitempty"`
-	UserID          string `json:"user_id,omitempty"`
-	Status          string `json:"status"`
-	Attempt         int    `json:"attempt"`
-	StepsCompleted  int    `json:"steps_completed"`
-	LastError       string `json:"last_error,omitempty"`
-	OriginatorRunID string `json:"originator_run_id,omitempty"`
-	ParentRunID     string `json:"parent_run_id,omitempty"`
-	InvocationKind  string `json:"invocation_kind,omitempty"`
-	JobID           string `json:"job_id,omitempty"`
+	RunID           string    `json:"run_id"`
+	ThreadID        string    `json:"thread_id"`
+	AgentID         string    `json:"agent_id,omitempty"`
+	TeamID          string    `json:"team_id,omitempty"`
+	UserID          string    `json:"user_id,omitempty"`
+	Status          string    `json:"status"`
+	Attempt         int       `json:"attempt"`
+	StepsCompleted  int       `json:"steps_completed"`
+	LastError       string    `json:"last_error,omitempty"`
+	OriginatorRunID string    `json:"originator_run_id,omitempty"`
+	ParentRunID     string    `json:"parent_run_id,omitempty"`
+	InvocationKind  string    `json:"invocation_kind,omitempty"`
+	JobID           string    `json:"job_id,omitempty"`
+	SubmissionKey   string    `json:"-"`
+	AcceptedInput   string    `json:"-"`
+	PromptPersisted bool      `json:"-"`
+	DispatchStarted bool      `json:"-"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 func ValidateSnapshot(s *RunSnapshot, ts *ToolSet) error {

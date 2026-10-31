@@ -107,11 +107,16 @@ func newRuntimeApp(parent context.Context, cfg appConfig) (_ *runtimeApp, err er
 	if err != nil {
 		return nil, err
 	}
-	if recovery.Interrupted > 0 || recovery.Failed > 0 {
-		cfg.logger.Info("recovered orphaned runs", "interrupted", recovery.Interrupted, "failed", recovery.Failed)
+	if recovery.Interrupted > 0 || recovery.Failed > 0 || recovery.Cancelled > 0 {
+		cfg.logger.Info("recovered orphaned runs", "interrupted", recovery.Interrupted, "failed", recovery.Failed, "cancelled", recovery.Cancelled)
 	}
 	threadRepo := sqliterepo.NewThreadRepo(storage.sharedDB)
 	messageRepo := sqliterepo.NewMessageRepo(storage.sharedDB)
+	if count, reconcileErr := handlers.ReconcileAcceptedPrompts(parent, userID, runRepo, messageRepo); reconcileErr != nil {
+		return nil, reconcileErr
+	} else if count > 0 {
+		cfg.logger.Info("reconciled accepted prompts", "count", count)
+	}
 	taskRepo := sqliterepo.NewTaskRepo(storage.executionDB)
 	jobRepo := sqliterepo.NewJobRepo(storage.executionDB)
 	jobRepo.SetTaskBudgetStore(taskRepo)
@@ -149,6 +154,7 @@ func newRuntimeApp(parent context.Context, cfg appConfig) (_ *runtimeApp, err er
 	theBus := bus.NewInProc()
 	app.bus = theBus
 	jobHub := dispatcher.NewJobHub()
+	taskEvents := agent.NewTaskEventHub()
 	preparer := dispatcher.NewRunPreparer(dispatcher.RunPreparerConfig{
 		Agents: agentReader, Threads: threadRepo, Messages: messageRepo, Runs: runRepo,
 		Summarizer: summarizer, Runtime: agentRuntime, ToolRegistry: toolRegistry,
@@ -156,7 +162,7 @@ func newRuntimeApp(parent context.Context, cfg appConfig) (_ *runtimeApp, err er
 	})
 	pools := dispatcher.NewPoolManager(dispatcher.PoolManagerConfig{
 		RootCtx: runtimeCtx, Bus: theBus, Preparer: preparer, Runtime: agentRuntime,
-		Status: runRepo, Messages: messageRepo, Jobs: jobRepo, Tasks: taskRepo, Hub: jobHub, Workers: 4,
+		Status: runRepo, Messages: messageRepo, Jobs: jobRepo, Tasks: taskRepo, Hub: jobHub, TaskEvents: taskEvents, Workers: 4,
 	})
 	app.pools = pools
 	invoker := dispatcher.NewBusDelegateInvoker(dispatcher.BusDelegateInvokerConfig{
@@ -166,7 +172,7 @@ func newRuntimeApp(parent context.Context, cfg appConfig) (_ *runtimeApp, err er
 	agentRuntime.SetDelegateInvoker(invoker)
 	coordinator := dispatcher.NewJobCoordinator(dispatcher.JobCoordinatorConfig{
 		Bus: theBus, Pools: pools, Threads: threadRepo, Runs: runRepo,
-		Jobs: jobRepo, Tasks: taskRepo, Hub: jobHub, Logger: cfg.logger,
+		Jobs: jobRepo, Tasks: taskRepo, Hub: jobHub, TaskEvents: taskEvents, Logger: cfg.logger,
 	})
 	app.coordinatorDone = make(chan struct{})
 	go func() {
@@ -178,18 +184,25 @@ func newRuntimeApp(parent context.Context, cfg appConfig) (_ *runtimeApp, err er
 	}
 
 	threadHandler := handlers.NewThreadHandler(threadRepo, agentReader)
-	messageHandler := handlers.NewMessageHandler(agentReader, threadRepo, messageRepo, disp, runRepo)
-	runHandler := handlers.NewRunHandler(agentReader, messageRepo, runRepo, disp, toolRegistry, capabilities)
+	executions := handlers.NewExecutionRegistryWithTaskEvents(runtimeCtx, taskEvents)
+	messageHandler := handlers.NewMessageHandler(agentReader, threadRepo, messageRepo, disp, runRepo, executions)
+	runHandler := handlers.NewRunHandler(agentReader, threadRepo, messageRepo, runRepo, disp, toolRegistry, capabilities, executions)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", app.health)
 	mux.HandleFunc("GET /readyz", app.readiness)
 	protected := http.NewServeMux()
 	protected.HandleFunc("POST /v1/threads", threadHandler.CreateForAgent(cfg.bundle.RootAgentID))
+	protected.HandleFunc("GET /v1/threads", threadHandler.ListForAgent(cfg.bundle.RootAgentID))
+	protected.HandleFunc("GET /v1/threads/{id}", threadHandler.Get)
+	protected.HandleFunc("PATCH /v1/threads/{id}", threadHandler.Update)
 	protected.HandleFunc("POST /v1/threads/{id}/messages", messageHandler.Send)
 	protected.HandleFunc("GET /v1/threads/{id}/messages", messageHandler.List)
+	protected.HandleFunc("GET /v1/threads/{id}/runs", runHandler.ListByThread)
 	protected.HandleFunc("GET /v1/runs/{id}", runHandler.GetRun)
+	protected.HandleFunc("GET /v1/runs/{id}/events", runHandler.StreamEvents)
 	protected.HandleFunc("POST /v1/runs/{id}/resume", runHandler.ResumeRun)
+	protected.HandleFunc("POST /v1/runs/{id}/cancel", runHandler.CancelRun)
 	mux.Handle("/v1/", cfg.auth.middleware(userID, protected))
 
 	app.server = &http.Server{

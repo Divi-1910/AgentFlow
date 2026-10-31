@@ -99,8 +99,18 @@ func (iv *BusDelegateInvoker) InvokeDelegate(ctx context.Context, parent runtime
 		return "", fmt.Errorf("delegate: resolve sub-thread: %w", err)
 	}
 
-	if err := iv.runs.CreateChildRun(ctx, childRunID, subThreadID, targetAgentID, parent.UserID, parent.OriginatorRunID, parent.RunID); err != nil {
-		return "", fmt.Errorf("delegate: create child run: %w", err)
+	var createErr error
+	if parent.TeamID != "" {
+		if teamRuns, ok := iv.runs.(TeamRunStore); ok {
+			createErr = teamRuns.CreateTeamChildRun(ctx, childRunID, subThreadID, targetAgentID, parent.UserID, parent.OriginatorRunID, parent.RunID, parent.TeamID)
+		} else {
+			createErr = fmt.Errorf("delegate: team-aware run store is unavailable")
+		}
+	} else {
+		createErr = iv.runs.CreateChildRun(ctx, childRunID, subThreadID, targetAgentID, parent.UserID, parent.OriginatorRunID, parent.RunID)
+	}
+	if createErr != nil {
+		return "", fmt.Errorf("delegate: create child run: %w", createErr)
 	}
 
 	// Pre-dispatch failures: the run exists but RunStream never ran and the
@@ -112,15 +122,18 @@ func (iv *BusDelegateInvoker) InvokeDelegate(ctx context.Context, parent runtime
 
 	chain := append(append([]string(nil), parent.Chain...), targetAgentID)
 	payload := DispatchPayload{
-		RunID:           childRunID,
-		OriginatorRunID: parent.OriginatorRunID,
-		ParentRunID:     parent.RunID,
-		AgentID:         targetAgentID,
-		UserID:          parent.UserID,
-		ThreadID:        subThreadID,
-		Input:           task,
-		Chain:           chain,
-		Depth:           parent.Depth + 1,
+		RunID:             childRunID,
+		OriginatorRunID:   parent.OriginatorRunID,
+		ParentRunID:       parent.RunID,
+		AgentID:           targetAgentID,
+		TeamID:            parent.TeamID,
+		UserID:            parent.UserID,
+		ThreadID:          subThreadID,
+		Input:             task,
+		Chain:             chain,
+		Depth:             parent.Depth + 1,
+		InvocationKind:    agent.InvocationSyncDelegate,
+		PublishTaskEvents: true,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

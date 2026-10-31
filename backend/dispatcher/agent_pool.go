@@ -23,21 +23,22 @@ type runStatusUpdater interface {
 }
 
 type AgentPool struct {
-	agentID  string
-	bus      bus.MessageBus
-	preparer *RunPreparer
-	runtime  Runtime
-	status   runStatusUpdater
-	messages MessageStore
-	jobs     WorkerJobStore
-	tasks    DurableCancelStore
-	hub      *JobHub
-	sub      bus.Subscription
-	workers  int
-	rootCtx  context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	cancels  *CancelRegistry
+	agentID    string
+	bus        bus.MessageBus
+	preparer   *RunPreparer
+	runtime    Runtime
+	status     runStatusUpdater
+	messages   MessageStore
+	jobs       WorkerJobStore
+	tasks      DurableCancelStore
+	hub        *JobHub
+	taskEvents *agent.TaskEventHub
+	sub        bus.Subscription
+	workers    int
+	rootCtx    context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	cancels    *CancelRegistry
 }
 
 func NewAgentPool(
@@ -51,6 +52,7 @@ func NewAgentPool(
 	jobs WorkerJobStore,
 	tasks DurableCancelStore,
 	hub *JobHub,
+	taskEvents *agent.TaskEventHub,
 	workers int,
 	cancels *CancelRegistry,
 ) *AgentPool {
@@ -65,19 +67,20 @@ func NewAgentPool(
 		cancels = NewCancelRegistry(0)
 	}
 	return &AgentPool{
-		agentID:  agentID,
-		bus:      b,
-		preparer: preparer,
-		runtime:  runtime,
-		status:   status,
-		messages: messages,
-		jobs:     jobs,
-		tasks:    tasks,
-		hub:      hub,
-		workers:  workers,
-		rootCtx:  ctx,
-		cancel:   cancel,
-		cancels:  cancels,
+		agentID:    agentID,
+		bus:        b,
+		preparer:   preparer,
+		runtime:    runtime,
+		status:     status,
+		messages:   messages,
+		jobs:       jobs,
+		tasks:      tasks,
+		hub:        hub,
+		taskEvents: taskEvents,
+		workers:    workers,
+		rootCtx:    ctx,
+		cancel:     cancel,
+		cancels:    cancels,
 	}
 }
 
@@ -171,14 +174,22 @@ func (p *AgentPool) handleDispatch(msg bus.Message) {
 	// run's terminal status — the worker must not write it.
 	workerEvents := make(chan agent.StreamEvent, 128)
 	eventsDone := make(chan struct{})
-	go p.forwardWorkerEvents(runCtx, payload.RunID, workerEvents, eventsDone)
+	deferredRootTerminal := make(chan *agent.StreamEvent, 1)
+	go p.forwardWorkerEvents(runCtx, payload, workerEvents, eventsDone, deferredRootTerminal)
 
 	stopLeaseHeartbeat := p.startLeaseHeartbeat(payload)
 	defer stopLeaseHeartbeat()
 
 	res, err := p.runtime.RunStream(runCtx, prepared.Agent, prepared.RunCtx, workerEvents)
 	<-eventsDone
+	terminalEvent := <-deferredRootTerminal
 	p.afterRun(payload, prepared, res, err)
+	if terminalEvent != nil && p.taskEvents != nil {
+		// Coordinator-started root resumptions persist their result messages in
+		// afterRun. Publish the terminal event only after that durability fence,
+		// matching the handler-owned initial/manual execution path.
+		p.taskEvents.Publish(*terminalEvent)
+	}
 	if err != nil {
 		p.publishReply(msg, DispatchReply{Result: wireFromRunResult(res), Error: err.Error()})
 		return
@@ -351,22 +362,42 @@ func (p *AgentPool) notifyJobTerminal(payload DispatchPayload, jobID string, suc
 	if p.hub != nil {
 		p.hub.Notify(jobID)
 	}
-	if p.bus == nil || payload.ParentRunID == "" {
+	if payload.ParentRunID == "" {
 		return
 	}
 	eventType := agent.EventJobCompleted
+	jobStatus := string(agent.JobStatusSucceeded)
 	var errMeta *agent.ErrMeta
 	if !succeeded {
 		eventType = agent.EventJobFailed
-		errMeta = &agent.ErrMeta{Code: "job.failed", Message: errText}
+		jobStatus = string(agent.JobStatusFailed)
+		errMeta = &agent.ErrMeta{Code: "job.failed", Message: "background task failed"}
 	}
-	_ = p.bus.Publish(context.Background(), eventsTopic(payload.ParentRunID), bus.Message{
-		Body: mustJSON(agent.StreamEvent{
-			Type:  eventType,
-			Job:   &agent.JobMeta{ID: jobID},
-			Error: errMeta,
-		}),
-	})
+	parentAgentID := ""
+	if len(payload.Chain) >= 2 {
+		parentAgentID = payload.Chain[len(payload.Chain)-2]
+	}
+	parentDepth := payload.Depth - 1
+	if parentDepth < 0 {
+		parentDepth = 0
+	}
+	event := agent.StreamEvent{
+		RunID:           payload.ParentRunID,
+		OriginatorRunID: payload.OriginatorRunID,
+		TeamID:          payload.TeamID,
+		AgentID:         parentAgentID,
+		Depth:           parentDepth,
+		Type:            eventType,
+		Job:             &agent.JobMeta{ID: jobID, Status: jobStatus, TargetAgentID: payload.AgentID},
+		Error:           errMeta,
+	}
+	if p.taskEvents != nil {
+		p.taskEvents.Publish(event)
+		return
+	}
+	if p.bus != nil {
+		_ = p.bus.Publish(context.Background(), eventsTopic(payload.ParentRunID), bus.Message{Body: mustJSON(event)})
+	}
 }
 
 func (p *AgentPool) markAsyncFailed(payload DispatchPayload, errText string) {
@@ -446,9 +477,25 @@ func (p *AgentPool) watchCancellation(ctx context.Context, originatorRunID strin
 	return sub, done
 }
 
-func (p *AgentPool) forwardWorkerEvents(ctx context.Context, runID string, workerEvents <-chan agent.StreamEvent, done chan<- struct{}) {
+func (p *AgentPool) forwardWorkerEvents(
+	ctx context.Context,
+	payload DispatchPayload,
+	workerEvents <-chan agent.StreamEvent,
+	done chan<- struct{},
+	deferredRootTerminal chan<- *agent.StreamEvent,
+) {
 	defer close(done)
+	var deferred *agent.StreamEvent
+	defer func() { deferredRootTerminal <- deferred }()
 	for event := range workerEvents {
+		if payload.PublishTaskEvents && p.taskEvents != nil {
+			if payload.RunID == payload.OriginatorRunID && payload.PersistResultMessages && isTerminalEvent(event.Type) {
+				copy := event
+				deferred = &copy
+			} else {
+				p.taskEvents.Publish(event)
+			}
+		}
 		body, err := json.Marshal(event)
 		if err != nil {
 			continue
@@ -457,7 +504,7 @@ func (p *AgentPool) forwardWorkerEvents(ctx context.Context, runID string, worke
 		// Exiting the loop here would leave runtime.RunStream blocked on the
 		// 129th send once the 128-element buffer fills, with no path out.
 		// Pinned by TestAgentPool_ForwardWorkerEventsKeepsDrainingOnPublishError.
-		if err := p.bus.Publish(ctx, eventsTopic(runID), bus.Message{Body: body}); err != nil {
+		if err := p.bus.Publish(ctx, eventsTopic(payload.RunID), bus.Message{Body: body}); err != nil {
 			continue
 		}
 	}

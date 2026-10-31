@@ -22,10 +22,11 @@ func MemoryScopeFromContext(ctx context.Context) (MemoryScope, bool) {
 type delegationKey struct{}
 
 // DelegationInfo is the parent-run context a DelegateTool needs to spawn a
-// child agent run: the root of the call tree, the current run (which becomes
-// the child's parent), the agent-ID chain (for cycle detection), the current
-// depth, and the owning user.
+// child agent run: the optional Team graph, root of the call tree, current run
+// (which becomes the child's parent), agent-ID chain (for cycle detection),
+// current depth, and owning user.
 type DelegationInfo struct {
+	TeamID          string
 	OriginatorRunID string
 	RunID           string
 	Chain           []string

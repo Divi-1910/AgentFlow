@@ -294,21 +294,105 @@ func stageLegacyStorage(ctx context.Context, request storageMigrationRequest, pa
 }
 
 func copyLegacyTables(ctx context.Context, target *sql.DB, sourcePath string, tables []string) error {
-	if _, err := target.ExecContext(ctx, "ATTACH DATABASE ? AS legacy", sourcePath); err != nil {
+	conn, err := target.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("storage migration: reserve target connection: %w", err)
+	}
+	defer conn.Close()
+
+	// ATTACH is scoped to one SQLite connection. Keep the attachment, schema
+	// inspection, and copy transaction on the same reserved connection.
+	if _, err := conn.ExecContext(ctx, "ATTACH DATABASE ? AS legacy", sourcePath); err != nil {
 		return fmt.Errorf("storage migration: attach legacy database: %w", err)
 	}
-	defer target.ExecContext(context.Background(), "DETACH DATABASE legacy")
-	tx, err := target.BeginTx(ctx, nil)
+	defer conn.ExecContext(context.Background(), "DETACH DATABASE legacy")
+
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("storage migration: begin copy transaction: %w", err)
 	}
 	defer tx.Rollback()
 	for _, table := range tables {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO main."+table+" SELECT * FROM legacy."+table); err != nil {
+		columns, err := sharedSQLiteColumns(ctx, tx, table)
+		if err != nil {
+			return err
+		}
+		quotedColumns := make([]string, len(columns))
+		for i, column := range columns {
+			quotedColumns[i] = quoteSQLiteIdentifier(column)
+		}
+		columnList := strings.Join(quotedColumns, ", ")
+		statement := "INSERT INTO main." + quoteSQLiteIdentifier(table) + " (" + columnList + ") " +
+			"SELECT " + columnList + " FROM legacy." + quoteSQLiteIdentifier(table)
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("storage migration: copy table %s: %w", table, err)
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("storage migration: commit copied tables: %w", err)
+	}
+	return nil
+}
+
+func sharedSQLiteColumns(ctx context.Context, tx *sql.Tx, table string) ([]string, error) {
+	targetColumns, err := sqliteTableColumns(ctx, tx, "main", table)
+	if err != nil {
+		return nil, err
+	}
+	sourceColumns, err := sqliteTableColumns(ctx, tx, "legacy", table)
+	if err != nil {
+		return nil, err
+	}
+	sourceSet := make(map[string]struct{}, len(sourceColumns))
+	for _, column := range sourceColumns {
+		sourceSet[column] = struct{}{}
+	}
+	shared := make([]string, 0, len(targetColumns))
+	for _, column := range targetColumns {
+		if _, ok := sourceSet[column]; ok {
+			shared = append(shared, column)
+		}
+	}
+	if len(shared) == 0 {
+		return nil, fmt.Errorf("storage migration: table %s has no columns shared by source and target", table)
+	}
+	return shared, nil
+}
+
+func sqliteTableColumns(ctx context.Context, tx *sql.Tx, schema, table string) ([]string, error) {
+	query := "PRAGMA " + quoteSQLiteIdentifier(schema) + ".table_info(" + quoteSQLiteIdentifier(table) + ")"
+	rows, err := tx.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("storage migration: inspect %s.%s columns: %w", schema, table, err)
+	}
+	defer rows.Close()
+
+	var columns []string
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultSQL sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultSQL, &primaryKey); err != nil {
+			return nil, fmt.Errorf("storage migration: scan %s.%s columns: %w", schema, table, err)
+		}
+		columns = append(columns, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage migration: inspect %s.%s columns: %w", schema, table, err)
+	}
+	if len(columns) == 0 {
+		return nil, fmt.Errorf("storage migration: table %s.%s does not exist or has no columns", schema, table)
+	}
+	return columns, nil
+}
+
+func quoteSQLiteIdentifier(identifier string) string {
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
 
 func copyMigrationTree(source, target string) error {

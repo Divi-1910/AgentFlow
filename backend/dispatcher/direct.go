@@ -20,6 +20,15 @@ type DirectDispatcher struct {
 	Pools    *PoolManager   // for CancelRegistry marking
 }
 
+func (d *DirectDispatcher) CancelRun(originatorRunID string) {
+	if d.Pools != nil {
+		d.Pools.CancelTask(originatorRunID)
+	}
+	if d.Bus != nil {
+		_ = d.Bus.Publish(context.Background(), cancelTopic(originatorRunID), bus.Message{})
+	}
+}
+
 func (d *DirectDispatcher) Dispatch(ctx context.Context, req DispatchRequest, events chan<- agent.StreamEvent) (*agent.RunResult, error) {
 	if d.Preparer == nil || d.Runtime == nil {
 		close(events)
@@ -38,12 +47,7 @@ func (d *DirectDispatcher) Dispatch(ctx context.Context, req DispatchRequest, ev
 	// suppresses the cascade on clean completion. No-op when the agent has no
 	// delegates (publish to an unsubscribed topic).
 	stop := context.AfterFunc(ctx, func() {
-		if d.Pools != nil {
-			d.Pools.CancelTask(originator)
-		}
-		if d.Bus != nil {
-			_ = d.Bus.Publish(context.Background(), cancelTopic(originator), bus.Message{})
-		}
+		d.CancelRun(originator)
 	})
 	defer stop()
 

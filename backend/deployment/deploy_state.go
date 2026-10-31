@@ -282,6 +282,19 @@ type DeployState struct {
 	UpdatedAt     time.Time
 }
 
+type DeployStatePageRequest struct {
+	Limit    int
+	Before   time.Time
+	BeforeID string
+	Phases   []DeploymentPhase
+}
+
+type DeployStatePage struct {
+	Items      []DeployState
+	NextBefore time.Time
+	NextID     string
+}
+
 func NewStoragePlan(ownerID, deploymentID, namespace string) (StoragePlan, error) {
 	if strings.TrimSpace(ownerID) == "" || strings.TrimSpace(deploymentID) == "" {
 		return StoragePlan{}, fmt.Errorf("%w: owner and deployment are required", ErrDeployStorageConflict)

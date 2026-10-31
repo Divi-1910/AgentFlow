@@ -34,6 +34,7 @@ func dispatchRequiredJob(t *testing.T, r *mongorepo.JobRepo) agent.DispatchAgent
 func dispatchRequiredJobWithToolCall(t *testing.T, r *mongorepo.JobRepo, toolCallID string) agent.DispatchAgentResult {
 	t.Helper()
 	res, err := r.DispatchAgent(context.Background(), agent.DispatchAgentRequest{
+		TeamID:          "team-1",
 		ParentRunID:     "parent-run",
 		OriginatorRunID: "originator-run",
 		ParentThreadID:  "parent-thread",
@@ -54,7 +55,7 @@ func dispatchRequiredJobWithToolCall(t *testing.T, r *mongorepo.JobRepo, toolCal
 }
 
 func TestJobRepoDispatchAgentIsIdempotentByParentRunAndToolCall(t *testing.T) {
-	r, _, _ := newJobRepo(t)
+	r, jobs, _ := newJobRepo(t)
 	ctx := context.Background()
 
 	first := dispatchRequiredJobWithToolCall(t, r, "dispatch-idempotent")
@@ -75,6 +76,13 @@ func TestJobRepoDispatchAgentIsIdempotentByParentRunAndToolCall(t *testing.T) {
 	}
 	if first.JobID != second.JobID {
 		t.Fatalf("job IDs differ: first=%s second=%s", first.JobID, second.JobID)
+	}
+	var stored model.JobDocument
+	if err := jobs.FindOne(ctx, bson.M{"job_id": first.JobID}).Decode(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.TeamID != "team-1" {
+		t.Fatalf("stored team id = %q", stored.TeamID)
 	}
 	doc, err := r.GetJob(ctx, first.JobID)
 	if err != nil {

@@ -128,6 +128,14 @@ func (r *DeploymentStateRepo) EnsureIndexes(ctx context.Context) error {
 		},
 		{
 			Keys: bson.D{
+				{Key: "user_id", Value: 1},
+				{Key: "updated_at", Value: -1},
+				{Key: "deployment_id", Value: -1},
+			},
+			Options: options.Index().SetName("deployment_states_owner_activity"),
+		},
+		{
+			Keys: bson.D{
 				{Key: "record_version", Value: 1},
 				{Key: "reconcile.due_at", Value: 1},
 				{Key: "reconcile.claim.lease_expires_at", Value: 1},
@@ -290,6 +298,61 @@ func (r *DeploymentStateRepo) Get(ctx context.Context, userID, deploymentID stri
 		return nil, deployment.ErrDeployStateMigrationRequired
 	}
 	return toDeployState(raw), nil
+}
+
+// ListPage returns the product-facing deployment timeline for one owner. The
+// compound cursor makes repeated timestamps deterministic without exposing the
+// MongoDB document identifier as part of the public API.
+func (r *DeploymentStateRepo) ListPage(ctx context.Context, userID string, request deployment.DeployStatePageRequest) (deployment.DeployStatePage, error) {
+	uid, err := bson.ObjectIDFromHex(strings.TrimSpace(userID))
+	if err != nil {
+		return deployment.DeployStatePage{}, deployment.ErrDeployStateConflict
+	}
+	if request.Limit <= 0 {
+		request.Limit = 50
+	}
+	if request.Limit > 200 {
+		request.Limit = 200
+	}
+	filter := bson.M{
+		"user_id":        uid,
+		"record_version": deployment.DeployStateRecordVersion,
+	}
+	if len(request.Phases) > 0 {
+		values := make(bson.A, 0, len(request.Phases))
+		for _, phase := range request.Phases {
+			values = append(values, string(phase))
+		}
+		filter["observed.phase"] = bson.M{"$in": values}
+	}
+	if !request.Before.IsZero() {
+		filter["$or"] = bson.A{
+			bson.M{"updated_at": bson.M{"$lt": request.Before}},
+			bson.M{"updated_at": request.Before, "deployment_id": bson.M{"$lt": request.BeforeID}},
+		}
+	}
+	cursor, err := r.states.Find(ctx, filter, options.Find().
+		SetSort(bson.D{{Key: "updated_at", Value: -1}, {Key: "deployment_id", Value: -1}}).
+		SetLimit(int64(request.Limit+1)))
+	if err != nil {
+		return deployment.DeployStatePage{}, fmt.Errorf("deployment_state_repo: list: %w", err)
+	}
+	defer cursor.Close(ctx)
+	var raw []deploymentStateBSON
+	if err := cursor.All(ctx, &raw); err != nil {
+		return deployment.DeployStatePage{}, fmt.Errorf("deployment_state_repo: decode list: %w", err)
+	}
+	page := deployment.DeployStatePage{Items: make([]deployment.DeployState, 0, min(len(raw), request.Limit))}
+	for i, item := range raw {
+		if i == request.Limit {
+			last := raw[request.Limit-1]
+			page.NextBefore = last.UpdatedAt.UTC()
+			page.NextID = last.DeploymentID
+			break
+		}
+		page.Items = append(page.Items, *toDeployState(item))
+	}
+	return page, nil
 }
 
 // InspectMigrationSource reads legacy evidence without migrating it. Normal

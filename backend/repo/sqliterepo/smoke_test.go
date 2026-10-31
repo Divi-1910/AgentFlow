@@ -199,10 +199,11 @@ func TestFileReopenResumeAndSynchronousDelegation(t *testing.T) {
 	// A separate top-level run delegates synchronously through the in-process
 	// bus. Async tools/stores and durable cancellation remain absent.
 	supervisor := &agent.Agent{
-		ID: "supervisor", Provider: "fake", Model: "supervisor", SystemPrompt: "supervise", MaxSteps: 4, MaxRuns: 3,
+		ID: "supervisor", Kind: agent.ResourceKindStandaloneAgent,
+		Provider: "fake", Model: "supervisor", SystemPrompt: "supervise", MaxSteps: 4, MaxRuns: 3,
 		Delegates: []agent.DelegateConfig{{AgentID: "worker", ToolName: "ask_worker", Description: "ask worker"}},
 	}
-	worker := &agent.Agent{ID: "worker", Provider: "fake", Model: "worker", SystemPrompt: "work", MaxSteps: 2}
+	worker := &agent.Agent{ID: "worker", Kind: agent.ResourceKindStandaloneAgent, Provider: "fake", Model: "worker", SystemPrompt: "work", MaxSteps: 2}
 	reader := &mapAgentReader{userID: userID, agents: map[string]*agent.Agent{supervisor.ID: supervisor, worker.ID: worker}}
 	delegationRuntime, delegationTools := testRuntime(t, &delegationLLM{}, runs, agent.ToolCapabilities{AsyncJobs: false})
 	theBus := bus.NewInProc()

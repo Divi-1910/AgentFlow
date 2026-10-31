@@ -24,15 +24,16 @@ const (
 )
 
 type JobCoordinatorConfig struct {
-	Bus      bus.MessageBus
-	Pools    *PoolManager
-	Threads  ThreadStore
-	Runs     CoordinatorRunStore
-	Jobs     CoordinatorJobStore
-	Tasks    DurableCancelStore
-	Hub      *JobHub
-	WorkerID string
-	Logger   *slog.Logger
+	Bus        bus.MessageBus
+	Pools      *PoolManager
+	Threads    ThreadStore
+	Runs       CoordinatorRunStore
+	Jobs       CoordinatorJobStore
+	Tasks      DurableCancelStore
+	Hub        *JobHub
+	TaskEvents *agent.TaskEventHub
+	WorkerID   string
+	Logger     *slog.Logger
 
 	ConcurrentJobs     int
 	JobLease           time.Duration
@@ -44,15 +45,16 @@ type JobCoordinatorConfig struct {
 }
 
 type JobCoordinator struct {
-	bus     bus.MessageBus
-	pools   *PoolManager
-	threads ThreadStore
-	runs    CoordinatorRunStore
-	jobs    CoordinatorJobStore
-	tasks   DurableCancelStore
-	hub     *JobHub
-	owner   string
-	logger  *slog.Logger
+	bus        bus.MessageBus
+	pools      *PoolManager
+	threads    ThreadStore
+	runs       CoordinatorRunStore
+	jobs       CoordinatorJobStore
+	tasks      DurableCancelStore
+	hub        *JobHub
+	taskEvents *agent.TaskEventHub
+	owner      string
+	logger     *slog.Logger
 
 	concurrentJobs     int
 	jobLease           time.Duration
@@ -108,6 +110,7 @@ func NewJobCoordinator(cfg JobCoordinatorConfig) *JobCoordinator {
 		jobs:               cfg.Jobs,
 		tasks:              cfg.Tasks,
 		hub:                cfg.Hub,
+		taskEvents:         cfg.TaskEvents,
 		owner:              owner,
 		logger:             logger,
 		concurrentJobs:     concurrentJobs,
@@ -309,7 +312,7 @@ func (c *JobCoordinator) dispatchJob(ctx context.Context, doc agent.JobRecord) {
 		c.failClaimedJob(doc, fmt.Errorf("resolve sub-thread: %w", err))
 		return
 	}
-	if err := c.runs.CreateChildRunWithKind(ctx, childRunID, subThreadID, doc.TargetAgentID, doc.UserID, doc.OriginatorRunID, doc.ParentRunID, agent.InvocationAsyncJob, doc.JobID); err != nil {
+	if err := c.createChildRun(ctx, childRunID, subThreadID, doc.TargetAgentID, doc, agent.InvocationAsyncJob); err != nil {
 		c.failClaimedJob(doc, fmt.Errorf("create child run: %w", err))
 		return
 	}
@@ -328,6 +331,7 @@ func (c *JobCoordinator) dispatchJob(ctx context.Context, doc agent.JobRecord) {
 		OriginatorRunID:       doc.OriginatorRunID,
 		ParentRunID:           doc.ParentRunID,
 		AgentID:               doc.TargetAgentID,
+		TeamID:                doc.TeamID,
 		UserID:                doc.UserID,
 		ThreadID:              subThreadID,
 		Input:                 doc.Task,
@@ -336,6 +340,7 @@ func (c *JobCoordinator) dispatchJob(ctx context.Context, doc agent.JobRecord) {
 		InvocationKind:        agent.InvocationAsyncJob,
 		JobID:                 doc.JobID,
 		PersistResultMessages: true,
+		PublishTaskEvents:     true,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -403,6 +408,7 @@ func (c *JobCoordinator) resumeReadyRuns(ctx context.Context) {
 			OriginatorRunID:       info.OriginatorRunID,
 			ParentRunID:           info.ParentRunID,
 			AgentID:               info.AgentID,
+			TeamID:                info.TeamID,
 			UserID:                info.UserID,
 			ThreadID:              info.ThreadID,
 			IsResume:              true,
@@ -410,6 +416,7 @@ func (c *JobCoordinator) resumeReadyRuns(ctx context.Context) {
 			InvocationKind:        info.InvocationKind,
 			JobID:                 info.JobID,
 			PersistResultMessages: true,
+			PublishTaskEvents:     true,
 		}
 		body, err := json.Marshal(payload)
 		if err != nil {
@@ -465,7 +472,7 @@ func (c *JobCoordinator) launchCallbacks(ctx context.Context) {
 			_ = c.jobs.ReleaseLock(context.Background(), lockKey, doc.JobID, c.owner)
 			continue
 		}
-		if err := c.runs.CreateChildRunWithKind(ctx, callbackRunID, doc.ParentThreadID, doc.ParentAgentID, doc.UserID, doc.OriginatorRunID, doc.ParentRunID, agent.InvocationCallback, doc.JobID); err != nil {
+		if err := c.createChildRun(ctx, callbackRunID, doc.ParentThreadID, doc.ParentAgentID, doc, agent.InvocationCallback); err != nil {
 			_ = c.jobs.MarkCallbackFailed(context.Background(), doc.JobID, callbackRunID, err.Error())
 			continue
 		}
@@ -479,12 +486,14 @@ func (c *JobCoordinator) launchCallbacks(ctx context.Context) {
 			OriginatorRunID:       doc.OriginatorRunID,
 			ParentRunID:           doc.ParentRunID,
 			AgentID:               doc.ParentAgentID,
+			TeamID:                doc.TeamID,
 			UserID:                doc.UserID,
 			ThreadID:              doc.ParentThreadID,
 			SystemContext:         callbackSystemContext(doc),
 			InvocationKind:        agent.InvocationCallback,
 			JobID:                 doc.JobID,
 			PersistResultMessages: true,
+			PublishTaskEvents:     true,
 		}
 		body, err := json.Marshal(payload)
 		if err != nil {
@@ -498,6 +507,17 @@ func (c *JobCoordinator) launchCallbacks(ctx context.Context) {
 			continue
 		}
 	}
+}
+
+func (c *JobCoordinator) createChildRun(ctx context.Context, runID, threadID, agentID string, doc agent.JobRecord, invocationKind string) error {
+	if doc.TeamID == "" {
+		return c.runs.CreateChildRunWithKind(ctx, runID, threadID, agentID, doc.UserID, doc.OriginatorRunID, doc.ParentRunID, invocationKind, doc.JobID)
+	}
+	teamRuns, ok := c.runs.(TeamCoordinatorRunStore)
+	if !ok {
+		return fmt.Errorf("job coordinator: team-aware run store is unavailable")
+	}
+	return teamRuns.CreateTeamChildRunWithKind(ctx, runID, threadID, agentID, doc.UserID, doc.OriginatorRunID, doc.ParentRunID, invocationKind, doc.JobID, doc.TeamID)
 }
 
 // failJob fences the terminal write on childRunID — use only after
@@ -514,7 +534,7 @@ func (c *JobCoordinator) failJob(doc agent.JobRecord, childRunID string, err err
 	if c.hub != nil {
 		c.hub.Notify(doc.JobID)
 	}
-	c.publishParentJobEvent(doc.ParentRunID, agent.EventJobFailed, doc, &agent.ErrMeta{Code: "job.failed", Message: errText})
+	c.publishParentJobEvent(doc.ParentRunID, agent.EventJobFailed, doc, &agent.ErrMeta{Code: "job.failed", Message: "background task failed"})
 }
 
 // failClaimedJob fences on the coordinator's claim owner — use for any
@@ -530,15 +550,20 @@ func (c *JobCoordinator) failClaimedJob(doc agent.JobRecord, err error) {
 	if c.hub != nil {
 		c.hub.Notify(doc.JobID)
 	}
-	c.publishParentJobEvent(doc.ParentRunID, agent.EventJobFailed, doc, &agent.ErrMeta{Code: "job.failed", Message: errText})
+	c.publishParentJobEvent(doc.ParentRunID, agent.EventJobFailed, doc, &agent.ErrMeta{Code: "job.failed", Message: "background task failed"})
 }
 
 func (c *JobCoordinator) publishParentJobEvent(parentRunID string, typ agent.EventType, doc agent.JobRecord, errMeta *agent.ErrMeta) {
-	if c.bus == nil || parentRunID == "" {
+	if parentRunID == "" {
 		return
 	}
-	body, _ := json.Marshal(agent.StreamEvent{
-		Type: typ,
+	event := agent.StreamEvent{
+		RunID:           parentRunID,
+		OriginatorRunID: doc.OriginatorRunID,
+		TeamID:          doc.TeamID,
+		AgentID:         doc.ParentAgentID,
+		Depth:           doc.DelegationDepth,
+		Type:            typ,
 		Job: &agent.JobMeta{
 			ID:            doc.JobID,
 			Status:        doc.Status,
@@ -547,8 +572,15 @@ func (c *JobCoordinator) publishParentJobEvent(parentRunID string, typ agent.Eve
 			TargetAgentID: doc.TargetAgentID,
 		},
 		Error: errMeta,
-	})
-	_ = c.bus.Publish(context.Background(), eventsTopic(parentRunID), bus.Message{Body: body})
+	}
+	if c.taskEvents != nil {
+		c.taskEvents.Publish(event)
+		return
+	}
+	if c.bus != nil {
+		body, _ := json.Marshal(event)
+		_ = c.bus.Publish(context.Background(), eventsTopic(parentRunID), bus.Message{Body: body})
+	}
 }
 
 func (c *JobCoordinator) isCancelled(ctx context.Context, originatorRunID string) bool {

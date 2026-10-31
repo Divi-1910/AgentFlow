@@ -146,31 +146,48 @@ func (r *DeploymentRevisionRepo) Get(ctx context.Context, userID, deploymentID s
 }
 
 func (r *DeploymentRevisionRepo) List(ctx context.Context, userID, deploymentID string, limit int) ([]deployment.Revision, error) {
+	page, err := r.ListPage(ctx, userID, deploymentID, deployment.RevisionPageRequest{Limit: limit})
+	return page.Items, err
+}
+
+func (r *DeploymentRevisionRepo) ListPage(ctx context.Context, userID, deploymentID string, request deployment.RevisionPageRequest) (deployment.RevisionPage, error) {
 	uid, err := bson.ObjectIDFromHex(userID)
 	if err != nil {
-		return nil, fmt.Errorf("deployment_revision_repo: invalid user_id: %w", err)
+		return deployment.RevisionPage{}, fmt.Errorf("deployment_revision_repo: invalid user_id: %w", err)
 	}
-	if deploymentID == "" || limit <= 0 {
-		return []deployment.Revision{}, nil
+	if deploymentID == "" || request.Limit <= 0 {
+		return deployment.RevisionPage{Items: []deployment.Revision{}}, nil
+	}
+	filter := bson.D{{Key: "user_id", Value: uid}, {Key: "deployment_id", Value: deploymentID}}
+	if request.BeforeRevision > 0 {
+		filter = append(filter, bson.E{Key: "revision", Value: bson.M{"$lt": request.BeforeRevision}})
 	}
 	cursor, err := r.col.Find(
 		ctx,
-		bson.D{{Key: "user_id", Value: uid}, {Key: "deployment_id", Value: deploymentID}},
-		options.Find().SetSort(bson.D{{Key: "revision", Value: -1}}).SetLimit(int64(limit)).SetProjection(bson.D{{Key: "bundle_json", Value: 0}}),
+		filter,
+		options.Find().SetSort(bson.D{{Key: "revision", Value: -1}}).SetLimit(int64(request.Limit+1)).SetProjection(bson.D{{Key: "bundle_json", Value: 0}}),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("deployment_revision_repo: list: %w", err)
+		return deployment.RevisionPage{}, fmt.Errorf("deployment_revision_repo: list: %w", err)
 	}
 	defer cursor.Close(ctx)
 	var raw []deploymentRevisionBSON
 	if err := cursor.All(ctx, &raw); err != nil {
-		return nil, fmt.Errorf("deployment_revision_repo: list decode: %w", err)
+		return deployment.RevisionPage{}, fmt.Errorf("deployment_revision_repo: list decode: %w", err)
+	}
+	hasMore := len(raw) > request.Limit
+	if hasMore {
+		raw = raw[:request.Limit]
 	}
 	revisions := make([]deployment.Revision, len(raw))
 	for i := range raw {
 		revisions[i] = *toDeploymentRevision(raw[i])
 	}
-	return revisions, nil
+	page := deployment.RevisionPage{Items: revisions}
+	if hasMore && len(revisions) > 0 {
+		page.NextRevision = revisions[len(revisions)-1].Revision
+	}
+	return page, nil
 }
 
 func validateRevisionInput(input deployment.RevisionInput) (bson.ObjectID, error) {

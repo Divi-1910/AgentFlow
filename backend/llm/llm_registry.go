@@ -14,23 +14,25 @@ type providerSpec struct {
 	build  func(string) LLMClient
 }
 
+const providerRequestTimeout = 30 * time.Minute
+
 var providerSpecs = []providerSpec{
 	{
 		name: "openai", envKey: "OPENAI_API_KEY",
 		build: func(key string) LLMClient {
-			return NewOpenAIAdapter(AdapterConfig{APIKey: key, BaseURL: "https://api.openai.com/v1", MaxRetries: 3, Timeout: 30 * time.Second})
+			return NewOpenAIAdapter(AdapterConfig{APIKey: key, BaseURL: "https://api.openai.com/v1", MaxRetries: 3, Timeout: providerRequestTimeout})
 		},
 	},
 	{
 		name: "nvidia", envKey: "NVIDIA_API_KEY",
 		build: func(key string) LLMClient {
-			return NewOpenAIAdapter(AdapterConfig{APIKey: key, BaseURL: "https://integrate.api.nvidia.com/v1", MaxRetries: 3, Timeout: 30 * time.Second})
+			return NewOpenAIAdapter(AdapterConfig{APIKey: key, BaseURL: "https://integrate.api.nvidia.com/v1", MaxRetries: 3, Timeout: providerRequestTimeout})
 		},
 	},
 	{
 		name: "anthropic", envKey: "ANTHROPIC_API_KEY",
 		build: func(key string) LLMClient {
-			return NewAnthropicAdapter(AdapterConfig{APIKey: key, MaxRetries: 3, Timeout: 60 * time.Second})
+			return NewAnthropicAdapter(AdapterConfig{APIKey: key, MaxRetries: 3, Timeout: providerRequestTimeout})
 		},
 	},
 }

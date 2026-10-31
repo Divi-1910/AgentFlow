@@ -120,3 +120,25 @@ func TestThreadRepoUpdateSummaryPersists(t *testing.T) {
 		t.Errorf("Summary: got %q, want %q", got.Summary, "this is the summary")
 	}
 }
+
+func TestThreadRepoUpdateTitlePersistsAndEnforcesOwnership(t *testing.T) {
+	r := mongorepo.NewThreadRepo(col(t, "threads"))
+	ctx := context.Background()
+	thread, err := r.Create(ctx, threadUserID, agentAID, "old title")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := r.UpdateTitle(ctx, thread.ID, threadOtherID, "intruder title"); err == nil {
+		t.Fatal("UpdateTitle accepted a non-owner")
+	}
+	if err := r.UpdateTitle(ctx, thread.ID, threadUserID, "new title"); err != nil {
+		t.Fatalf("UpdateTitle: %v", err)
+	}
+	updated, err := r.GetByID(ctx, thread.ID, threadUserID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if updated.Title != "new title" || !updated.UpdatedAt.After(thread.UpdatedAt) {
+		t.Fatalf("updated thread = %#v", updated)
+	}
+}

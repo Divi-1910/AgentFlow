@@ -29,7 +29,12 @@ func (f *fakeLLMModelStore) ListAll(ctx context.Context) ([]model.LLMModel, erro
 // ── fakeLLMClientRegistry ─────────────────────────────────────────────────────
 
 type fakeLLMClientRegistry struct {
-	getFn func(provider string) (llm.LLMClient, error)
+	getFn     func(provider string) (llm.LLMClient, error)
+	available []string
+}
+
+func (f *fakeLLMClientRegistry) Available() []string {
+	return append([]string(nil), f.available...)
 }
 
 func (f *fakeLLMClientRegistry) Get(provider string) (llm.LLMClient, error) {
@@ -61,6 +66,7 @@ func newLLMHandler(ms *fakeLLMModelStore, reg *fakeLLMClientRegistry) *handlers.
 // registryWith returns a registry that serves the given client for any provider.
 func registryWith(client llm.LLMClient) *fakeLLMClientRegistry {
 	return &fakeLLMClientRegistry{
+		available: []string{"openai", "anthropic", "nvidia"},
 		getFn: func(_ string) (llm.LLMClient, error) {
 			return client, nil
 		},
@@ -122,20 +128,21 @@ func TestGetLLMsReturns200WithModels(t *testing.T) {
 	ms := &fakeLLMModelStore{
 		listAllFn: func(_ context.Context) ([]model.LLMModel, error) {
 			return []model.LLMModel{
-				{ModelID: "m1", Name: "GPT-4", Provider: "openai"},
+				{ModelID: "m1", Name: "GPT-4", Provider: "openai", APIModelID: "gpt-4"},
+				{ModelID: "m2", Name: "Claude", Provider: "anthropic", APIModelID: "claude"},
 			}, nil
 		},
 	}
-	h := newLLMHandler(ms, &fakeLLMClientRegistry{})
+	h := newLLMHandler(ms, &fakeLLMClientRegistry{available: []string{"openai"}})
 	r := httptest.NewRequest(http.MethodGet, "/api/llms", nil)
 	w := httptest.NewRecorder()
 	h.GetLLMs(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("got %d, want 200 — body: %s", w.Code, w.Body)
 	}
-	var models []model.LLMModel
+	var models []handlers.LLMModelResponse
 	decodeJSON(t, w.Body.Bytes(), &models)
-	if len(models) != 1 || models[0].ModelID != "m1" {
+	if len(models) != 2 || models[0].Provider != "anthropic" || models[0].Available || !models[1].Available {
 		t.Errorf("unexpected models: %v", models)
 	}
 }

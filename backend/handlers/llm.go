@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"net/http"
+	"sort"
 
 	"backend/llm"
 	"backend/middleware"
@@ -17,6 +18,19 @@ type llmModelStore interface {
 // llmClientRegistry resolves a registered LLM client by provider name.
 type llmClientRegistry interface {
 	Get(provider string) (llm.LLMClient, error)
+	Available() []string
+}
+
+// LLMModelResponse is the product-facing catalog shape. Availability is
+// runtime state (AgentFlow has configured the provider credential), so it does
+// not belong in the persisted model document.
+type LLMModelResponse struct {
+	ModelID       string `json:"model_id"`
+	Name          string `json:"name"`
+	Provider      string `json:"provider"`
+	APIModelID    string `json:"api_model_id"`
+	ContextWindow int    `json:"context_window"`
+	Available     bool   `json:"available"`
 }
 
 type LLMHandler struct {
@@ -40,7 +54,31 @@ func (lh *LLMHandler) GetLLMs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, models)
+	availableProviders := make(map[string]struct{})
+	for _, provider := range lh.registry.Available() {
+		availableProviders[provider] = struct{}{}
+	}
+
+	response := make([]LLMModelResponse, len(models))
+	for i, entry := range models {
+		_, available := availableProviders[entry.Provider]
+		response[i] = LLMModelResponse{
+			ModelID: entry.ModelID, Name: entry.Name, Provider: entry.Provider,
+			APIModelID: entry.APIModelID, ContextWindow: entry.ContextWindow,
+			Available: available,
+		}
+	}
+	sort.Slice(response, func(i, j int) bool {
+		if response[i].Provider != response[j].Provider {
+			return response[i].Provider < response[j].Provider
+		}
+		if response[i].Name != response[j].Name {
+			return response[i].Name < response[j].Name
+		}
+		return response[i].APIModelID < response[j].APIModelID
+	})
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 type chatRequest struct {

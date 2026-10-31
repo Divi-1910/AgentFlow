@@ -213,20 +213,22 @@ func TestResumeRunVerifiesMessagesPersistedAfterResume(t *testing.T) {
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("list messages: expected 200, got %d", resp2.StatusCode)
 	}
-	var msgs []struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
+	var page struct {
+		Items []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"items"`
 	}
-	decodeBody(t, resp2, &msgs)
+	decodeBody(t, resp2, &page)
 
 	var sawAssistant bool
-	for _, m := range msgs {
+	for _, m := range page.Items {
 		if m.Role == "assistant" && m.Content == "resumed answer" {
 			sawAssistant = true
 			break
 		}
 	}
 	if !sawAssistant {
-		t.Errorf("expected persisted assistant message with content 'resumed answer'; got %+v", msgs)
+		t.Errorf("expected persisted assistant message with content 'resumed answer'; got %+v", page.Items)
 	}
 }

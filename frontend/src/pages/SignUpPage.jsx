@@ -6,7 +6,7 @@ import { useAuth } from '../hooks/useAuth'
 
 function SignUpPage() {
   const { signup } = useAuth()
-  const [error, setError]     = useState('')
+  const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
   const handleSubmit = async (e) => {
@@ -14,7 +14,7 @@ function SignUpPage() {
     setError('')
 
     const formData = new FormData(e.target)
-    const pwd     = formData.get('password')
+    const pwd = formData.get('password')
     const confirm = formData.get('confirmPassword')
 
     if (pwd !== confirm) {
@@ -41,12 +41,13 @@ function SignUpPage() {
     <AuthShell
       mode="signup"
       title="Create Account"
-      subtitle="Initialise your access key and join the AgentFlow network."
+      subtitle="Create your account to start building and running agents."
       submitLabel={loading ? 'Creating…' : 'Create Account'}
       switchLabel="Already have an account?"
       switchCta="Sign in"
       switchTo="/login"
       onSubmit={handleSubmit}
+      submitting={loading}
     >
       {/* Error banner */}
       {error && (
@@ -113,18 +114,6 @@ function SignUpPage() {
           icon="verified_user"
         />
       </div>
-
-      {/* Terms note */}
-      <p className="form-item text-[11px] font-light leading-relaxed text-white/25 opacity-0">
-        By creating an account you agree to our{' '}
-        <button type="button" className="underline decoration-white/20 underline-offset-2 hover:text-white/50 transition-colors">
-          Terms of Service
-        </button>
-        {' '}and{' '}
-        <button type="button" className="underline decoration-white/20 underline-offset-2 hover:text-white/50 transition-colors">
-          Privacy Policy
-        </button>.
-      </p>
     </AuthShell>
   )
 }

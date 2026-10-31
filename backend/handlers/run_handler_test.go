@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"backend/agent"
+	"backend/dispatcher"
 	"backend/handlers"
 	"backend/llm"
 	"backend/model"
@@ -18,10 +19,19 @@ import (
 
 // ── constructor helpers ───────────────────────────────────────────────────────
 
+type handlerRunStore interface {
+	agent.CheckpointStore
+	ListTopLevelByThreadForUser(context.Context, string, string, int) ([]*agent.RunInfo, error)
+	ResumeTopLevelRunForUser(context.Context, string, string, []string) (int, bool, error)
+	RequestCancelForUser(context.Context, string, string) (*agent.RunInfo, bool, error)
+	FinalizeCancelForUser(context.Context, string, string) (bool, error)
+}
+
 // newRunHandler wires only runRepo — safe for GetRun tests where nothing else is touched.
-func newRunHandler(runRepo agent.CheckpointStore) *handlers.RunHandler {
+func newRunHandler(runRepo handlerRunStore) *handlers.RunHandler {
 	return handlers.NewRunHandler(
 		&fakeAgentStore{},
+		&fakeThreadStore{},
 		&fakeMessageStore{},
 		runRepo,
 		&fakeDispatcher{},
@@ -32,13 +42,14 @@ func newRunHandler(runRepo agent.CheckpointStore) *handlers.RunHandler {
 
 // newResumeRunHandler provides all deps needed for ResumeRun tests.
 func newResumeRunHandler(
-	repo agent.CheckpointStore,
+	repo handlerRunStore,
 	as *fakeAgentStore,
 	ms *fakeMessageStore,
 	rt *fakeDispatcher,
 ) *handlers.RunHandler {
 	return handlers.NewRunHandler(
 		as,
+		&fakeThreadStore{},
 		ms,
 		repo,
 		rt,
@@ -136,8 +147,203 @@ func TestRunHandlerGetRunReturns200WithRunInfo(t *testing.T) {
 	}
 	var resp map[string]any
 	decodeJSON(t, w.Body.Bytes(), &resp)
-	if resp["run_id"] != "run-123" {
-		t.Errorf("run_id: got %v, want %q", resp["run_id"], "run-123")
+	if resp["id"] != "run-123" {
+		t.Errorf("id: got %v, want %q", resp["id"], "run-123")
+	}
+	if _, exposed := resp["user_id"]; exposed {
+		t.Error("product run response must not expose user_id")
+	}
+}
+
+func TestRunHandlerStreamEventsReplaysAfterLastEventID(t *testing.T) {
+	registry := handlers.NewExecutionRegistry()
+	published := make(chan struct{})
+	started, err := registry.Start("run-events", func(_ context.Context, publish func(agent.StreamEvent)) {
+		publish(agent.StreamEvent{Type: agent.EventRunStarted})
+		publish(agent.StreamEvent{Type: agent.EventRunCompleted})
+		close(published)
+	})
+	if err != nil || !started {
+		t.Fatalf("Start() = (%v, %v), want (true, nil)", started, err)
+	}
+	<-published
+	repo := &fakeRunRepo{getRunForUserFn: func(_ context.Context, runID, userID string) (*agent.RunInfo, error) {
+		if userID != testUserID {
+			t.Fatalf("user id = %q, want %q", userID, testUserID)
+		}
+		return &agent.RunInfo{RunID: runID, InvocationKind: agent.InvocationTopLevel}, nil
+	}}
+	h := handlers.NewRunHandler(
+		&fakeAgentStore{}, &fakeThreadStore{}, &fakeMessageStore{}, repo,
+		&fakeDispatcher{}, tools.NewEmptyRegistry(), agent.ToolCapabilities{AsyncJobs: true}, registry,
+	)
+	r := httptest.NewRequest(http.MethodGet, "/api/runs/run-events/events", nil)
+	r.SetPathValue("id", "run-events")
+	r.Header.Set("Last-Event-ID", "run-events:1")
+	r = withUser(r)
+	w := newFlushable()
+	h.StreamEvents(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 — body: %s", w.Code, w.Body)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "id: run-events:2") || !strings.Contains(body, "event: run.completed") {
+		t.Fatalf("SSE body = %q, want replayed terminal event with standard id/event fields", body)
+	}
+	if strings.Contains(body, "event: run.started") {
+		t.Fatalf("SSE body replayed an event at or before Last-Event-ID: %q", body)
+	}
+	if !strings.Contains(body, `"delivery_replayed":true`) {
+		t.Fatalf("SSE body = %q, want delivery replay marker", body)
+	}
+}
+
+func TestRunHandlerStreamEventsReturnsGoneWhenBufferExpired(t *testing.T) {
+	repo := &fakeRunRepo{getRunForUserFn: func(_ context.Context, runID, _ string) (*agent.RunInfo, error) {
+		return &agent.RunInfo{RunID: runID, InvocationKind: agent.InvocationTopLevel}, nil
+	}}
+	h := handlers.NewRunHandler(
+		&fakeAgentStore{}, &fakeThreadStore{}, &fakeMessageStore{}, repo,
+		&fakeDispatcher{}, tools.NewEmptyRegistry(), agent.ToolCapabilities{AsyncJobs: true},
+		handlers.NewExecutionRegistry(),
+	)
+	r := httptest.NewRequest(http.MethodGet, "/api/runs/run-expired/events", nil)
+	r.SetPathValue("id", "run-expired")
+	r = withUser(r)
+	w := newFlushable()
+	h.StreamEvents(w, r)
+	if w.Code != http.StatusGone {
+		t.Fatalf("got %d, want 410 — body: %s", w.Code, w.Body)
+	}
+}
+
+func TestRunHandlerStreamEventsHidesChildRuns(t *testing.T) {
+	repo := &fakeRunRepo{getRunForUserFn: func(_ context.Context, runID, _ string) (*agent.RunInfo, error) {
+		return &agent.RunInfo{RunID: runID, ParentRunID: "parent-run"}, nil
+	}}
+	h := newRunHandler(repo)
+	r := httptest.NewRequest(http.MethodGet, "/api/runs/child-run/events", nil)
+	r.SetPathValue("id", "child-run")
+	r = withUser(r)
+	w := newFlushable()
+	h.StreamEvents(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404 — body: %s", w.Code, w.Body)
+	}
+}
+
+func TestRunHandlerListByThreadReturnsProductRuns(t *testing.T) {
+	t.Parallel()
+	now := time.Now().UTC()
+	repo := &fakeRunRepo{listTopLevelFn: func(_ context.Context, threadID, userID string, limit int) ([]*agent.RunInfo, error) {
+		if threadID != testThreadID || userID != testUserID || limit != 25 {
+			t.Fatalf("list args = (%q, %q, %d)", threadID, userID, limit)
+		}
+		return []*agent.RunInfo{{
+			RunID: "run-1", ThreadID: threadID, AgentID: testAgentID,
+			Status: string(model.RunStatusInterrupted), Attempt: 2,
+			CreatedAt: now, UpdatedAt: now,
+		}}, nil
+	}}
+	h := handlers.NewRunHandler(
+		&fakeAgentStore{},
+		&fakeThreadStore{getByIDFn: func(_ context.Context, _, _ string) (*agent.ThreadRecord, error) {
+			return &agent.ThreadRecord{ID: testThreadID, AgentID: testAgentID}, nil
+		}},
+		&fakeMessageStore{}, repo, &fakeDispatcher{}, tools.NewEmptyRegistry(),
+		agent.ToolCapabilities{AsyncJobs: true},
+	)
+	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+testThreadID+"/runs?limit=25", nil)
+	r.SetPathValue("id", testThreadID)
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.ListByThread(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 — body: %s", w.Code, w.Body)
+	}
+	var response struct {
+		Items []map[string]any `json:"items"`
+	}
+	decodeJSON(t, w.Body.Bytes(), &response)
+	if len(response.Items) != 1 || response.Items[0]["id"] != "run-1" || response.Items[0]["resumable"] != true {
+		t.Fatalf("response = %#v", response)
+	}
+	if _, exposed := response.Items[0]["originator_run_id"]; exposed {
+		t.Error("product run response must not expose delegation lineage")
+	}
+}
+
+func TestRunHandlerCancelAbandonsInterruptedRun(t *testing.T) {
+	t.Parallel()
+	status := string(model.RunStatusInterrupted)
+	repo := &fakeRunRepo{
+		requestCancelFn: func(_ context.Context, runID, _ string) (*agent.RunInfo, bool, error) {
+			status = string(model.RunStatusCancelling)
+			return &agent.RunInfo{RunID: runID, AgentID: testAgentID, Status: string(model.RunStatusInterrupted)}, true, nil
+		},
+		finalizeCancelFn: func(context.Context, string, string) (bool, error) {
+			status = string(model.RunStatusCancelled)
+			return true, nil
+		},
+		getRunForUserFn: func(_ context.Context, runID, _ string) (*agent.RunInfo, error) {
+			return &agent.RunInfo{RunID: runID, AgentID: testAgentID, Status: status, CreatedAt: time.Now(), UpdatedAt: time.Now()}, nil
+		},
+	}
+	h := newRunHandler(repo)
+	r := httptest.NewRequest(http.MethodPost, "/api/runs/run-123/cancel", nil)
+	r.SetPathValue("id", "run-123")
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.CancelRun(w, r)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"cancelled"`) {
+		t.Fatalf("got %d body=%s", w.Code, w.Body)
+	}
+}
+
+func TestRunHandlerCancelRejectsCompletedRun(t *testing.T) {
+	t.Parallel()
+	repo := &fakeRunRepo{requestCancelFn: func(_ context.Context, runID, _ string) (*agent.RunInfo, bool, error) {
+		return &agent.RunInfo{RunID: runID, Status: string(model.RunStatusCompleted)}, false, nil
+	}}
+	h := newRunHandler(repo)
+	r := httptest.NewRequest(http.MethodPost, "/api/runs/run-123/cancel", nil)
+	r.SetPathValue("id", "run-123")
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.CancelRun(w, r)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("got %d, want 409", w.Code)
+	}
+}
+
+func TestRunHandlerCancelFinalizesAcceptedUndispatchedRun(t *testing.T) {
+	t.Parallel()
+	status := string(model.RunStatusRunning)
+	repo := &fakeRunRepo{
+		requestCancelFn: func(_ context.Context, runID, _ string) (*agent.RunInfo, bool, error) {
+			status = string(model.RunStatusCancelling)
+			return &agent.RunInfo{
+				RunID: runID, AgentID: testAgentID, Status: string(model.RunStatusRunning),
+				DispatchStarted: false,
+			}, true, nil
+		},
+		finalizeCancelFn: func(context.Context, string, string) (bool, error) {
+			status = string(model.RunStatusCancelled)
+			return true, nil
+		},
+		getRunForUserFn: func(_ context.Context, runID, _ string) (*agent.RunInfo, error) {
+			return &agent.RunInfo{RunID: runID, AgentID: testAgentID, Status: status}, nil
+		},
+	}
+	h := newRunHandler(repo)
+	r := httptest.NewRequest(http.MethodPost, "/api/runs/run-123/cancel", nil)
+	r.SetPathValue("id", "run-123")
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.CancelRun(w, r)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"cancelled"`) {
+		t.Fatalf("got %d body=%s", w.Code, w.Body)
 	}
 }
 
@@ -305,69 +511,25 @@ func TestResumeRunStreamsRunCompletedEvent(t *testing.T) {
 	}
 }
 
-func TestResumeRunIncrementAttemptFailureIsNonFatal(t *testing.T) {
+func TestResumeRunUsesAttemptFromAtomicClaim(t *testing.T) {
 	t.Parallel()
-	// IncrementAttempt fails → handler logs a warning and uses fallback,
-	// then continues to stream successfully.
-	repo := resumableRepo()
-	var incrementCalled bool
-	repo2 := &fakeRunRepo{
-		getRunForUserFn:     repo.getRunForUserFn,
-		loadLatestFn:        repo.loadLatestFn,
-		transitionForUserFn: repo.transitionForUserFn,
-	}
-	_ = repo2
-	// Use an inline fakeRunRepo that overrides only IncrementAttempt.
-	customRepo := &incrementFailRepo{fakeRunRepo: resumableRepo()}
-	h := newResumeRunHandler(customRepo, &fakeAgentStore{}, &fakeMessageStore{}, &fakeDispatcher{})
+	var attempt int
+	dispatcher := &fakeDispatcher{dispatchFn: func(_ context.Context, req dispatcher.DispatchRequest, events chan<- agent.StreamEvent) (*agent.RunResult, error) {
+		attempt = req.Attempt
+		events <- agent.StreamEvent{Type: agent.EventRunCompleted}
+		close(events)
+		return &agent.RunResult{Output: "ok"}, nil
+	}}
+	h := newResumeRunHandler(resumableRepo(), &fakeAgentStore{}, &fakeMessageStore{}, dispatcher)
 	r := withUser(resumeRequest(t))
 	w := newFlushable()
 	h.ResumeRun(w, r)
-
-	_ = incrementCalled
-	// Should still stream successfully despite the increment failure.
 	if w.Code != http.StatusOK {
 		t.Fatalf("got %d, want 200 — body: %s", w.Code, w.Body)
 	}
-	body := w.Body.String()
-	if !strings.Contains(body, string(agent.EventRunCompleted)) {
-		t.Errorf("response missing EventRunCompleted — body: %s", body)
+	if attempt != 2 {
+		t.Fatalf("dispatch attempt = %d, want 2", attempt)
 	}
-}
-
-// incrementFailRepo wraps fakeRunRepo and makes IncrementAttempt always fail.
-type incrementFailRepo struct {
-	*fakeRunRepo
-}
-
-func (r *incrementFailRepo) IncrementAttempt(_ context.Context, _ string) (int, error) {
-	return 0, errors.New("counter unavailable")
-}
-
-// Delegate all other methods to the embedded fakeRunRepo.
-func (r *incrementFailRepo) CreateRun(ctx context.Context, a, b, c, d string) error {
-	return r.fakeRunRepo.CreateRun(ctx, a, b, c, d)
-}
-func (r *incrementFailRepo) Save(ctx context.Context, s agent.RunSnapshot) error {
-	return r.fakeRunRepo.Save(ctx, s)
-}
-func (r *incrementFailRepo) LoadLatest(ctx context.Context, id string) (*agent.RunSnapshot, error) {
-	return r.fakeRunRepo.LoadLatest(ctx, id)
-}
-func (r *incrementFailRepo) TransitionStatus(ctx context.Context, a, b, c string) (bool, error) {
-	return r.fakeRunRepo.TransitionStatus(ctx, a, b, c)
-}
-func (r *incrementFailRepo) TransitionStatusForUser(ctx context.Context, a, b, c, d string) (bool, error) {
-	return r.fakeRunRepo.TransitionStatusForUser(ctx, a, b, c, d)
-}
-func (r *incrementFailRepo) UpdateStatus(ctx context.Context, a, b, c string) error {
-	return r.fakeRunRepo.UpdateStatus(ctx, a, b, c)
-}
-func (r *incrementFailRepo) GetRun(ctx context.Context, id string) (*agent.RunInfo, error) {
-	return r.fakeRunRepo.GetRun(ctx, id)
-}
-func (r *incrementFailRepo) GetRunForUser(ctx context.Context, a, b string) (*agent.RunInfo, error) {
-	return r.fakeRunRepo.GetRunForUser(ctx, a, b)
 }
 
 // suppress unused import

@@ -1,60 +1,89 @@
-import { useRef, useState, useEffect, useMemo, Suspense } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Canvas, useFrame } from '@react-three/fiber'
-import { useFBX } from '@react-three/drei'
+import { Environment, Lightformer } from '@react-three/drei'
 import { motion } from 'framer-motion'
 import * as THREE from 'three'
+import { BOTS } from './armorBot/botRegistry'
+import { BotShow } from './armorBot/botShow'
 
 // ─────────────────────────────────────────────────────────────────
-//  ↓  SWAP THIS ONE IMPORT TO CHANGE THE HERO MODEL
-// ─────────────────────────────────────────────────────────────────
-import modelUrl from '../../source/Robot.fbx?url'
-// ─────────────────────────────────────────────────────────────────
-
-// ─────────────────────────────────────────────────────────────────
-//  ↓  SCALE KNOB — increase to make the model larger in the scene
-//     The model is auto-normalised to 2 units tall first; this
-//     multiplier sits on top of that. 1.15 ≈ 15% larger than the
-//     previous GLB hero.
-// ─────────────────────────────────────────────────────────────────
-const MODEL_SCALE = 1.15
+//  The hero shows a cycle of code-built robots (img2threejs, see
+//  hero-bot-workspace/). BotShow loads them on demand, holds one,
+//  transforms into the next and runs the subtle idle animation.
+//  Phones, where this scene is hidden, never download any of it.
 // ─────────────────────────────────────────────────────────────────
 
-// Pre-fetch the model before the component mounts
-useFBX.preload(modelUrl)
+const DESKTOP_QUERY = '(min-width: 1024px)'
 
-// ─── 3-D model ───────────────────────────────────────────────────
-function AgentModel({ onLoaded, isDragging, dragOffsetX, dragOffsetY }) {
-  const fbx      = useFBX(modelUrl)
+function useIsDesktop() {
+  const [desktop, setDesktop] = useState(() => window.matchMedia(DESKTOP_QUERY).matches)
+  useEffect(() => {
+    const mq = window.matchMedia(DESKTOP_QUERY)
+    const onChange = (e) => setDesktop(e.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+  return desktop
+}
+
+// Procedural studio (no network fetch): a dark room with a few softboxes. Glossy clear-coat and gold only look
+// like armour when they have bright shapes to reflect; a uniformly bright room just washes everything to white.
+function StudioEnvironment() {
+  return (
+    <Environment resolution={256} frames={1}>
+      {/* key softbox: top-right-front */}
+      <Lightformer form="rect" intensity={5} color="#ffffff" scale={[9, 5, 1]} position={[4, 5, 5]} />
+      {/* cool strip: left */}
+      <Lightformer form="rect" intensity={3.2} color="#9bb8ff" scale={[2, 10, 1]} position={[-7, 2, 2]} />
+      {/* rim: behind, blue-violet */}
+      <Lightformer form="rect" intensity={4} color="#7a86ff" scale={[12, 3, 1]} position={[0, 2, -8]} />
+      {/* warm top-back strip: gives the gold its highlights */}
+      <Lightformer form="rect" intensity={3.5} color="#ffd9a0" scale={[8, 1.4, 1]} position={[0, 7, -3]} />
+      {/* low cool bounce */}
+      <Lightformer form="rect" intensity={0.8} color="#6070ff" scale={[10, 2, 1]} position={[0, -6, 3]} />
+    </Environment>
+  )
+}
+
+// ─── Lights ──────────────────────────────────────────────────────
+// The environment supplies the broad reflections; these add the directional shape.
+// The rim light takes on the accent colour of whichever bot is showing.
+function Lights({ show }) {
+  const rim = useRef(null)
+  useFrame(() => {
+    if (rim.current) rim.current.color.lerp(show.accent, 0.06)
+  })
+  return (
+    <>
+      <ambientLight intensity={0.02} />
+      {/* Key: strong, top-right-front */}
+      <directionalLight position={[3.5, 7, 5]} intensity={1.3} color="#ffffff" />
+      {/* Rim: behind + below — silhouette halo */}
+      <directionalLight ref={rim} position={[-1.5, -2, -7]} intensity={2.2} color="#8896ff" />
+      {/* Fill: soft left — keeps shadow side readable */}
+      <directionalLight position={[-5, 4, 2]} intensity={0.3} color="#c0ccff" />
+      {/* Ground bounce: cold from below */}
+      <pointLight position={[0, -3.5, 2]} intensity={0.6} color="#6070ff" distance={10} />
+    </>
+  )
+}
+
+// ─── Show rig: entry rise, auto-spin, drag, parallax, breathing ────────────────
+function ShowRig({ show, onLoaded, isDragging, dragOffsetX, dragOffsetY }) {
   const groupRef = useRef(null)
   const baseY    = useRef(0)
   const entryT   = useRef(null)
+  const pointer  = useRef({ x: 0, y: 0 })
 
-  /*
-    Auto-fit — runs once when the FBX is in memory.
-    Measures the real bounding box, computes a scale that maps
-    the model's height to exactly 2.0 three.js units, then
-    multiplies by MODEL_SCALE. Works regardless of whether the
-    FBX was exported in cm, m, or inches.
-  */
-  const { fitScale, fitOffset } = useMemo(() => {
-    const box  = new THREE.Box3().setFromObject(fbx)
-    const size = new THREE.Vector3()
-    const ctr  = new THREE.Vector3()
-    box.getSize(size)
-    box.getCenter(ctr)
-
-    const scale = size.y > 0
-      ? (2.0 / size.y) * MODEL_SCALE
-      : MODEL_SCALE
-
-    return { fitScale: scale, fitOffset: ctr }
-  }, [fbx])
-
-  // Signal parent once geometry is measured
-  useEffect(() => { onLoaded?.() }, [onLoaded])
+  useEffect(() => {
+    show.start(onLoaded)
+    return () => show.dispose()
+  }, [show, onLoaded])
 
   useFrame((state, delta) => {
     if (!groupRef.current) return
+    pointer.current.x = state.pointer.x
+    pointer.current.y = state.pointer.y
 
     // ── Entry: rise from y = -1 to 0 over ~1.8 s ──────────────
     if (entryT.current === null) entryT.current = state.clock.elapsedTime
@@ -85,66 +114,38 @@ function AgentModel({ onLoaded, isDragging, dragOffsetX, dragOffsetY }) {
     // ── Micro-breathing: barely perceptible scale oscillation ─
     const breath = 1 + Math.sin(state.clock.elapsedTime * 0.6) * 0.006
     groupRef.current.scale.setScalar(breath)
+
+    show.update(Math.min(delta, 0.1), state.clock.elapsedTime, pointer.current)
   })
 
   return (
-    /*
-      Outer group handles position animation (entry rise + parallax).
-      Inner group re-centres the FBX and normalises its scale so
-      swapping models is just changing the import at the top.
-    */
     <group ref={groupRef} position={[0, -1.0, 0]}>
-      <group
-        scale={fitScale}
-        position={[
-          -fitOffset.x * fitScale,
-          -fitOffset.y * fitScale,
-          -fitOffset.z * fitScale,
-        ]}
-      >
-        <primitive object={fbx} />
-      </group>
+      <primitive object={show.root} />
     </group>
   )
 }
 
-// ─── Lights ──────────────────────────────────────────────────────
-function Lights() {
+function Scene({ show, onLoaded, isDragging, dragOffsetX, dragOffsetY }) {
   return (
     <>
-      <ambientLight intensity={0.08} />
-      {/* Key: strong, top-right-front */}
-      <directionalLight position={[3.5, 7, 5]}  intensity={5.5} color="#ffffff" />
-      {/* Rim: behind + below — silhouette halo */}
-      <directionalLight position={[-1.5, -2, -7]} intensity={3.5} color="#8896ff" />
-      {/* Fill: soft left — keeps shadow side readable */}
-      <directionalLight position={[-5, 4, 2]}   intensity={0.7} color="#c0ccff" />
-      {/* Ground bounce: cold from below */}
-      <pointLight position={[0, -3.5, 2]} intensity={1.2} color="#6070ff" distance={10} />
-    </>
-  )
-}
-
-// ─── Scene ───────────────────────────────────────────────────────
-function Scene({ onLoaded, isDragging, dragOffsetX, dragOffsetY }) {
-  return (
-    <>
-      <Lights />
-      <Suspense fallback={null}>
-        <AgentModel
-          onLoaded={onLoaded}
-          isDragging={isDragging}
-          dragOffsetX={dragOffsetX}
-          dragOffsetY={dragOffsetY}
-        />
-      </Suspense>
+      <StudioEnvironment />
+      <Lights show={show} />
+      <ShowRig show={show} onLoaded={onLoaded} isDragging={isDragging} dragOffsetX={dragOffsetX} dragOffsetY={dragOffsetY} />
     </>
   )
 }
 
 // ─── Exported canvas wrapper ──────────────────────────────────────
 export default function CinematicScene() {
+  const desktop = useIsDesktop()
+  // Only the desktop layout shows the scene: do not build the WebGL context or fetch the models otherwise.
+  return desktop ? <HeroCanvas /> : null
+}
+
+function HeroCanvas() {
   const [loaded, setLoaded] = useState(false)
+  const show = useMemo(() => new BotShow(BOTS), [])
+  const handleLoaded = useCallback(() => setLoaded(true), [])
 
   // Drag state in refs — read by useFrame without causing re-renders
   const isDragging  = useRef(false)
@@ -200,7 +201,7 @@ export default function CinematicScene() {
           antialias: true,
           alpha: true,
           toneMapping: THREE.ACESFilmicToneMapping,
-          toneMappingExposure: 1.1,
+          toneMappingExposure: 1.0,
           powerPreference: 'high-performance',
           stencil: false,
         }}
@@ -208,7 +209,8 @@ export default function CinematicScene() {
         style={{ background: 'transparent' }}
       >
         <Scene
-          onLoaded={() => setLoaded(true)}
+          show={show}
+          onLoaded={handleLoaded}
           isDragging={isDragging}
           dragOffsetX={dragOffsetX}
           dragOffsetY={dragOffsetY}

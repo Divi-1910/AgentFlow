@@ -2,6 +2,7 @@ package mongorepo_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -12,6 +13,77 @@ import (
 
 	"github.com/google/uuid"
 )
+
+func TestRunRepoAdmissionIsIdempotentAndSerializesThread(t *testing.T) {
+	r := newRunRepo(t)
+	ctx := context.Background()
+	in := agent.RunAdmission{RunID: uuid.NewString(), ThreadID: "thread", AgentID: "team", TeamID: "team", UserID: "user", SubmissionKey: "key-1", AcceptedInput: "hello"}
+	first, err := r.AdmitTopLevelRun(ctx, in)
+	if err != nil || !first.Created {
+		t.Fatalf("first admission = %#v, err=%v", first, err)
+	}
+	if first.Run.TeamID != "team" {
+		t.Fatalf("persisted team id = %q", first.Run.TeamID)
+	}
+	replay, err := r.AdmitTopLevelRun(ctx, agent.RunAdmission{RunID: uuid.NewString(), ThreadID: in.ThreadID, AgentID: in.AgentID, UserID: in.UserID, SubmissionKey: in.SubmissionKey, AcceptedInput: in.AcceptedInput})
+	if err != nil || !replay.Replayed || replay.Run.RunID != in.RunID {
+		t.Fatalf("replay = %#v, err=%v", replay, err)
+	}
+	_, err = r.AdmitTopLevelRun(ctx, agent.RunAdmission{RunID: uuid.NewString(), ThreadID: in.ThreadID, AgentID: in.AgentID, UserID: in.UserID, SubmissionKey: in.SubmissionKey, AcceptedInput: "changed"})
+	if !errors.Is(err, agent.ErrSubmissionKeyConflict) {
+		t.Fatalf("changed replay err = %v", err)
+	}
+	active, err := r.AdmitTopLevelRun(ctx, agent.RunAdmission{RunID: uuid.NewString(), ThreadID: in.ThreadID, AgentID: in.AgentID, UserID: in.UserID, SubmissionKey: "key-2", AcceptedInput: "next"})
+	if !errors.Is(err, agent.ErrThreadRunActive) || active.ActiveRun != in.RunID {
+		t.Fatalf("active admission = %#v, err=%v", active, err)
+	}
+}
+
+func TestRunRepoCancellationFencesLateCompletion(t *testing.T) {
+	r := newRunRepo(t)
+	ctx := context.Background()
+	in := agent.RunAdmission{RunID: uuid.NewString(), ThreadID: "thread", AgentID: "agent", UserID: "user", SubmissionKey: "key-1", AcceptedInput: "hello"}
+	if _, err := r.AdmitTopLevelRun(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := r.RequestCancelForUser(ctx, in.RunID, in.UserID); err != nil || !claimed {
+		t.Fatalf("request cancel: claimed=%v err=%v", claimed, err)
+	}
+	if err := r.UpdateStatus(ctx, in.RunID, string(model.RunStatusCompleted), ""); err != nil {
+		t.Fatal(err)
+	}
+	info, err := r.GetRun(ctx, in.RunID)
+	if err != nil || info.Status != string(model.RunStatusCancelling) {
+		t.Fatalf("late completion overwrote cancellation: info=%#v err=%v", info, err)
+	}
+}
+
+func TestRunRepoRecoveryPreservesAcceptedUndispatchedRunForRetry(t *testing.T) {
+	r := newRunRepo(t)
+	ctx := context.Background()
+	in := agent.RunAdmission{
+		RunID: uuid.NewString(), ThreadID: "thread", AgentID: "agent", UserID: "user",
+		SubmissionKey: "key-pending", AcceptedInput: "hello",
+	}
+	if _, err := r.AdmitTopLevelRun(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := r.RecoverOrphanedRuns(ctx, in.UserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery.Interrupted != 0 || recovery.Failed != 0 || recovery.Cancelled != 0 {
+		t.Fatalf("recovery = %+v, want no orphan transition", recovery)
+	}
+	info, err := r.GetRun(ctx, in.RunID)
+	if err != nil || info.Status != string(model.RunStatusRunning) || info.DispatchStarted {
+		t.Fatalf("pending run = %#v, err=%v", info, err)
+	}
+	claimed, err := r.ClaimRunDispatch(ctx, in.RunID)
+	if err != nil || !claimed {
+		t.Fatalf("retry dispatch claim = %v, err=%v", claimed, err)
+	}
+}
 
 // newRunRepo creates a RunRepo with isolated collections and ensures indexes.
 func newRunRepo(t *testing.T) *mongorepo.RunRepo {
@@ -111,6 +183,32 @@ func TestRunRepoGetRunForUserCorrectOwner(t *testing.T) {
 	}
 	if info.RunID != runID {
 		t.Errorf("RunID: got %q, want %q", info.RunID, runID)
+	}
+}
+
+func TestRunRepoListTopLevelByThreadForUserExcludesChildrenAndOtherOwners(t *testing.T) {
+	r := newRunRepo(t)
+	ctx := context.Background()
+	rootID := uuid.NewString()
+	if err := r.CreateRun(ctx, rootID, "thread1", "agent1", "user1"); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if err := r.CreateChildRun(ctx, uuid.NewString(), "thread1", "agent2", "user1", rootID, rootID); err != nil {
+		t.Fatalf("CreateChildRun: %v", err)
+	}
+	if err := r.CreateRun(ctx, uuid.NewString(), "thread1", "agent1", "user2"); err != nil {
+		t.Fatalf("CreateRun other owner: %v", err)
+	}
+
+	infos, err := r.ListTopLevelByThreadForUser(ctx, "thread1", "user1", 10)
+	if err != nil {
+		t.Fatalf("ListTopLevelByThreadForUser: %v", err)
+	}
+	if len(infos) != 1 || infos[0].RunID != rootID {
+		t.Fatalf("listed runs = %#v, want only %q", infos, rootID)
+	}
+	if infos[0].CreatedAt.IsZero() || infos[0].UpdatedAt.IsZero() {
+		t.Fatalf("run timestamps were not projected: %#v", infos[0])
 	}
 }
 

@@ -186,10 +186,11 @@ func newAsyncHarness(t *testing.T, dbPath string, client llm.LLMClient, reader d
 
 func asyncAgents(userID string) (*agent.Agent, *mapAgentReader) {
 	supervisor := &agent.Agent{
-		ID: "supervisor", Provider: "fake", Model: "supervisor", SystemPrompt: "supervise", MaxSteps: 4, MaxRuns: 3,
+		ID: "supervisor", Kind: agent.ResourceKindStandaloneAgent,
+		Provider: "fake", Model: "supervisor", SystemPrompt: "supervise", MaxSteps: 4, MaxRuns: 3,
 		Delegates: []agent.DelegateConfig{{AgentID: "worker", ToolName: "ask_worker", Description: "ask worker"}},
 	}
-	worker := &agent.Agent{ID: "worker", Provider: "fake", Model: "worker", SystemPrompt: "work", MaxSteps: 2}
+	worker := &agent.Agent{ID: "worker", Kind: agent.ResourceKindStandaloneAgent, Provider: "fake", Model: "worker", SystemPrompt: "work", MaxSteps: 2}
 	reader := &mapAgentReader{userID: userID, agents: map[string]*agent.Agent{supervisor.ID: supervisor, worker.ID: worker}}
 	return supervisor, reader
 }

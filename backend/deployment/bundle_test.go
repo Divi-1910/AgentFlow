@@ -284,6 +284,9 @@ func TestAgentReaderScopesAndDefensiveCopies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if a.Kind != agent.ResourceKindStandaloneAgent {
+		t.Fatalf("compiled runtime agent kind = %q", a.Kind)
+	}
 	a.Tools = append(a.Tools, "mutated")
 	again, _ := r.GetByIDSystem(context.Background(), "supervisor")
 	if len(again.Tools) != 0 {

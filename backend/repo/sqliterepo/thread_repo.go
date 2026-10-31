@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"backend/agent"
+	"backend/pagination"
 
 	"github.com/google/uuid"
 )
@@ -47,7 +49,7 @@ func (r *ThreadRepo) GetByID(ctx context.Context, threadID, userID string) (*age
 func (r *ThreadRepo) ListByAgent(ctx context.Context, agentID, userID string) ([]*agent.ThreadRecord, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT `+threadColumns+` FROM threads
 WHERE agent_id = ? AND user_id = ? AND kind <> 'sub'
-ORDER BY created_at DESC, id DESC`, agentID, userID)
+ORDER BY updated_at DESC, id DESC`, agentID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("thread_repo: find failed: %w", err)
 	}
@@ -64,6 +66,64 @@ ORDER BY created_at DESC, id DESC`, agentID, userID)
 		return nil, fmt.Errorf("thread_repo: iterate failed: %w", err)
 	}
 	return records, nil
+}
+
+func (r *ThreadRepo) ListByAgentPage(ctx context.Context, agentID, userID string, request pagination.Request) (pagination.Page[*agent.ThreadRecord], error) {
+	return r.listPage(ctx, `user_id = ? AND agent_id = ? AND kind <> 'sub'`, []any{userID, agentID}, request)
+}
+
+func (r *ThreadRepo) ListByUserPage(ctx context.Context, userID string, resourceIDs []string, request pagination.Request) (pagination.Page[*agent.ThreadRecord], error) {
+	where := `user_id = ? AND kind <> 'sub'`
+	args := []any{userID}
+	if resourceIDs != nil {
+		if len(resourceIDs) == 0 {
+			return pagination.Page[*agent.ThreadRecord]{Items: []*agent.ThreadRecord{}}, nil
+		}
+		where += ` AND agent_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(resourceIDs)), ",") + `)`
+		for _, id := range resourceIDs {
+			args = append(args, id)
+		}
+	}
+	return r.listPage(ctx, where, args, request)
+}
+
+func (r *ThreadRepo) listPage(ctx context.Context, where string, args []any, request pagination.Request) (pagination.Page[*agent.ThreadRecord], error) {
+	if request.Limit <= 0 {
+		request.Limit = 50
+	}
+	if request.Cursor != nil {
+		where += ` AND (updated_at < ? OR (updated_at = ? AND id < ?))`
+		at := unixNano(request.Cursor.Time)
+		args = append(args, at, at, request.Cursor.ID)
+	}
+	args = append(args, request.Limit+1)
+	rows, err := r.db.QueryContext(ctx, `SELECT `+threadColumns+` FROM threads WHERE `+where+`
+ORDER BY updated_at DESC, id DESC LIMIT ?`, args...)
+	if err != nil {
+		return pagination.Page[*agent.ThreadRecord]{}, fmt.Errorf("thread_repo: page find failed: %w", err)
+	}
+	defer rows.Close()
+	var items []*agent.ThreadRecord
+	for rows.Next() {
+		record, err := scanThread(rows)
+		if err != nil {
+			return pagination.Page[*agent.ThreadRecord]{}, fmt.Errorf("thread_repo: page decode failed: %w", err)
+		}
+		items = append(items, record)
+	}
+	if err := rows.Err(); err != nil {
+		return pagination.Page[*agent.ThreadRecord]{}, fmt.Errorf("thread_repo: page iterate failed: %w", err)
+	}
+	hasMore := len(items) > request.Limit
+	if hasMore {
+		items = items[:request.Limit]
+	}
+	page := pagination.Page[*agent.ThreadRecord]{Items: items, HasMore: hasMore}
+	if hasMore && len(items) > 0 {
+		last := items[len(items)-1]
+		page.Next = &pagination.Cursor{Kind: "threads", Time: last.UpdatedAt, ID: last.ID}
+	}
+	return page, nil
 }
 
 // FindOrCreateSubThread keeps insert and read in one IMMEDIATE transaction.
@@ -103,6 +163,38 @@ func (r *ThreadRepo) UpdateSummary(ctx context.Context, threadID, userID, summar
 		summary, unixNano(time.Now()), threadID, userID)
 	if err != nil {
 		return fmt.Errorf("thread_repo: update summary failed: %w", err)
+	}
+	return nil
+}
+
+func (r *ThreadRepo) UpdateTitle(ctx context.Context, threadID, userID, title string) error {
+	result, err := r.db.ExecContext(ctx, `UPDATE threads SET title = ?, updated_at = ? WHERE id = ? AND user_id = ?`,
+		title, unixNano(time.Now()), threadID, userID)
+	if err != nil {
+		return fmt.Errorf("thread_repo: update title failed: %w", err)
+	}
+	matched, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("thread_repo: update title result: %w", err)
+	}
+	if matched == 0 {
+		return fmt.Errorf("thread not found")
+	}
+	return nil
+}
+
+func (r *ThreadRepo) Touch(ctx context.Context, threadID, userID string) error {
+	result, err := r.db.ExecContext(ctx, `UPDATE threads SET updated_at = ? WHERE id = ? AND user_id = ?`,
+		unixNano(time.Now()), threadID, userID)
+	if err != nil {
+		return fmt.Errorf("thread_repo: touch failed: %w", err)
+	}
+	matched, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("thread_repo: touch result: %w", err)
+	}
+	if matched == 0 {
+		return fmt.Errorf("thread not found")
 	}
 	return nil
 }

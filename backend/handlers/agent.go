@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"backend/agent"
@@ -67,20 +68,62 @@ type mcpServerLookup interface {
 	GetEnabledByIDs(ctx context.Context, serverIDs []string) (map[string]mcp.CatalogEntry, error)
 }
 
-var errMCPServerCatalog = errors.New("MCP server catalog unavailable")
+type llmModelLookup interface {
+	Exists(ctx context.Context, provider, apiModelID string) (bool, error)
+}
+
+type providerAvailability interface {
+	Available() []string
+}
+
+type resourceDependencyChecker interface {
+	BlockingDependencies(ctx context.Context, userID, resourceID string) ([]string, error)
+}
+
+var (
+	errMCPServerCatalog = errors.New("MCP server catalog unavailable")
+	errLLMModelCatalog  = errors.New("LLM model catalog unavailable")
+)
 
 type AgentHandler struct {
 	agentRepo    agentStore
-	toolRegistry *tools.ToolRegistry
-	mcpCatalog   mcpServerLookup
+	validator    *agentConfigurationValidator
+	dependencies resourceDependencyChecker
 }
 
-func NewAgentHandler(agentRepo agentStore, toolRegistry *tools.ToolRegistry, mcpCatalog mcpServerLookup) *AgentHandler {
-	return &AgentHandler{
-		agentRepo:    agentRepo,
-		toolRegistry: toolRegistry,
-		mcpCatalog:   mcpCatalog,
+// agentConfigurationValidator owns validation shared by the standalone-agent
+// and agent-team transports. It depends on domain-facing readers/registries,
+// not on either HTTP handler, so neither product resource is coupled to the
+// other's transport implementation.
+type agentConfigurationValidator struct {
+	agentRepo    agentReader
+	toolRegistry *tools.ToolRegistry
+	toolCatalog  toolDefinitionCatalog
+	mcpCatalog   mcpServerLookup
+	modelCatalog llmModelLookup
+	providers    providerAvailability
+}
+
+func NewAgentHandler(
+	agentRepo agentStore,
+	toolRegistry *tools.ToolRegistry,
+	toolCatalog toolDefinitionCatalog,
+	mcpCatalog mcpServerLookup,
+	modelCatalog llmModelLookup,
+	providers providerAvailability,
+	dependencies ...resourceDependencyChecker,
+) *AgentHandler {
+	handler := &AgentHandler{
+		agentRepo: agentRepo,
+		validator: &agentConfigurationValidator{
+			agentRepo: agentRepo, toolRegistry: toolRegistry, toolCatalog: toolCatalog, mcpCatalog: mcpCatalog,
+			modelCatalog: modelCatalog, providers: providers,
+		},
 	}
+	if len(dependencies) > 0 {
+		handler.dependencies = dependencies[0]
+	}
+	return handler
 }
 
 type CreateAgentRequest struct {
@@ -110,6 +153,7 @@ type UpdateAgentRequest struct {
 	Tools              *[]string                 `json:"tools"`
 	Delegates          *[]DelegateConfigJSON     `json:"delegates"`
 	MCPServers         *[]MCPServerSelectionJSON `json:"mcp_servers"`
+	ContextWindow      *int                      `json:"context_window"`
 	ContextKeepRatio   *float64                  `json:"context_keep_ratio"`
 	SummarizationModel *string                   `json:"summarization_model"`
 	MaxSteps           *int                      `json:"max_steps"`
@@ -120,13 +164,13 @@ type UpdateAgentRequest struct {
 
 type AgentResponse struct {
 	ID                 string                   `json:"id"`
+	Kind               string                   `json:"kind"`
 	Name               string                   `json:"name"`
 	Description        string                   `json:"description,omitempty"`
 	Provider           string                   `json:"provider"`
 	Model              string                   `json:"model"`
 	SystemPrompt       string                   `json:"system_prompt"`
 	Tools              []string                 `json:"tools"`
-	Delegates          []DelegateConfigJSON     `json:"delegates,omitempty"`
 	MCPServers         []MCPServerSelectionJSON `json:"mcp_servers,omitempty"`
 	ContextWindow      int                      `json:"context_window"`
 	ContextKeepRatio   float64                  `json:"context_keep_ratio"`
@@ -136,18 +180,19 @@ type AgentResponse struct {
 	MaxTokens          int                      `json:"max_tokens"`
 	MaxRuns            int                      `json:"max_runs"`
 	CreatedAt          string                   `json:"created_at"`
+	UpdatedAt          string                   `json:"updated_at"`
 }
 
 func toAgentResponse(a *agent.Agent) AgentResponse {
 	return AgentResponse{
 		ID:                 a.ID,
+		Kind:               string(agent.EffectiveResourceKind(a)),
 		Name:               a.Name,
 		Description:        a.Description,
 		Provider:           a.Provider,
 		Model:              a.Model,
 		SystemPrompt:       a.SystemPrompt,
 		Tools:              a.Tools,
-		Delegates:          delegatesToJSON(a.Delegates),
 		MCPServers:         mcpServersToJSON(a.MCPServers),
 		ContextWindow:      a.ContextWindow,
 		ContextKeepRatio:   a.ContextKeepRatio,
@@ -157,6 +202,7 @@ func toAgentResponse(a *agent.Agent) AgentResponse {
 		MaxTokens:          a.MaxTokens,
 		MaxRuns:            resolveAgentMaxRuns(a.MaxRuns),
 		CreatedAt:          a.CreatedAt.UTC().Format(time.RFC3339Nano),
+		UpdatedAt:          a.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	}
 }
 
@@ -188,6 +234,61 @@ func validatePositiveInt(name string, v *int) error {
 	return nil
 }
 
+func validateNonBlank(name, value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s is required", name)
+	}
+	return nil
+}
+
+func validateOptionalNonBlank(name string, value *string) error {
+	if value == nil {
+		return nil
+	}
+	return validateNonBlank(name, *value)
+}
+
+func trimmedStringPointer(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*value)
+	return &trimmed
+}
+
+func validateAgentTuning(
+	contextWindow *int,
+	contextKeepRatio *float64,
+	maxSteps *int,
+	temperature *float64,
+	maxTokens *int,
+	maxRuns *int,
+) error {
+	integerSettings := []struct {
+		name  string
+		value *int
+	}{
+		{name: "context_window", value: contextWindow},
+		{name: "max_steps", value: maxSteps},
+		{name: "max_tokens", value: maxTokens},
+		{name: "max_runs", value: maxRuns},
+	}
+	for _, setting := range integerSettings {
+		if err := validatePositiveInt(setting.name, setting.value); err != nil {
+			return err
+		}
+	}
+	if contextKeepRatio != nil && (*contextKeepRatio <= 0 || *contextKeepRatio > 1) {
+		return errors.New("context_keep_ratio must be greater than 0 and at most 1")
+	}
+	// A zero value currently means "use the AgentFlow default" in the runtime,
+	// so accepting it as an explicit setting would misrepresent user intent.
+	if temperature != nil && (*temperature <= 0 || *temperature > 1) {
+		return errors.New("temperature must be greater than 0 and at most 1")
+	}
+	return nil
+}
+
 func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 	userID, ok := getUserID(r)
 	if !ok {
@@ -200,46 +301,59 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Name == "" || req.Provider == "" || req.Model == "" || req.SystemPrompt == "" {
-		writeError(w, http.StatusBadRequest, "name, provider, model, and system_prompt are required")
+	requiredFields := []struct{ name, value string }{
+		{name: "name", value: req.Name},
+		{name: "provider", value: req.Provider},
+		{name: "model", value: req.Model},
+		{name: "system_prompt", value: req.SystemPrompt},
+	}
+	for _, field := range requiredFields {
+		if err := validateNonBlank(field.name, field.value); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if err := validateAgentTuning(
+		req.ContextWindow, req.ContextKeepRatio, req.MaxSteps,
+		req.Temperature, req.MaxTokens, req.MaxRuns,
+	); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.validator.validateModelSelection(
+		r.Context(), req.Provider, req.Model, req.SummarizationModel,
+	); err != nil {
+		writeConfigurationValidationError(w, err)
 		return
 	}
 
 	if req.Tools == nil {
 		req.Tools = []string{}
 	}
-	if err := h.validateTools(req.Tools); err != nil {
+	if err := h.validator.validateTools(req.Tools); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := validatePositiveInt("max_runs", req.MaxRuns); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	delegates := toDelegateConfigs(req.Delegates)
-	// thisAgentID is empty on create (id not yet assigned); self-delegate is
-	// impossible (a self-reference can't resolve) and is backstopped by the
-	// runtime cycle guard.
-	if err := h.validateDelegates(r.Context(), userID, "", req.Tools, delegates); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if len(req.Delegates) > 0 {
+		writeError(w, http.StatusBadRequest, "delegates belong to an agent team")
 		return
 	}
 	mcpServers := toMCPServerSelections(req.MCPServers)
-	if err := h.validateMCPServers(r.Context(), mcpServers); err != nil {
-		h.writeMCPValidationError(w, err)
+	if err := h.validator.validateMCPServers(r.Context(), mcpServers); err != nil {
+		writeMCPValidationError(w, err)
 		return
 	}
 
 	a := &agent.Agent{
-		Name:               req.Name,
+		Kind:               agent.ResourceKindStandaloneAgent,
+		Name:               strings.TrimSpace(req.Name),
 		Description:        req.Description,
-		Provider:           req.Provider,
-		Model:              req.Model,
+		Provider:           strings.TrimSpace(req.Provider),
+		Model:              strings.TrimSpace(req.Model),
 		SystemPrompt:       req.SystemPrompt,
 		Tools:              req.Tools,
-		Delegates:          delegates,
 		MCPServers:         mcpServers,
-		SummarizationModel: req.SummarizationModel,
+		SummarizationModel: strings.TrimSpace(req.SummarizationModel),
 		MaxSteps:           resolveInt(req.MaxSteps, agent.DefaultMaxSteps),
 		MaxTokens:          resolveInt(req.MaxTokens, agent.DefaultMaxTokens),
 		MaxRuns:            resolveInt(req.MaxRuns, agent.DefaultMaxTaskRuns),
@@ -270,9 +384,12 @@ func (h *AgentHandler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := make([]AgentResponse, len(agents))
-	for i, a := range agents {
-		resp[i] = toAgentResponse(a)
+	resp := make([]AgentResponse, 0, len(agents))
+	for _, a := range agents {
+		if agent.EffectiveResourceKind(a) != agent.ResourceKindStandaloneAgent {
+			continue
+		}
+		resp = append(resp, toAgentResponse(a))
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -293,6 +410,10 @@ func (h *AgentHandler) Get(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to get agent")
 		return
 	}
+	if agent.EffectiveResourceKind(a) != agent.ResourceKindStandaloneAgent {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return
+	}
 	writeJSON(w, http.StatusOK, toAgentResponse(a))
 }
 
@@ -309,49 +430,86 @@ func (h *AgentHandler) Update(w http.ResponseWriter, r *http.Request) {
 	}
 
 	agentID := r.PathValue("id")
+	current, err := h.agentRepo.GetByID(r.Context(), agentID, userID)
+	if err != nil {
+		if err.Error() == "agent not found" {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load agent")
+		return
+	}
+	if agent.EffectiveResourceKind(current) != agent.ResourceKindStandaloneAgent {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return
+	}
+	if req.Delegates != nil {
+		writeError(w, http.StatusBadRequest, "delegates belong to an agent team")
+		return
+	}
+	optionalFields := []struct {
+		name  string
+		value *string
+	}{
+		{name: "name", value: req.Name},
+		{name: "provider", value: req.Provider},
+		{name: "model", value: req.Model},
+		{name: "system_prompt", value: req.SystemPrompt},
+	}
+	for _, field := range optionalFields {
+		if err := validateOptionalNonBlank(field.name, field.value); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if err := validateAgentTuning(
+		req.ContextWindow, req.ContextKeepRatio, req.MaxSteps,
+		req.Temperature, req.MaxTokens, req.MaxRuns,
+	); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Provider != nil || req.Model != nil || req.SummarizationModel != nil {
+		provider, modelID, summarizationModel := current.Provider, current.Model, current.SummarizationModel
+		if req.Provider != nil {
+			provider = strings.TrimSpace(*req.Provider)
+		}
+		if req.Model != nil {
+			modelID = strings.TrimSpace(*req.Model)
+		}
+		if req.SummarizationModel != nil {
+			summarizationModel = strings.TrimSpace(*req.SummarizationModel)
+		}
+		if err := h.validator.validateModelSelection(r.Context(), provider, modelID, summarizationModel); err != nil {
+			writeConfigurationValidationError(w, err)
+			return
+		}
+	}
 	input := agent.UpdateAgentInput{
-		Name:               req.Name,
+		Name:               trimmedStringPointer(req.Name),
 		Description:        req.Description,
-		Provider:           req.Provider,
-		Model:              req.Model,
+		Provider:           trimmedStringPointer(req.Provider),
+		Model:              trimmedStringPointer(req.Model),
 		SystemPrompt:       req.SystemPrompt,
 		Tools:              req.Tools,
 		Temperature:        req.Temperature,
 		MaxSteps:           req.MaxSteps,
 		MaxTokens:          req.MaxTokens,
 		MaxRuns:            req.MaxRuns,
+		ContextWindow:      req.ContextWindow,
 		ContextKeepRatio:   req.ContextKeepRatio,
-		SummarizationModel: req.SummarizationModel,
-	}
-	if err := validatePositiveInt("max_runs", req.MaxRuns); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		SummarizationModel: trimmedStringPointer(req.SummarizationModel),
 	}
 	if req.Tools != nil {
-		if err := h.validateTools(*req.Tools); err != nil {
+		if err := h.validator.validateTools(*req.Tools); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-	}
-	if req.Delegates != nil {
-		delegates := toDelegateConfigs(*req.Delegates)
-		// Determine the effective tool list for collision checks: the new
-		// Tools if provided, else the agent's current Tools.
-		effectiveTools, err := h.effectiveToolsForUpdate(r.Context(), agentID, userID, req.Tools)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to load agent for validation")
-			return
-		}
-		if err := h.validateDelegates(r.Context(), userID, agentID, effectiveTools, delegates); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		input.Delegates = &delegates
 	}
 	if req.MCPServers != nil {
 		mcpServers := toMCPServerSelections(*req.MCPServers)
-		if err := h.validateMCPServers(r.Context(), mcpServers); err != nil {
-			h.writeMCPValidationError(w, err)
+		if err := h.validator.validateMCPServers(r.Context(), mcpServers); err != nil {
+			writeMCPValidationError(w, err)
 			return
 		}
 		input.MCPServers = &mcpServers
@@ -376,7 +534,25 @@ func (h *AgentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.agentRepo.Delete(r.Context(), r.PathValue("id"), userID); err != nil {
+	agentID := r.PathValue("id")
+	current, err := h.agentRepo.GetByID(r.Context(), agentID, userID)
+	if err != nil {
+		if err.Error() == "agent not found" {
+			writeError(w, http.StatusNotFound, "agent not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load agent")
+		return
+	}
+	if agent.EffectiveResourceKind(current) != agent.ResourceKindStandaloneAgent {
+		writeError(w, http.StatusNotFound, "agent not found")
+		return
+	}
+	if !h.canDelete(w, r, userID, agentID) {
+		return
+	}
+
+	if err := h.agentRepo.Delete(r.Context(), agentID, userID); err != nil {
 		if err.Error() == "agent not found" {
 			writeError(w, http.StatusNotFound, "agent not found")
 			return
@@ -387,11 +563,30 @@ func (h *AgentHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "agent deleted"})
 }
 
-func (h *AgentHandler) validateTools(toolNames []string) error {
+func (h *AgentHandler) canDelete(w http.ResponseWriter, r *http.Request, userID, resourceID string) bool {
+	if h.dependencies == nil {
+		return true
+	}
+	dependencies, err := h.dependencies.BlockingDependencies(r.Context(), userID, resourceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to verify resource dependencies")
+		return false
+	}
+	if len(dependencies) == 0 {
+		return true
+	}
+	writeJSON(w, http.StatusConflict, map[string]any{
+		"error":        "resource cannot be deleted while it has dependencies",
+		"dependencies": dependencies,
+	})
+	return false
+}
+
+func (v *agentConfigurationValidator) validateTools(toolNames []string) error {
 	seen := make(map[string]bool, len(toolNames))
 	for _, name := range toolNames {
-		if !h.toolRegistry.Has(name) {
-			return errors.New("unknown tool: " + name)
+		if !v.toolRegistry.Has(name) {
+			return errors.New("unknown or unavailable tool: " + name)
 		}
 		if seen[name] {
 			return errors.New("duplicate tool: " + name)
@@ -401,36 +596,49 @@ func (h *AgentHandler) validateTools(toolNames []string) error {
 	return nil
 }
 
-func toDelegateConfigs(in []DelegateConfigJSON) []agent.DelegateConfig {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]agent.DelegateConfig, len(in))
-	for i, d := range in {
-		out[i] = agent.DelegateConfig{
-			AgentID:      d.AgentID,
-			ToolName:     d.ToolName,
-			Description:  d.Description,
-			Instructions: d.Instructions,
-		}
-	}
-	return out
-}
+func (v *agentConfigurationValidator) validateModelSelection(
+	ctx context.Context,
+	provider string,
+	modelID string,
+	summarizationModel string,
+) error {
+	provider = strings.TrimSpace(provider)
+	modelID = strings.TrimSpace(modelID)
+	summarizationModel = strings.TrimSpace(summarizationModel)
 
-func delegatesToJSON(in []agent.DelegateConfig) []DelegateConfigJSON {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]DelegateConfigJSON, len(in))
-	for i, d := range in {
-		out[i] = DelegateConfigJSON{
-			AgentID:      d.AgentID,
-			ToolName:     d.ToolName,
-			Description:  d.Description,
-			Instructions: d.Instructions,
+	providerAvailable := false
+	if v.providers != nil {
+		for _, available := range v.providers.Available() {
+			if available == provider {
+				providerAvailable = true
+				break
+			}
 		}
 	}
-	return out
+	if !providerAvailable {
+		return fmt.Errorf("provider %q is unavailable", provider)
+	}
+	if v.modelCatalog == nil {
+		return errLLMModelCatalog
+	}
+	exists, err := v.modelCatalog.Exists(ctx, provider, modelID)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errLLMModelCatalog, err)
+	}
+	if !exists {
+		return fmt.Errorf("unknown model %q for provider %q", modelID, provider)
+	}
+	if summarizationModel == "" {
+		return nil
+	}
+	exists, err = v.modelCatalog.Exists(ctx, provider, summarizationModel)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errLLMModelCatalog, err)
+	}
+	if !exists {
+		return fmt.Errorf("unknown summarization_model %q for provider %q", summarizationModel, provider)
+	}
+	return nil
 }
 
 func toMCPServerSelections(in []MCPServerSelectionJSON) []agent.MCPServerSelection {
@@ -455,7 +663,7 @@ func mcpServersToJSON(in []agent.MCPServerSelection) []MCPServerSelectionJSON {
 	return out
 }
 
-func (h *AgentHandler) validateMCPServers(ctx context.Context, servers []agent.MCPServerSelection) error {
+func (v *agentConfigurationValidator) validateMCPServers(ctx context.Context, servers []agent.MCPServerSelection) error {
 	if len(servers) == 0 {
 		return nil
 	}
@@ -473,10 +681,10 @@ func (h *AgentHandler) validateMCPServers(ctx context.Context, servers []agent.M
 	for i, server := range servers {
 		serverIDs[i] = server.ServerID
 	}
-	if h.mcpCatalog == nil {
+	if v.mcpCatalog == nil {
 		return errMCPServerCatalog
 	}
-	entries, err := h.mcpCatalog.GetEnabledByIDs(ctx, serverIDs)
+	entries, err := v.mcpCatalog.GetEnabledByIDs(ctx, serverIDs)
 	if err != nil {
 		return fmt.Errorf("%w: %v", errMCPServerCatalog, err)
 	}
@@ -500,7 +708,7 @@ func (h *AgentHandler) validateMCPServers(ctx context.Context, servers []agent.M
 	return nil
 }
 
-func (h *AgentHandler) writeMCPValidationError(w http.ResponseWriter, err error) {
+func writeMCPValidationError(w http.ResponseWriter, err error) {
 	if errors.Is(err, errMCPServerCatalog) {
 		writeError(w, http.StatusInternalServerError, "failed to validate MCP servers")
 		return
@@ -508,24 +716,18 @@ func (h *AgentHandler) writeMCPValidationError(w http.ResponseWriter, err error)
 	writeError(w, http.StatusBadRequest, err.Error())
 }
 
-// effectiveToolsForUpdate returns the tool list to validate delegate-name
-// collisions against: the incoming Tools if the update sets them, else the
-// agent's current Tools.
-func (h *AgentHandler) effectiveToolsForUpdate(ctx context.Context, agentID, userID string, newTools *[]string) ([]string, error) {
-	if newTools != nil {
-		return *newTools, nil
+func writeConfigurationValidationError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errLLMModelCatalog) {
+		writeError(w, http.StatusInternalServerError, "failed to validate LLM model")
+		return
 	}
-	a, err := h.agentRepo.GetByID(ctx, agentID, userID)
-	if err != nil {
-		return nil, err
-	}
-	return a.Tools, nil
+	writeError(w, http.StatusBadRequest, err.Error())
 }
 
 // validateDelegates enforces provider-safe tool names, no collisions (against
 // tools, other delegates, or any registered tool), same-user ownership of the
 // target, and (on update) no self-delegate.
-func (h *AgentHandler) validateDelegates(ctx context.Context, userID, thisAgentID string, toolNames []string, delegates []agent.DelegateConfig) error {
+func (v *agentConfigurationValidator) validateDelegates(ctx context.Context, userID, thisAgentID string, toolNames []string, delegates []agent.DelegateConfig) error {
 	if len(delegates) == 0 {
 		return nil
 	}
@@ -543,16 +745,32 @@ func (h *AgentHandler) validateDelegates(ctx context.Context, userID, thisAgentI
 		if seen[d.ToolName] {
 			return fmt.Errorf("delegate tool_name %q collides with another tool or delegate", d.ToolName)
 		}
-		if h.toolRegistry.Has(d.ToolName) {
+		if v.isCatalogTool(d.ToolName) {
 			return fmt.Errorf("delegate tool_name %q collides with a registered tool", d.ToolName)
 		}
 		seen[d.ToolName] = true
 		if thisAgentID != "" && d.AgentID == thisAgentID {
 			return errors.New("an agent cannot delegate to itself")
 		}
-		if _, err := h.agentRepo.GetByID(ctx, d.AgentID, userID); err != nil {
+		member, err := v.agentRepo.GetByID(ctx, d.AgentID, userID)
+		if err != nil {
 			return fmt.Errorf("delegate agent %s not found or not owned", d.AgentID)
+		}
+		if agent.EffectiveResourceKind(member) != agent.ResourceKindStandaloneAgent {
+			return fmt.Errorf("delegate agent %s must be a standalone agent", d.AgentID)
 		}
 	}
 	return nil
+}
+
+func (v *agentConfigurationValidator) isCatalogTool(name string) bool {
+	if v.toolCatalog == nil {
+		return v.toolRegistry.Has(name)
+	}
+	for _, definition := range v.toolCatalog.Definitions() {
+		if definition.Name == name {
+			return true
+		}
+	}
+	return false
 }

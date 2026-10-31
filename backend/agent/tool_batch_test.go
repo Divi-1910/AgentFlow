@@ -540,7 +540,7 @@ func TestRunToolCallPanicOutcomePreservesMetadataAndFailedEvent(t *testing.T) {
 		if e.Tool == nil || e.Tool.ID != "tc-panic" || e.Tool.Name != "panic_tool" || string(e.Tool.Args) != `{"x":1}` {
 			t.Fatalf("failed event tool metadata = %+v", e.Tool)
 		}
-		if e.Error == nil || e.Error.Code != "tool.execution_failed" || e.Error.Message != "panic: boom" {
+		if e.Error == nil || e.Error.Code != "tool.execution_failed" || e.Error.Message != "tool execution failed" {
 			t.Fatalf("failed event error = %+v", e.Error)
 		}
 		return
@@ -768,7 +768,7 @@ func TestApplyToolOutcomesSetsLastActionFromLastCallInOrder(t *testing.T) {
 		}
 	}
 	failureOutcome := func(index int, name, callID string) toolOutcome {
-		return failedToolOutcome(plannedCall{
+		return failedToolOutcome(RunContext{}, plannedCall{
 			index: index,
 			call:  llm.ToolCall{ID: callID, Name: name, Arguments: json.RawMessage(`{}`)},
 		}, 5, "boom")

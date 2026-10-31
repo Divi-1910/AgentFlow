@@ -2,10 +2,60 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestChannelSinkAddsSourceIdentityAndToolArgsStayPrivate(t *testing.T) {
+	ch := make(chan StreamEvent, 1)
+	sink := NewChannelSinkWithSource(context.Background(), "child-run", EventSource{
+		OriginatorRunID: "root-run",
+		ParentRunID:     "parent-run",
+		TeamID:          "team-1",
+		AgentID:         "agent-2",
+		AgentName:       "Researcher",
+		Depth:           2,
+		InvocationKind:  InvocationSyncDelegate,
+		Attempt:         3,
+	}, ch)
+	sink.Emit(StreamEvent{
+		Type: EventToolStarted,
+		Tool: &ToolMeta{Name: "memory_write", Args: json.RawMessage(`{"secret":"value"}`)},
+	})
+	event := <-ch
+	if event.RunID != "child-run" || event.OriginatorRunID != "root-run" || event.ParentRunID != "parent-run" {
+		t.Fatalf("run lineage = %#v", event)
+	}
+	if event.AgentID != "agent-2" || event.AgentName != "Researcher" || event.TeamID != "team-1" || event.Depth != 2 || event.Attempt != 3 {
+		t.Fatalf("source identity = %#v", event)
+	}
+	body, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "secret") || strings.Contains(string(body), "value") || strings.Contains(string(body), `"args"`) {
+		t.Fatalf("product event leaked raw tool arguments: %s", body)
+	}
+}
+
+func TestToolEventMetaClassifiesProductCapabilities(t *testing.T) {
+	runCtx := RunContext{MCPServerIDs: map[string]string{"weather": "mcp-open-meteo"}}
+	mcp := toolEventMeta(runCtx, "call-1", "mcp__weather__forecast", nil, "", "", false)
+	if mcp.Kind != ToolKindMCP || mcp.Operation != "forecast" || mcp.MCPAlias != "weather" || mcp.MCPServerID != "mcp-open-meteo" {
+		t.Fatalf("MCP metadata = %#v", mcp)
+	}
+	memory := toolEventMeta(runCtx, "call-2", "memory_write", nil, "", "", false)
+	if memory.Kind != ToolKindMemory || memory.Operation != "write" {
+		t.Fatalf("memory metadata = %#v", memory)
+	}
+	delegate := toolEventMeta(runCtx, "call-3", "ask_researcher", nil, "", "agent-researcher", true)
+	if delegate.Kind != ToolKindDelegate || delegate.TargetAgentID != "agent-researcher" {
+		t.Fatalf("delegate metadata = %#v", delegate)
+	}
+}
 
 func TestChannelSinkConcurrentEmitsPreserveReceiveSeqOrder(t *testing.T) {
 	t.Parallel()

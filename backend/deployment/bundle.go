@@ -445,7 +445,8 @@ func (a BundleAgent) Agent() *agent.Agent {
 		connections[i] = agent.MCPServerConnection{ServerID: s.ServerID, Alias: s.Alias, URL: s.URL}
 	}
 	return &agent.Agent{
-		ID: a.ID, Name: a.Name, Description: a.Description, Provider: a.Provider, Model: a.Model,
+		ID: a.ID, Kind: agent.ResourceKindStandaloneAgent,
+		Name: a.Name, Description: a.Description, Provider: a.Provider, Model: a.Model,
 		SystemPrompt: a.SystemPrompt, Tools: append([]string(nil), a.Tools...), Delegates: delegates,
 		MCPServers: selections, MCPConnections: connections,
 		ModelContextLimit: a.ModelContextLimit, ContextWindow: a.ContextWindow, ContextKeepRatio: a.ContextKeepRatio,

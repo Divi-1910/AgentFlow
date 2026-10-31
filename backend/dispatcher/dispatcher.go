@@ -17,6 +17,7 @@ type Dispatcher interface {
 type DispatchRequest struct {
 	RunID                 string
 	AgentID               string
+	TeamID                string
 	UserID                string
 	ThreadID              string
 	Input                 string
@@ -27,6 +28,10 @@ type DispatchRequest struct {
 	InvocationKind        string
 	JobID                 string
 	PersistResultMessages bool
+	// PublishTaskEvents routes this source into the originator-scoped live
+	// aggregate. Handler-owned root attempts leave it false because their
+	// events are already published through the root ExecutionRegistry.
+	PublishTaskEvents bool
 
 	// Delegation tree. For top-level runs these are left zero and defaulted
 	// in the preparer (OriginatorRunID=RunID, Chain=[agentID], Depth=0). For
@@ -39,6 +44,7 @@ type DispatchRequest struct {
 
 type EstimateRequest struct {
 	AgentID  string
+	TeamID   string
 	UserID   string
 	ThreadID string
 	Summary  string
@@ -49,6 +55,7 @@ type DispatchPayload struct {
 	OriginatorRunID       string   `json:"originator_run_id"`
 	ParentRunID           string   `json:"parent_run_id,omitempty"`
 	AgentID               string   `json:"agent_id"`
+	TeamID                string   `json:"team_id,omitempty"`
 	UserID                string   `json:"user_id"`
 	ThreadID              string   `json:"thread_id"`
 	Input                 string   `json:"input"`
@@ -60,6 +67,7 @@ type DispatchPayload struct {
 	InvocationKind        string   `json:"invocation_kind,omitempty"`
 	JobID                 string   `json:"job_id,omitempty"`
 	PersistResultMessages bool     `json:"persist_result_messages,omitempty"`
+	PublishTaskEvents     bool     `json:"publish_task_events,omitempty"`
 }
 
 type DispatchReply struct {
@@ -103,6 +111,10 @@ type ThreadStore interface {
 type RunStore interface {
 	CreateChildRun(ctx context.Context, runID, threadID, agentID, userID, originatorRunID, parentRunID string) error
 	UpdateStatus(ctx context.Context, runID, status, lastError string) error
+}
+
+type TeamRunStore interface {
+	CreateTeamChildRun(ctx context.Context, runID, threadID, agentID, userID, originatorRunID, parentRunID, teamID string) error
 }
 
 type MessageStore interface {
@@ -181,6 +193,10 @@ type CoordinatorRunStore interface {
 	GetRun(ctx context.Context, runID string) (*agent.RunInfo, error)
 }
 
+type TeamCoordinatorRunStore interface {
+	CreateTeamChildRunWithKind(ctx context.Context, runID, threadID, agentID, userID, originatorRunID, parentRunID, invocationKind, jobID, teamID string) error
+}
+
 // DurableCancelStore lets the pool worker and coordinator check/record task
 // cancellation beyond the in-process CancelRegistry — e.g. a cancel issued
 // while no worker for that agent is currently running.
@@ -203,6 +219,7 @@ func payloadFromRequest(req DispatchRequest) DispatchPayload {
 		OriginatorRunID:       originator,
 		ParentRunID:           req.ParentRunID,
 		AgentID:               req.AgentID,
+		TeamID:                req.TeamID,
 		UserID:                req.UserID,
 		ThreadID:              req.ThreadID,
 		Input:                 req.Input,
@@ -214,6 +231,7 @@ func payloadFromRequest(req DispatchRequest) DispatchPayload {
 		InvocationKind:        req.InvocationKind,
 		JobID:                 req.JobID,
 		PersistResultMessages: req.PersistResultMessages,
+		PublishTaskEvents:     req.PublishTaskEvents,
 	}
 }
 
@@ -230,6 +248,7 @@ func requestFromPayload(payload DispatchPayload) DispatchRequest {
 		OriginatorRunID:       payload.OriginatorRunID,
 		ParentRunID:           payload.ParentRunID,
 		AgentID:               payload.AgentID,
+		TeamID:                payload.TeamID,
 		UserID:                payload.UserID,
 		ThreadID:              payload.ThreadID,
 		Input:                 payload.Input,
@@ -241,6 +260,7 @@ func requestFromPayload(payload DispatchPayload) DispatchRequest {
 		InvocationKind:        payload.InvocationKind,
 		JobID:                 payload.JobID,
 		PersistResultMessages: payload.PersistResultMessages,
+		PublishTaskEvents:     payload.PublishTaskEvents,
 		Logger:                logger,
 	}
 }

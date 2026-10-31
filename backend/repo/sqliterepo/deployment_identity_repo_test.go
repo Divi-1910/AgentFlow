@@ -22,7 +22,7 @@ func openIdentityTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
-func TestMigrationV2ToV3PreservesState(t *testing.T) {
+func TestMigrationV2ToCurrentPreservesState(t *testing.T) {
 	db, err := backenddb.OpenSQLite(":memory:", backenddb.SQLiteOptions{JournalMode: "MEMORY"})
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +45,7 @@ func TestMigrationV2ToV3PreservesState(t *testing.T) {
 	if err := db.QueryRow(`SELECT title FROM threads WHERE id = 't'`).Scan(&title); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 || title != "kept" {
+	if version != schemaVersion || title != "kept" {
 		t.Fatalf("version/title = %d/%q", version, title)
 	}
 	if _, err := db.Exec(`SELECT singleton FROM deployment_identity`); err != nil {

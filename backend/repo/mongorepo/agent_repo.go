@@ -32,6 +32,7 @@ func (r *AgentRepo) Create(ctx context.Context, userID string, input *agent.Agen
 	doc := model.AgentDocument{
 		ID:                 bson.NewObjectID(),
 		UserID:             uid,
+		Kind:               string(agent.EffectiveResourceKind(input)),
 		Name:               input.Name,
 		Description:        input.Description,
 		Provider:           input.Provider,
@@ -39,6 +40,7 @@ func (r *AgentRepo) Create(ctx context.Context, userID string, input *agent.Agen
 		SystemPrompt:       input.SystemPrompt,
 		Tools:              input.Tools,
 		Delegates:          toDelegateConfigDocs(input.Delegates),
+		TeamGraph:          toTeamGraphDoc(input.TeamGraph),
 		MCPServers:         toMCPServerSelectionDocs(input.MCPServers),
 		ContextWindow:      input.ContextWindow,
 		ContextKeepRatio:   input.ContextKeepRatio,
@@ -108,7 +110,7 @@ func (r *AgentRepo) ListByUser(ctx context.Context, userID string) ([]*agent.Age
 		return nil, fmt.Errorf("invalid user_id: %w", err)
 	}
 
-	cursor, err := r.col.Find(ctx, bson.M{"user_id": uid})
+	cursor, err := r.col.Find(ctx, bson.M{"user_id": uid}, options.Find().SetSort(bson.D{{Key: "updated_at", Value: -1}, {Key: "_id", Value: -1}}))
 	if err != nil {
 		return nil, fmt.Errorf("agent_repo: find failed: %w", err)
 	}
@@ -152,6 +154,9 @@ func (r *AgentRepo) Update(ctx context.Context, agentID, userID string, input ag
 	if input.Delegates != nil {
 		set["delegates"] = toDelegateConfigDocs(*input.Delegates)
 	}
+	if input.TeamGraph != nil {
+		set["team_graph"] = toTeamGraphDoc(input.TeamGraph)
+	}
 	if input.MCPServers != nil {
 		set["mcp_servers"] = toMCPServerSelectionDocs(*input.MCPServers)
 	}
@@ -172,6 +177,9 @@ func (r *AgentRepo) Update(ctx context.Context, agentID, userID string, input ag
 	}
 	if input.MaxRuns != nil {
 		set["max_runs"] = normalizeAgentMaxRuns(*input.MaxRuns)
+	}
+	if input.ContextWindow != nil {
+		set["context_window"] = *input.ContextWindow
 	}
 	if input.ContextKeepRatio != nil {
 		set["context_keep_ratio"] = *input.ContextKeepRatio
@@ -221,6 +229,7 @@ func (r *AgentRepo) Delete(ctx context.Context, agentID, userID string) error {
 func (r *AgentRepo) toRuntimeAgent(ctx context.Context, doc model.AgentDocument) *agent.Agent {
 	return &agent.Agent{
 		ID:                 doc.ID.Hex(),
+		Kind:               effectiveDocumentKind(doc),
 		Name:               doc.Name,
 		Description:        doc.Description,
 		Provider:           doc.Provider,
@@ -228,6 +237,7 @@ func (r *AgentRepo) toRuntimeAgent(ctx context.Context, doc model.AgentDocument)
 		SystemPrompt:       doc.SystemPrompt,
 		Tools:              doc.Tools,
 		Delegates:          toDelegateConfigs(doc.Delegates),
+		TeamGraph:          toTeamGraph(doc.TeamGraph),
 		MCPServers:         toMCPServerSelections(doc.MCPServers),
 		ModelContextLimit:  r.resolveContextLimit(ctx, doc.Provider, doc.Model),
 		ContextWindow:      doc.ContextWindow,
@@ -238,7 +248,18 @@ func (r *AgentRepo) toRuntimeAgent(ctx context.Context, doc model.AgentDocument)
 		MaxTokens:          doc.MaxTokens,
 		MaxRuns:            normalizeAgentMaxRuns(doc.MaxRuns),
 		CreatedAt:          doc.CreatedAt,
+		UpdatedAt:          doc.UpdatedAt,
 	}
+}
+
+func effectiveDocumentKind(doc model.AgentDocument) agent.ResourceKind {
+	if doc.Kind != "" {
+		return agent.ResourceKind(doc.Kind)
+	}
+	if len(doc.Delegates) > 0 {
+		return agent.ResourceKindAgentTeam
+	}
+	return agent.ResourceKindStandaloneAgent
 }
 
 func normalizeAgentMaxRuns(maxRuns int) int {
@@ -300,6 +321,58 @@ func toMCPServerSelections(in []model.MCPServerSelectionDoc) []agent.MCPServerSe
 		out[i] = agent.MCPServerSelection{ServerID: m.ServerID}
 	}
 	return out
+}
+
+func toTeamGraphDoc(in *agent.TeamGraph) *model.TeamGraphDoc {
+	if in == nil {
+		return nil
+	}
+	nodes := make([]model.TeamNodeDoc, len(in.Nodes))
+	for i, node := range in.Nodes {
+		nodes[i] = model.TeamNodeDoc{
+			AgentID:  node.AgentID,
+			Position: model.TeamPositionDoc{X: node.Position.X, Y: node.Position.Y},
+		}
+	}
+	edges := make([]model.TeamEdgeDoc, len(in.Edges))
+	for i, edge := range in.Edges {
+		edges[i] = model.TeamEdgeDoc{
+			SourceAgentID: edge.SourceAgentID,
+			TargetAgentID: edge.TargetAgentID,
+			SourcePort:    edge.SourcePort,
+			TargetPort:    edge.TargetPort,
+			ToolName:      edge.ToolName,
+			Description:   edge.Description,
+			Instructions:  edge.Instructions,
+		}
+	}
+	return &model.TeamGraphDoc{EntryAgentID: in.EntryAgentID, Nodes: nodes, Edges: edges}
+}
+
+func toTeamGraph(in *model.TeamGraphDoc) *agent.TeamGraph {
+	if in == nil {
+		return nil
+	}
+	nodes := make([]agent.TeamNode, len(in.Nodes))
+	for i, node := range in.Nodes {
+		nodes[i] = agent.TeamNode{
+			AgentID:  node.AgentID,
+			Position: agent.TeamPosition{X: node.Position.X, Y: node.Position.Y},
+		}
+	}
+	edges := make([]agent.TeamEdge, len(in.Edges))
+	for i, edge := range in.Edges {
+		edges[i] = agent.TeamEdge{
+			SourceAgentID: edge.SourceAgentID,
+			TargetAgentID: edge.TargetAgentID,
+			SourcePort:    edge.SourcePort,
+			TargetPort:    edge.TargetPort,
+			ToolName:      edge.ToolName,
+			Description:   edge.Description,
+			Instructions:  edge.Instructions,
+		}
+	}
+	return &agent.TeamGraph{EntryAgentID: in.EntryAgentID, Nodes: nodes, Edges: edges}
 }
 
 func (r *AgentRepo) resolveContextLimit(ctx context.Context, provider, modelID string) int {

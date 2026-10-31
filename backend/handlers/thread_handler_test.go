@@ -12,6 +12,7 @@ import (
 
 	"backend/agent"
 	"backend/handlers"
+	"backend/pagination"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
@@ -22,7 +23,15 @@ type fakeThreadStore struct {
 	createFn        func(context.Context, string, string, string) (*agent.ThreadRecord, error)
 	getByIDFn       func(context.Context, string, string) (*agent.ThreadRecord, error)
 	listByAgentFn   func(context.Context, string, string) ([]*agent.ThreadRecord, error)
+	updateTitleFn   func(context.Context, string, string, string) error
 	updateSummaryFn func(context.Context, string, string, string) error
+}
+
+func (f *fakeThreadStore) UpdateTitle(ctx context.Context, threadID, userID, title string) error {
+	if f.updateTitleFn != nil {
+		return f.updateTitleFn(ctx, threadID, userID, title)
+	}
+	return nil
 }
 
 func (f *fakeThreadStore) Create(ctx context.Context, userID, agentID, title string) (*agent.ThreadRecord, error) {
@@ -45,6 +54,23 @@ func (f *fakeThreadStore) ListByAgent(ctx context.Context, agentID, userID strin
 	}
 	return []*agent.ThreadRecord{}, nil
 }
+
+func (f *fakeThreadStore) ListByAgentPage(ctx context.Context, agentID, userID string, request pagination.Request) (pagination.Page[*agent.ThreadRecord], error) {
+	items, err := f.ListByAgent(ctx, agentID, userID)
+	if err != nil {
+		return pagination.Page[*agent.ThreadRecord]{}, err
+	}
+	if len(items) > request.Limit {
+		items = items[:request.Limit]
+	}
+	return pagination.Page[*agent.ThreadRecord]{Items: items}, nil
+}
+
+func (f *fakeThreadStore) ListByUserPage(_ context.Context, _ string, _ []string, _ pagination.Request) (pagination.Page[*agent.ThreadRecord], error) {
+	return pagination.Page[*agent.ThreadRecord]{Items: []*agent.ThreadRecord{}}, nil
+}
+
+func (f *fakeThreadStore) Touch(context.Context, string, string) error { return nil }
 
 func (f *fakeThreadStore) UpdateSummary(ctx context.Context, threadID, userID, summary string) error {
 	if f.updateSummaryFn != nil {
@@ -202,10 +228,12 @@ func TestThreadHandlerListByAgentReturnsThreads(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("got %d, want 200", w.Code)
 	}
-	var resp []map[string]any
+	var resp struct {
+		Items []map[string]any `json:"items"`
+	}
 	decodeJSON(t, w.Body.Bytes(), &resp)
-	if len(resp) != 2 {
-		t.Errorf("got %d threads, want 2", len(resp))
+	if len(resp.Items) != 2 {
+		t.Errorf("got %d threads, want 2", len(resp.Items))
 	}
 }
 
@@ -220,9 +248,107 @@ func TestThreadHandlerListByAgentReturnsEmptyArray(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("got %d, want 200", w.Code)
 	}
-	var resp []map[string]any
+	var resp struct {
+		Items []map[string]any `json:"items"`
+	}
 	decodeJSON(t, w.Body.Bytes(), &resp)
-	if len(resp) != 0 {
-		t.Errorf("want empty array, got %d items", len(resp))
+	if len(resp.Items) != 0 {
+		t.Errorf("want empty items, got %d items", len(resp.Items))
+	}
+}
+
+func TestThreadHandlerAgentRouteRejectsTeamResource(t *testing.T) {
+	t.Parallel()
+	agentStore := &fakeAgentStore{getByIDFn: func(_ context.Context, id, _ string) (*agent.Agent, error) {
+		return &agent.Agent{ID: id, Kind: agent.ResourceKindAgentTeam}, nil
+	}}
+	h := newThreadHandler(agentStore, &fakeThreadStore{})
+	r := httptest.NewRequest(http.MethodPost, "/api/agents/"+testAgentID+"/threads", bytes.NewBufferString(`{"title":"wrong route"}`))
+	r.SetPathValue("id", testAgentID)
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.Create(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404", w.Code)
+	}
+}
+
+func TestThreadHandlerTeamRouteRejectsStandaloneResource(t *testing.T) {
+	t.Parallel()
+	h := newThreadHandler(&fakeAgentStore{}, &fakeThreadStore{})
+	r := httptest.NewRequest(http.MethodPost, "/api/agent-teams/"+testAgentID+"/threads", bytes.NewBufferString(`{"title":"wrong route"}`))
+	r.SetPathValue("id", testAgentID)
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.CreateForTeam(w, r)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("got %d, want 404", w.Code)
+	}
+}
+
+func TestThreadHandlerTeamRouteCreatesTeamThread(t *testing.T) {
+	t.Parallel()
+	agentStore := &fakeAgentStore{getByIDFn: func(_ context.Context, id, _ string) (*agent.Agent, error) {
+		return &agent.Agent{ID: id, Kind: agent.ResourceKindAgentTeam}, nil
+	}}
+	h := newThreadHandler(agentStore, &fakeThreadStore{})
+	r := httptest.NewRequest(http.MethodPost, "/api/agent-teams/"+testAgentID+"/threads", bytes.NewBufferString(`{"title":"team chat"}`))
+	r.SetPathValue("id", testAgentID)
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.CreateForTeam(w, r)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("got %d, want 201 — body: %s", w.Code, w.Body)
+	}
+	var response handlers.ThreadResponse
+	decodeJSON(t, w.Body.Bytes(), &response)
+	if response.ResourceKind != agent.ResourceKindAgentTeam {
+		t.Fatalf("resource_kind = %q, want %q", response.ResourceKind, agent.ResourceKindAgentTeam)
+	}
+}
+
+func TestThreadHandlerGetReturnsOwnedThread(t *testing.T) {
+	t.Parallel()
+	thread := fakeThread("owned")
+	thread.AgentID = testAgentID
+	store := &fakeThreadStore{getByIDFn: func(_ context.Context, _, _ string) (*agent.ThreadRecord, error) {
+		return thread, nil
+	}}
+	h := newThreadHandler(&fakeAgentStore{}, store)
+	r := httptest.NewRequest(http.MethodGet, "/api/threads/"+thread.ID, nil)
+	r.SetPathValue("id", thread.ID)
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.Get(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 — body: %s", w.Code, w.Body)
+	}
+}
+
+func TestThreadHandlerUpdateTrimsAndPersistsTitle(t *testing.T) {
+	t.Parallel()
+	thread := fakeThread("old")
+	thread.AgentID = testAgentID
+	store := &fakeThreadStore{}
+	store.getByIDFn = func(_ context.Context, _, _ string) (*agent.ThreadRecord, error) {
+		copy := *thread
+		return &copy, nil
+	}
+	store.updateTitleFn = func(_ context.Context, _, _ string, title string) error {
+		thread.Title = title
+		thread.UpdatedAt = time.Now()
+		return nil
+	}
+	h := newThreadHandler(&fakeAgentStore{}, store)
+	r := httptest.NewRequest(http.MethodPatch, "/api/threads/"+thread.ID, bytes.NewBufferString(`{"title":"  renamed  "}`))
+	r.SetPathValue("id", thread.ID)
+	r = withUser(r)
+	w := httptest.NewRecorder()
+	h.Update(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got %d, want 200 — body: %s", w.Code, w.Body)
+	}
+	if thread.Title != "renamed" {
+		t.Fatalf("persisted title = %q, want renamed", thread.Title)
 	}
 }

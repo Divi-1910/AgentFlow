@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -82,6 +83,38 @@ type openaiErrorResponse struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 	} `json:"error"`
+}
+
+type openaiStreamResponse struct {
+	ID      string `json:"id"`
+	Model   string `json:"model"`
+	Choices []struct {
+		Delta struct {
+			Content   string `json:"content"`
+			Refusal   string `json:"refusal"`
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage *openaiUsage `json:"usage"`
+	Error *struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	} `json:"error"`
+}
+
+type openaiToolAccumulator struct {
+	id        string
+	name      strings.Builder
+	arguments strings.Builder
 }
 
 func (ad *OpenAIAdapter) ChatCompletion(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
@@ -167,6 +200,198 @@ func (ad *OpenAIAdapter) ChatCompletion(ctx context.Context, req *ChatRequest) (
 
 	log.Printf("[openai] ✗ exhausted all %d retries total_elapsed=%v", ad.maxRetries, time.Since(start))
 	return nil, fmt.Errorf("request failed after %d retries: %w", ad.maxRetries, lastErr)
+}
+
+// ChatCompletionStream consumes an OpenAI-compatible SSE response while
+// preserving ChatCompletion's complete response contract. Only assistant text
+// reaches onTextDelta; tool arguments remain private until fully assembled.
+func (ad *OpenAIAdapter) ChatCompletionStream(ctx context.Context, req *ChatRequest, onTextDelta TextDeltaHandler) (*ChatResponse, error) {
+	endpoint := ad.baseURL + "/chat/completions"
+	payload := ad.buildPayload(req)
+	payload["stream"] = true
+	payload["stream_options"] = openAIStreamOptions(payload["stream_options"])
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal openai streaming request: %w", err)
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= ad.maxRetries; attempt++ {
+		if err := waitForRetry(ctx, attempt); err != nil {
+			return nil, err
+		}
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create openai streaming request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("Authorization", "Bearer "+ad.apiKey)
+
+		httpResp, err := ad.client.Do(httpReq)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			lastErr = fmt.Errorf("openai streaming request failed: %w", err)
+			continue
+		}
+
+		if httpResp.StatusCode != http.StatusOK {
+			respBody, readErr := io.ReadAll(io.LimitReader(httpResp.Body, 64<<10))
+			httpResp.Body.Close()
+			if readErr != nil {
+				lastErr = fmt.Errorf("failed to read openai error response: %w", readErr)
+			} else {
+				lastErr = ad.handleErrorStatus(httpResp.StatusCode, respBody)
+			}
+			if httpResp.StatusCode == http.StatusTooManyRequests || httpResp.StatusCode >= 500 {
+				continue
+			}
+			return nil, lastErr
+		}
+
+		response, visible, retryable, streamErr := consumeOpenAIStream(ctx, httpResp.Body, onTextDelta)
+		httpResp.Body.Close()
+		if streamErr == nil {
+			return response, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if visible {
+			return nil, fmt.Errorf("%w: %v", ErrStreamInterrupted, streamErr)
+		}
+		lastErr = streamErr
+		if !retryable {
+			return nil, streamErr
+		}
+	}
+
+	return nil, fmt.Errorf("openai streaming request failed after %d retries: %w", ad.maxRetries, lastErr)
+}
+
+func openAIStreamOptions(existing any) map[string]any {
+	options := map[string]any{"include_usage": true}
+	if configured, ok := existing.(map[string]any); ok {
+		options = make(map[string]any, len(configured)+1)
+		for key, value := range configured {
+			options[key] = value
+		}
+		options["include_usage"] = true
+	}
+	return options
+}
+
+func consumeOpenAIStream(ctx context.Context, body io.Reader, onTextDelta TextDeltaHandler) (*ChatResponse, bool, bool, error) {
+	response := &ChatResponse{}
+	tools := make(map[int]*openaiToolAccumulator)
+	visible := false
+	done := false
+	var protocolErr error
+	var providerErr error
+	var callbackErr error
+
+	emitText := func(delta string) error {
+		if delta == "" {
+			return nil
+		}
+		visible = true
+		response.Content += delta
+		if onTextDelta == nil {
+			return nil
+		}
+		if err := onTextDelta(delta); err != nil {
+			callbackErr = err
+			return err
+		}
+		return nil
+	}
+
+	err := readSSE(ctx, body, func(event sseEvent) error {
+		if event.Data == "[DONE]" {
+			done = true
+			return nil
+		}
+
+		var chunk openaiStreamResponse
+		if err := json.Unmarshal([]byte(event.Data), &chunk); err != nil {
+			protocolErr = fmt.Errorf("parse openai stream event: %w", err)
+			return protocolErr
+		}
+		if chunk.Error != nil {
+			providerErr = fmt.Errorf("openai stream error (%s): %s", chunk.Error.Type, chunk.Error.Message)
+			return providerErr
+		}
+		if chunk.Model != "" {
+			response.Model = chunk.Model
+		}
+		if chunk.Usage != nil {
+			response.Usage = TokenUsage{
+				PromptTokens:     chunk.Usage.PromptTokens,
+				CompletionTokens: chunk.Usage.CompletionTokens,
+				TotalTokens:      chunk.Usage.TotalTokens,
+			}
+		}
+
+		for _, choice := range chunk.Choices {
+			if err := emitText(choice.Delta.Content); err != nil {
+				return err
+			}
+			if err := emitText(choice.Delta.Refusal); err != nil {
+				return err
+			}
+			for _, fragment := range choice.Delta.ToolCalls {
+				accumulator := tools[fragment.Index]
+				if accumulator == nil {
+					accumulator = &openaiToolAccumulator{}
+					tools[fragment.Index] = accumulator
+				}
+				if fragment.ID != "" {
+					accumulator.id = fragment.ID
+				}
+				accumulator.name.WriteString(fragment.Function.Name)
+				accumulator.arguments.WriteString(fragment.Function.Arguments)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		switch {
+		case callbackErr != nil:
+			return nil, visible, false, callbackErr
+		case protocolErr != nil:
+			return nil, visible, false, protocolErr
+		case providerErr != nil:
+			return nil, visible, true, providerErr
+		default:
+			return nil, visible, true, err
+		}
+	}
+	if !done {
+		return nil, visible, true, io.ErrUnexpectedEOF
+	}
+
+	indices := make([]int, 0, len(tools))
+	for index := range tools {
+		indices = append(indices, index)
+	}
+	sort.Ints(indices)
+	for _, index := range indices {
+		tool := tools[index]
+		arguments := tool.arguments.String()
+		if arguments == "" {
+			arguments = "{}"
+		}
+		response.ToolCalls = append(response.ToolCalls, ToolCall{
+			ID:        tool.id,
+			Name:      tool.name.String(),
+			Arguments: json.RawMessage(arguments),
+		})
+	}
+	return response, visible, false, nil
 }
 
 func (a *OpenAIAdapter) parseResponse(body []byte) (*ChatResponse, error) {

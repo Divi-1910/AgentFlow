@@ -53,6 +53,7 @@ type MessageRecord struct {
 // so CallbackError is a distinct field from Error: a callback failure must
 // never overwrite the job's own outcome.
 type JobRecord struct {
+	TeamID          string
 	JobID           string
 	ParentRunID     string
 	OriginatorRunID string

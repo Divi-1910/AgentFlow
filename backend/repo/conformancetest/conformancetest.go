@@ -106,7 +106,7 @@ func RunCheckpointConformance(t *testing.T, newStore func(t *testing.T) RunStore
 		if err := s.CreateRun(ctx, "run-status", "t", "a", "u"); err != nil {
 			t.Fatalf("CreateRun: %v", err)
 		}
-		if err := s.UpdateStatus(ctx, "run-status", "failed", "first error"); err != nil {
+		if err := s.UpdateStatus(ctx, "run-status", "running", "first error"); err != nil {
 			t.Fatalf("UpdateStatus(error): %v", err)
 		}
 		if err := s.UpdateStatus(ctx, "run-status", "resumable", ""); err != nil {
@@ -118,6 +118,26 @@ func RunCheckpointConformance(t *testing.T, newStore func(t *testing.T) RunStore
 		}
 		if info.Status != "resumable" || info.LastError != "first error" {
 			t.Fatalf("status/error = %q/%q, want resumable/first error", info.Status, info.LastError)
+		}
+	})
+
+	t.Run("terminal_status_cannot_be_overwritten_by_late_update", func(t *testing.T) {
+		s := newStore(t)
+		if err := s.CreateRun(ctx, "run-terminal", "t", "a", "u"); err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		if err := s.UpdateStatus(ctx, "run-terminal", "failed", "terminal error"); err != nil {
+			t.Fatalf("UpdateStatus(failed): %v", err)
+		}
+		if err := s.UpdateStatus(ctx, "run-terminal", "completed", "late result"); err != nil {
+			t.Fatalf("UpdateStatus(late): %v", err)
+		}
+		info, err := s.GetRun(ctx, "run-terminal")
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if info.Status != "failed" || info.LastError != "terminal error" {
+			t.Fatalf("status/error = %q/%q, want failed/terminal error", info.Status, info.LastError)
 		}
 	})
 

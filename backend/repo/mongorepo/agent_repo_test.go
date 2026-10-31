@@ -48,6 +48,9 @@ func TestAgentRepoCreateAndGetByID(t *testing.T) {
 	if created.Name != "my-agent" {
 		t.Errorf("Name: got %q, want %q", created.Name, "my-agent")
 	}
+	if created.Kind != agent.ResourceKindStandaloneAgent {
+		t.Errorf("Kind: got %q, want %q", created.Kind, agent.ResourceKindStandaloneAgent)
+	}
 
 	got, err := r.GetByID(ctx, created.ID, userA)
 	if err != nil {
@@ -55,6 +58,33 @@ func TestAgentRepoCreateAndGetByID(t *testing.T) {
 	}
 	if got.ID != created.ID {
 		t.Errorf("ID mismatch: got %q, want %q", got.ID, created.ID)
+	}
+}
+
+func TestAgentRepoRoundTripsExplicitAgentTeamKind(t *testing.T) {
+	r := agentRepo(t)
+	ctx := context.Background()
+	input := testAgent("team")
+	input.Kind = agent.ResourceKindAgentTeam
+	input.TeamGraph = &agent.TeamGraph{
+		EntryAgentID: "507f1f77bcf86cd799439088",
+		Nodes: []agent.TeamNode{
+			{AgentID: "507f1f77bcf86cd799439088", Position: agent.TeamPosition{X: 10, Y: 20}},
+			{AgentID: "507f191e810c19729de860ea", Position: agent.TeamPosition{X: 30, Y: 40}},
+		},
+		Edges: []agent.TeamEdge{{
+			SourceAgentID: "507f1f77bcf86cd799439088", TargetAgentID: "507f191e810c19729de860ea",
+			SourcePort: "bottom", TargetPort: "top", ToolName: "delegate", Description: "delegate",
+		}},
+	}
+	created, err := r.Create(ctx, userA, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Kind != agent.ResourceKindAgentTeam || created.TeamGraph == nil || created.TeamGraph.EntryAgentID != input.TeamGraph.EntryAgentID ||
+		len(created.TeamGraph.Nodes) != 2 || len(created.TeamGraph.Edges) != 1 ||
+		created.TeamGraph.Edges[0].SourcePort != "bottom" || created.TeamGraph.Edges[0].TargetPort != "top" {
+		t.Fatalf("created = %+v", created)
 	}
 }
 

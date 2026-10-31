@@ -17,6 +17,7 @@ type JobDocument struct {
 	ID bson.ObjectID `bson:"_id,omitempty" json:"id"`
 
 	JobID           string `bson:"job_id"             json:"job_id"`
+	TeamID          string `bson:"team_id,omitempty"  json:"team_id,omitempty"`
 	ParentRunID     string `bson:"parent_run_id"      json:"parent_run_id"`
 	OriginatorRunID string `bson:"originator_run_id"  json:"originator_run_id"`
 	ParentThreadID  string `bson:"parent_thread_id"   json:"parent_thread_id"`

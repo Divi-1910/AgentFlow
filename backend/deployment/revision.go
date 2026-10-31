@@ -38,6 +38,16 @@ type Revision struct {
 	CreatedAt      time.Time
 }
 
+type RevisionPageRequest struct {
+	Limit          int
+	BeforeRevision int
+}
+
+type RevisionPage struct {
+	Items        []Revision
+	NextRevision int
+}
+
 // ValidateRevisionIdempotencyKey accepts a small opaque ASCII token suitable
 // for storage and exact comparison. It deliberately rejects whitespace and
 // control bytes so values cannot become ambiguous in HTTP headers or logs.

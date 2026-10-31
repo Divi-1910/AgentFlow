@@ -15,6 +15,22 @@ const (
 	msgUserID   = "507f1f77bcf86cd799439013"
 )
 
+func TestMessageRepoInsertUserPromptIsIdempotent(t *testing.T) {
+	r := mongorepo.NewMessageRepo(col(t, "messages"))
+	ctx := context.Background()
+	if err := r.EnsureIndexes(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first, created, err := r.InsertUserPrompt(ctx, msgThreadID, msgAgentID, msgUserID, "run-1", "hello")
+	if err != nil || !created {
+		t.Fatalf("first prompt: created=%v err=%v", created, err)
+	}
+	second, created, err := r.InsertUserPrompt(ctx, msgThreadID, msgAgentID, msgUserID, "run-1", "hello")
+	if err != nil || created || second.ID != first.ID {
+		t.Fatalf("second prompt: %#v created=%v err=%v", second, created, err)
+	}
+}
+
 func TestMessageRepoInsertManyAndListInOrder(t *testing.T) {
 	r := mongorepo.NewMessageRepo(col(t, "messages"))
 	ctx := context.Background()

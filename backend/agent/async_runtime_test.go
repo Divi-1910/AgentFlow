@@ -142,6 +142,7 @@ func newAsyncRuntime(lm llm.LLMClient, store AsyncJobStore, checkpointStore Chec
 func asyncRunCtx() RunContext {
 	return RunContext{
 		RunID:           "run-test",
+		TeamID:          "team-test",
 		ThreadID:        "thread-test",
 		Input:           "research this",
 		OriginatorRunID: "run-test",
@@ -182,12 +183,18 @@ func TestAsyncRequiredDispatchAutoAwaitSuspendsRun(t *testing.T) {
 	if len(store.markAwaiting) != 1 || store.markAwaiting[0].JobID != "job-1" {
 		t.Fatalf("MarkAwaiting = %+v, want one await for job-1", store.markAwaiting)
 	}
+	if len(store.dispatched) != 1 || store.dispatched[0].TeamID != "team-test" {
+		t.Fatalf("dispatch team context = %+v", store.dispatched)
+	}
 	if got := store.markAwaiting[0].AwaitToolCallID; got != "auto-await:run-test:job-1" {
 		t.Fatalf("auto await call id = %q", got)
 	}
 	last := checkpoints.saves[len(checkpoints.saves)-1]
 	if last.Meta.Phase != PhaseWaitingJobs {
 		t.Fatalf("last checkpoint phase = %q, want %q", last.Meta.Phase, PhaseWaitingJobs)
+	}
+	if last.Meta.TeamID != "team-test" {
+		t.Fatalf("checkpoint team id = %q", last.Meta.TeamID)
 	}
 	for _, msg := range result.NewMessages {
 		if msg.Role == "assistant" && msg.Content == "premature final answer" {

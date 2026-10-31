@@ -8,15 +8,30 @@ import (
 )
 
 var (
-	ErrRateLimited   = errors.New("Rate Limit Exceeded")
-	ErrInvalidAPIKey = errors.New("Invalid API Key")
-	ErrBadRequest    = errors.New("Bad Request")
-	ErrLLMTimeOut    = errors.New("LLM Time Out")
-	ErrInternal      = errors.New("Internal Server Error")
+	ErrRateLimited       = errors.New("Rate Limit Exceeded")
+	ErrInvalidAPIKey     = errors.New("Invalid API Key")
+	ErrBadRequest        = errors.New("Bad Request")
+	ErrLLMTimeOut        = errors.New("LLM Time Out")
+	ErrInternal          = errors.New("Internal Server Error")
+	ErrStreamInterrupted = errors.New("LLM stream interrupted after visible output")
 )
 
 type LLMClient interface {
 	ChatCompletion(ctx context.Context, req *ChatRequest) (*ChatResponse, error)
+}
+
+// TextDeltaHandler receives only assistant text that is safe to display to a
+// user. Provider reasoning/thinking fields and partial tool arguments must
+// never be passed to this callback.
+type TextDeltaHandler func(delta string) error
+
+// StreamingLLMClient is an optional capability implemented by providers that
+// can expose incremental assistant text. The returned ChatResponse is still the
+// authoritative, complete response used for tool execution, checkpoints, and
+// persistence. Deltas are an ephemeral progress projection only.
+type StreamingLLMClient interface {
+	LLMClient
+	ChatCompletionStream(ctx context.Context, req *ChatRequest, onTextDelta TextDeltaHandler) (*ChatResponse, error)
 }
 
 type ChatRequest struct {

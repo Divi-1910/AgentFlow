@@ -17,80 +17,44 @@ type runOutcome struct {
 }
 
 type streamResult struct {
-	out                runOutcome
-	terminalEvent      *agent.StreamEvent
-	clientDisconnected bool
+	out           runOutcome
+	terminalEvent *agent.StreamEvent
 }
 
-func streamLoop(
-	ctx context.Context,
-	cancel context.CancelFunc,
-	w http.ResponseWriter,
-	flusher http.Flusher,
+// collectRunExecution drains the engine event channel independently of every
+// HTTP observer. Non-terminal events are published immediately; the terminal
+// event is held back so callers can publish persistence status before closing
+// the public stream.
+func collectRunExecution(
 	events <-chan agent.StreamEvent,
 	done <-chan runOutcome,
+	publish func(agent.StreamEvent),
 	logger *slog.Logger,
 ) streamResult {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-
+	eventCh := events
+	doneCh := done
 	var terminalEvent *agent.StreamEvent
-	clientDisconnected := false
+	var out runOutcome
 
-loop:
-	for {
+	for eventCh != nil || doneCh != nil {
 		select {
-		case <-ctx.Done():
-			break loop
-		case <-ticker.C:
-			if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
-				clientDisconnected = true
-				cancel()
-				break loop
-			}
-			flusher.Flush()
-		case e, ok := <-events:
+		case event, ok := <-eventCh:
 			if !ok {
-				break loop
+				eventCh = nil
+				continue
 			}
-			if e.Type == agent.EventRunCompleted || e.Type == agent.EventRunFailed || e.Type == agent.EventRunCancelled {
+			if isTerminalEvent(event.Type) {
 				if terminalEvent == nil {
-					terminalEvent = &e
-				} else {
-					logger.Warn("duplicate terminal event", "type", e.Type)
+					copy := event
+					terminalEvent = &copy
+				} else if logger != nil {
+					logger.Warn("duplicate terminal event", "type", event.Type)
 				}
 				continue
 			}
-			data, err := json.Marshal(e)
-			if err != nil {
-				logger.Warn("failed to marshal stream event", "type", e.Type, "error", err)
-				continue
-			}
-			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
-				clientDisconnected = true
-				cancel()
-				break loop
-			}
-			flusher.Flush()
-		}
-	}
-
-	out := <-done
-
-draining:
-	for {
-		select {
-		case e, ok := <-events:
-			if !ok {
-				break draining
-			}
-			if e.Type == agent.EventRunCompleted || e.Type == agent.EventRunFailed || e.Type == agent.EventRunCancelled {
-				if terminalEvent == nil {
-					terminalEvent = &e
-				}
-			}
-		default:
-			break draining
+			publish(event)
+		case out = <-doneCh:
+			doneCh = nil
 		}
 	}
 
@@ -101,16 +65,73 @@ draining:
 			Error: &agent.ErrMeta{Code: "engine.runtime_error", Message: out.err.Error()},
 		}
 	}
+	return streamResult{out: out, terminalEvent: terminalEvent}
+}
 
-	return streamResult{
-		out:                out,
-		terminalEvent:      terminalEvent,
-		clientDisconnected: clientDisconnected,
+func writeSSEHeaders(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+}
+
+// serveSubscription streams one observer until it disconnects or the session
+// reaches a terminal event. Returning from here only detaches the observer.
+func serveSubscription(
+	ctx context.Context,
+	w http.ResponseWriter,
+	flusher http.Flusher,
+	subscription *ExecutionSubscription,
+) {
+	if subscription == nil {
+		return
+	}
+	defer subscription.Close()
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case event, ok := <-subscription.Events:
+			if !ok {
+				return
+			}
+			if err := emitEvent(w, flusher, event); err != nil {
+				return
+			}
+		}
 	}
 }
 
-func emitEvent(w http.ResponseWriter, flusher http.Flusher, e agent.StreamEvent) {
-	data, _ := json.Marshal(e)
-	_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+func emitEvent(w http.ResponseWriter, flusher http.Flusher, event agent.StreamEvent) error {
+	data, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("marshal SSE event: %w", err)
+	}
+	streamID := event.StreamID
+	if streamID == "" {
+		streamID = event.ID
+	}
+	if streamID != "" {
+		if _, err := fmt.Fprintf(w, "id: %s\n", streamID); err != nil {
+			return err
+		}
+	}
+	if event.Type != "" {
+		if _, err := fmt.Fprintf(w, "event: %s\n", event.Type); err != nil {
+			return err
+		}
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		return err
+	}
 	flusher.Flush()
+	return nil
 }

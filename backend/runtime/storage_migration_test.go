@@ -51,7 +51,9 @@ func TestLegacyStorageMigrationDryRunApplyVerifyAndReplay(t *testing.T) {
 		}
 	}
 	assertSQLiteCount(t, filepath.Join(request.DataDir, "shared", "shared.db"), "threads", 1)
-	assertSQLiteCount(t, filepath.Join(request.DataDir, "revisions", applied.QuarantineDirectory, "execution.db"), "runs", 1)
+	executionPath := filepath.Join(request.DataDir, "revisions", applied.QuarantineDirectory, "execution.db")
+	assertSQLiteCount(t, executionPath, "runs", 1)
+	assertMigratedRunAdmissionDefaults(t, executionPath, "run-1")
 
 	replayed, err := migrateLegacyStorage(ctx, request, true)
 	if err != nil {
@@ -97,6 +99,25 @@ func createLegacyStorageFixture(t *testing.T) storageMigrationRequest {
 	if _, err := db.Exec(`INSERT INTO memory_meta(lineage_key,user_id,agent_id,thread_id,memory_id,scope,type,importance,revision,body_path,created_at,updated_at) VALUES('lineage','runtime','agent','','memory','agent','note',1,1,'note.md',1,1)`); err != nil {
 		t.Fatal(err)
 	}
+	// The source of this migration is the last combined-store schema. Remove
+	// fields introduced by the current run-admission schema so this fixture
+	// catches accidental positional copies such as INSERT ... SELECT *.
+	for _, statement := range []string{
+		`DROP INDEX runs_submission_unique`,
+		`DROP INDEX runs_active_slot_unique`,
+		`DROP INDEX messages_dedupe_unique`,
+		`ALTER TABLE runs DROP COLUMN submission_key`,
+		`ALTER TABLE runs DROP COLUMN accepted_input`,
+		`ALTER TABLE runs DROP COLUMN prompt_persisted`,
+		`ALTER TABLE runs DROP COLUMN dispatch_started`,
+		`ALTER TABLE runs DROP COLUMN active_slot`,
+		`ALTER TABLE messages DROP COLUMN dedupe_key`,
+		`PRAGMA user_version = 3`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("prepare v3 legacy fixture with %q: %v", statement, err)
+		}
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -130,5 +151,34 @@ func assertSQLiteCount(t *testing.T, path, table string, want int64) {
 	}
 	if got != want {
 		t.Fatalf("%s count = %d, want %d", table, got, want)
+	}
+}
+
+func assertMigratedRunAdmissionDefaults(t *testing.T, path, runID string) {
+	t.Helper()
+	db, err := openLegacyStorageDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var (
+		submissionKey   string
+		acceptedInput   string
+		promptPersisted int
+		dispatchStarted int
+		activeSlot      *string
+	)
+	if err := db.QueryRow(`
+		SELECT submission_key, accepted_input, prompt_persisted, dispatch_started, active_slot
+		FROM runs WHERE run_id = ?`, runID).Scan(
+		&submissionKey, &acceptedInput, &promptPersisted, &dispatchStarted, &activeSlot,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if submissionKey != "" || acceptedInput != "" || promptPersisted != 0 || dispatchStarted != 0 || activeSlot != nil {
+		t.Fatalf(
+			"migrated run admission defaults = key %q input %q prompt %d dispatch %d slot %v",
+			submissionKey, acceptedInput, promptPersisted, dispatchStarted, activeSlot,
+		)
 	}
 }

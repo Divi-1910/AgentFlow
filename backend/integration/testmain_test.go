@@ -19,9 +19,11 @@ import (
 	"backend/handlers"
 	"backend/llm"
 	"backend/middleware"
+	"backend/model"
 	"backend/repo/mongorepo"
 	"backend/tools"
 
+	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
@@ -72,6 +74,12 @@ type runtimeFn interface {
 	EstimateSystemPromptTokens(ctx context.Context, req dispatcher.EstimateRequest) int
 }
 
+type integrationLLMClient struct{}
+
+func (integrationLLMClient) ChatCompletion(_ context.Context, req *llm.ChatRequest) (*llm.ChatResponse, error) {
+	return &llm.ChatResponse{Content: "test response", Model: req.Model}, nil
+}
+
 // newTestEnv creates a fresh HTTP test server backed by a stubRuntime.
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
@@ -92,29 +100,43 @@ func newTestEnvWithRuntime(t *testing.T, rt runtimeFn) *testEnv {
 
 	// Real repos ──────────────────────────────────────────────────────────────
 	userRepo := mongorepo.NewUserRepo(col("users"))
-	agentRepo := mongorepo.NewAgentRepo(col("agents"), col("models"))
-	threadRepo := mongorepo.NewThreadRepo(col("threads"))
-	messageRepo := mongorepo.NewMessageRepo(col("messages"))
 	llmModelCol := col("llm_models")
 	llmModelRepo := mongorepo.NewLLMModelRepo(llmModelCol)
+	if _, err := llmModelCol.InsertOne(context.Background(), model.LLMModel{
+		ModelID: "gpt-4o", Name: "GPT-4o", Provider: "openai",
+		APIModelID: "gpt-4o", ContextWindow: 128000,
+	}); err != nil {
+		t.Fatalf("seed default LLM model: %v", err)
+	}
+	agentRepo := mongorepo.NewAgentRepo(col("agents"), llmModelCol)
+	threadRepo := mongorepo.NewThreadRepo(col("threads"))
+	messageRepo := mongorepo.NewMessageRepo(col("messages"))
+	mcpServerRepo := mongorepo.NewMCPServerRepo(col("mcp_servers"))
 	runRepo := mongorepo.NewRunRepo(col("runs"), col("checkpoints"))
 	if err := runRepo.EnsureIndexes(context.Background()); err != nil {
 		t.Fatalf("EnsureIndexes: %v", err)
 	}
+	if err := messageRepo.EnsureIndexes(context.Background()); err != nil {
+		t.Fatalf("message EnsureIndexes: %v", err)
+	}
 
 	// Stubs ───────────────────────────────────────────────────────────────────
 	llmReg := llm.NewEmptyLLMRegistry()
+	llmReg.Register("openai", integrationLLMClient{})
 	toolReg := tools.NewEmptyRegistry()
+	toolCatalog := tools.NewCatalogRegistry()
 
 	// Handlers ────────────────────────────────────────────────────────────────
 	authHandler := handlers.NewAuthHandler(userRepo, nil) // nil → real auth.GenerateToken
-	agentHandler := handlers.NewAgentHandler(agentRepo, toolReg, nil)
+	agentHandler := handlers.NewAgentHandler(agentRepo, toolReg, toolCatalog, mcpServerRepo, llmModelRepo, llmReg)
+	agentTeamHandler := handlers.NewAgentTeamHandler(agentRepo, toolReg, toolCatalog, mcpServerRepo, llmModelRepo, llmReg)
+	toolHandler := handlers.NewToolHandler(toolCatalog, toolReg)
+	mcpServerHandler := handlers.NewMCPServerHandler(mcpServerRepo)
 	threadHandler := handlers.NewThreadHandler(threadRepo, agentRepo)
-	msgHandler := handlers.NewMessageHandler(
-		agentRepo, threadRepo, messageRepo, rt, runRepo,
-	)
+	executions := handlers.NewExecutionRegistry()
+	msgHandler := handlers.NewMessageHandler(agentRepo, threadRepo, messageRepo, rt, runRepo, executions)
 	llmHandler := handlers.NewLLMHandler(llmModelRepo, llmReg)
-	runHandler := handlers.NewRunHandler(agentRepo, messageRepo, runRepo, rt, toolReg, agent.ToolCapabilities{AsyncJobs: true})
+	runHandler := handlers.NewRunHandler(agentRepo, threadRepo, messageRepo, runRepo, rt, toolReg, agent.ToolCapabilities{AsyncJobs: true}, executions)
 
 	// Routing — mirrors main.go ────────────────────────────────────────────────
 	mux := http.NewServeMux()
@@ -123,22 +145,37 @@ func newTestEnvWithRuntime(t *testing.T, rt runtimeFn) *testEnv {
 	mux.HandleFunc("GET /api/auth/me", middleware.RequireAuth(authHandler.Me))
 
 	mux.HandleFunc("GET /api/llms", middleware.RequireAuth(llmHandler.GetLLMs))
+	mux.HandleFunc("GET /api/tools", middleware.RequireAuth(toolHandler.List))
+	mux.HandleFunc("GET /api/mcp-servers", middleware.RequireAuth(mcpServerHandler.List))
 	mux.HandleFunc("POST /api/llm/chat", middleware.RequireAuth(llmHandler.Chat))
 
 	mux.HandleFunc("POST /api/agents", middleware.RequireAuth(agentHandler.Create))
 	mux.HandleFunc("GET /api/agents", middleware.RequireAuth(agentHandler.List))
 	mux.HandleFunc("GET /api/agents/{id}", middleware.RequireAuth(agentHandler.Get))
-	mux.HandleFunc("PUT /api/agents/{id}", middleware.RequireAuth(agentHandler.Update))
+	mux.HandleFunc("PATCH /api/agents/{id}", middleware.RequireAuth(agentHandler.Update))
 	mux.HandleFunc("DELETE /api/agents/{id}", middleware.RequireAuth(agentHandler.Delete))
+	mux.HandleFunc("POST /api/agent-teams", middleware.RequireAuth(agentTeamHandler.Create))
+	mux.HandleFunc("GET /api/agent-teams", middleware.RequireAuth(agentTeamHandler.List))
+	mux.HandleFunc("GET /api/agent-teams/{id}", middleware.RequireAuth(agentTeamHandler.Get))
+	mux.HandleFunc("PATCH /api/agent-teams/{id}", middleware.RequireAuth(agentTeamHandler.Update))
+	mux.HandleFunc("DELETE /api/agent-teams/{id}", middleware.RequireAuth(agentTeamHandler.Delete))
 
 	mux.HandleFunc("POST /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.Create))
 	mux.HandleFunc("GET /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.ListByAgent))
+	mux.HandleFunc("POST /api/agent-teams/{id}/threads", middleware.RequireAuth(threadHandler.CreateForTeam))
+	mux.HandleFunc("GET /api/agent-teams/{id}/threads", middleware.RequireAuth(threadHandler.ListByTeam))
+	mux.HandleFunc("GET /api/threads", middleware.RequireAuth(threadHandler.List))
+	mux.HandleFunc("GET /api/threads/{id}", middleware.RequireAuth(threadHandler.Get))
+	mux.HandleFunc("PATCH /api/threads/{id}", middleware.RequireAuth(threadHandler.Update))
 
 	mux.HandleFunc("POST /api/threads/{id}/messages", middleware.RequireAuth(msgHandler.Send))
 	mux.HandleFunc("GET /api/threads/{id}/messages", middleware.RequireAuth(msgHandler.List))
+	mux.HandleFunc("GET /api/threads/{id}/runs", middleware.RequireAuth(runHandler.ListByThread))
 
+	mux.HandleFunc("GET /api/runs", middleware.RequireAuth(runHandler.List))
 	mux.HandleFunc("GET /api/runs/{id}", middleware.RequireAuth(runHandler.GetRun))
 	mux.HandleFunc("POST /api/runs/{id}/resume", middleware.RequireAuth(runHandler.ResumeRun))
+	mux.HandleFunc("POST /api/runs/{id}/cancel", middleware.RequireAuth(runHandler.CancelRun))
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -171,6 +208,9 @@ func (e *testEnv) do(t *testing.T, method, path string, body any, token string) 
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if method == http.MethodPost && strings.HasSuffix(path, "/messages") {
+		req.Header.Set("Idempotency-Key", uuid.NewString())
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

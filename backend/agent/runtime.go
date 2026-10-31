@@ -103,7 +103,16 @@ func (r *AgentRuntime) EstimateSystemPromptTokens(ctx context.Context, agent *Ag
 }
 
 func (r *AgentRuntime) RunStream(ctx context.Context, ag *Agent, runCtx RunContext, events chan<- StreamEvent) (*RunResult, error) {
-	sink := NewChannelSink(ctx, runCtx.RunID, events)
+	sink := NewChannelSinkWithSource(ctx, runCtx.RunID, EventSource{
+		OriginatorRunID: runCtx.OriginatorRunID,
+		ParentRunID:     runCtx.ParentRunID,
+		TeamID:          runCtx.TeamID,
+		AgentID:         ag.ID,
+		AgentName:       ag.Name,
+		Depth:           runCtx.DelegationDepth,
+		InvocationKind:  runCtx.InvocationKind,
+		Attempt:         runCtx.Attempt,
+	}, events)
 	return r.runInternal(ctx, ag, runCtx, sink)
 }
 
@@ -146,57 +155,74 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			state = stateFailed
 		}
 
-		duration := time.Since(runStart).Milliseconds()
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		if r.checkpointStore != nil {
+			runID := runCtx.RunID
+			target := model.RunStatusFailed
+			lastError := errMsg
+			switch state {
+			case stateSuccess:
+				target = model.RunStatusCompleted
+				lastError = ""
+			case stateCancelled:
+				if hasSnapshot {
+					target = model.RunStatusInterrupted
+					lastError = ""
+				} else {
+					lastError = "interrupted before first checkpoint"
+				}
+			case stateWaiting:
+				target = model.RunStatusWaitingJobs
+				lastError = ""
+			case stateFailed:
+				if IsResumable(err) && hasSnapshot {
+					target = model.RunStatusResumable
+				}
+			}
+			applied, transitionErr := r.checkpointStore.TransitionStatus(context.Background(), runID, string(model.RunStatusRunning), string(target))
+			if transitionErr != nil {
+				logger.Error("run terminal transition failed", "run_id", runID, "target", target, "error", transitionErr)
+			} else if applied {
+				if updateErr := r.checkpointStore.UpdateStatus(context.Background(), runID, string(target), lastError); updateErr != nil {
+					logger.Error("run terminal details update failed", "run_id", runID, "target", target, "error", updateErr)
+				}
+			} else if current, getErr := r.checkpointStore.GetRun(context.Background(), runID); getErr == nil {
+				if current.Status == string(model.RunStatusCancelling) {
+					finalized, finalizeErr := r.checkpointStore.TransitionStatus(
+						context.Background(), runID, string(model.RunStatusCancelling), string(model.RunStatusCancelled),
+					)
+					if finalizeErr != nil {
+						logger.Error("run cancellation finalization failed", "run_id", runID, "error", finalizeErr)
+					} else if finalized {
+						if updateErr := r.checkpointStore.UpdateStatus(
+							context.Background(), runID, string(model.RunStatusCancelled), "cancelled by user",
+						); updateErr != nil {
+							logger.Error("run cancellation details update failed", "run_id", runID, "error", updateErr)
+						}
+					}
+					state = stateCancelled
+				} else if current.Status == string(model.RunStatusCancelled) {
+					state = stateCancelled
+				}
+			}
+		}
 
+		duration := time.Since(runStart).Milliseconds()
 		switch state {
 		case stateSuccess:
-			sink.Emit(StreamEvent{
-				Type:       EventRunCompleted,
-				DurationMs: duration,
-				Content:    result.Output,
-				Usage:      &result.Usage,
-				Step:       result.Steps,
-			})
+			sink.Emit(StreamEvent{Type: EventRunCompleted, DurationMs: duration, Content: result.Output, Usage: &result.Usage, Step: result.Steps})
 		case stateCancelled:
 			sink.Emit(StreamEvent{Type: EventRunCancelled, DurationMs: duration})
 		case stateWaiting:
 			sink.Emit(StreamEvent{Type: EventRunWaiting, DurationMs: duration, Step: result.Steps})
 		case stateFailed:
-			errMsg := "unknown error"
-			if err != nil {
-				errMsg = err.Error()
+			if errMsg == "" {
+				errMsg = "unknown error"
 			}
-			sink.Emit(StreamEvent{
-				Type:       EventRunFailed,
-				DurationMs: duration,
-				Error:      &ErrMeta{Code: classifyError(err), Message: errMsg},
-			})
-		}
-
-		if r.checkpointStore != nil {
-			runID := runCtx.RunID
-			switch state {
-			case stateSuccess:
-				_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "completed", "")
-			case stateCancelled:
-				if hasSnapshot {
-					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, string(model.RunStatusInterrupted), "")
-				} else {
-					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, string(model.RunStatusFailed), "interrupted before first checkpoint")
-				}
-			case stateWaiting:
-				_ = r.checkpointStore.UpdateStatus(context.Background(), runID, string(model.RunStatusWaitingJobs), "")
-			case stateFailed:
-				errMsg := "unknown error"
-				if err != nil {
-					errMsg = err.Error()
-				}
-				if IsResumable(err) && hasSnapshot {
-					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "resumable", errMsg)
-				} else {
-					_ = r.checkpointStore.UpdateStatus(context.Background(), runID, "failed", errMsg)
-				}
-			}
+			sink.Emit(StreamEvent{Type: EventRunFailed, DurationMs: duration, Error: &ErrMeta{Code: classifyError(err), Message: errMsg}})
 		}
 
 		sink.Close()
@@ -222,9 +248,23 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 	// (ToolSet.Refs/Version), so a down or drifted server never blocks a resume.
 	// Discovery never fails the run: an unreachable server degrades to a note.
 	if r.mcpManager != nil && len(agent.MCPConnections) > 0 {
+		runCtx.MCPServerIDs = make(map[string]string, len(agent.MCPConnections))
+		for _, connection := range agent.MCPConnections {
+			runCtx.MCPServerIDs[connection.Alias] = connection.ServerID
+		}
 		mcpTools, unavailable := r.mcpManager.Discover(ctx, toMCPServerSpecs(agent.MCPConnections))
 		toolSet.AddMCPTools(mcpTools)
 		runCtx.MCPUnavailable = unavailable
+		if len(unavailable) > 0 {
+			servers := make([]MCPServerMeta, 0, len(unavailable))
+			for _, alias := range unavailable {
+				servers = append(servers, MCPServerMeta{ServerID: runCtx.MCPServerIDs[alias], Alias: alias})
+			}
+			sink.Emit(StreamEvent{
+				Type: EventMCPUnavailable,
+				MCP:  &MCPMeta{Unavailable: servers},
+			})
+		}
 	}
 	toolDefs := toolSet.Definitions()
 
@@ -421,13 +461,36 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			// preserve full evidence across resumes.
 			forLLM := r.contextBuilder.RenderForLLM(messages)
 
-			resp, err := client.ChatCompletion(ctx, &llm.ChatRequest{
+			request := &llm.ChatRequest{
 				Model:       agent.Model,
 				Messages:    forLLM,
 				Tools:       toolDefs,
 				Temperature: temperature,
 				MaxTokens:   maxTokens,
-			})
+			}
+
+			var resp *llm.ChatResponse
+			var err error
+			if streamingClient, ok := client.(llm.StreamingLLMClient); ok {
+				resp, err = streamingClient.ChatCompletionStream(ctx, request, func(delta string) error {
+					if delta == "" {
+						return nil
+					}
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					sink.Emit(StreamEvent{
+						Type:     EventModelDelta,
+						Step:     steps + 1,
+						Provider: agent.Provider,
+						Model:    agent.Model,
+						Delta:    delta,
+					})
+					return ctx.Err()
+				})
+			} else {
+				resp, err = client.ChatCompletion(ctx, request)
+			}
 
 			if err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
@@ -438,7 +501,18 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 			}
 
 			steps++
-			sink.Emit(StreamEvent{Type: EventModelCompleted, Step: steps})
+			completedModel := resp.Model
+			if completedModel == "" {
+				completedModel = agent.Model
+			}
+			usage := resp.Usage
+			sink.Emit(StreamEvent{
+				Type:     EventModelCompleted,
+				Step:     steps,
+				Provider: agent.Provider,
+				Model:    completedModel,
+				Usage:    &usage,
+			})
 
 			totalUsage.PromptTokens += resp.Usage.PromptTokens
 			totalUsage.CompletionTokens += resp.Usage.CompletionTokens
@@ -557,10 +631,10 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 					logger.Warn("mcp tool unavailable, degrading", "tool", m.call.Name)
 					sink.Emit(StreamEvent{
 						Type: EventToolCompleted,
-						Tool: &ToolMeta{ID: m.call.ID, Name: m.call.Name, Args: m.rawArgs},
+						Tool: toolEventMeta(runCtx, m.call.ID, m.call.Name, m.rawArgs, "MCP tool unavailable", "", false),
 						Step: steps,
 					})
-					mcpMissingOutcomes = append(mcpMissingOutcomes, softMissingMCPOutcome(m))
+					mcpMissingOutcomes = append(mcpMissingOutcomes, softMissingMCPOutcome(runCtx, m))
 					continue
 				}
 				hardMissing = append(hardMissing, m)
@@ -570,7 +644,7 @@ func (r *AgentRuntime) runInternal(ctx context.Context, agent *Agent, runCtx Run
 					logger.Error("tool not found, aborting", "tool", m.call.Name)
 					sink.Emit(StreamEvent{
 						Type:  EventToolFailed,
-						Tool:  &ToolMeta{ID: m.call.ID, Name: m.call.Name, Args: m.rawArgs},
+						Tool:  toolEventMeta(runCtx, m.call.ID, m.call.Name, m.rawArgs, "Tool unavailable", "", false),
 						Error: &ErrMeta{Code: "tool.not_found", Message: "tool not available"},
 						Step:  steps,
 					})
@@ -656,6 +730,8 @@ func classifyError(err error) string {
 		return "engine.runtime_error"
 	}
 	switch {
+	case errors.Is(err, llm.ErrStreamInterrupted):
+		return "provider.stream_interrupted"
 	case errors.Is(err, ErrMaxStepsReached):
 		return "engine.max_steps"
 	case errors.Is(err, ErrNoFinalOutput):
@@ -809,6 +885,11 @@ func (r *AgentRuntime) resumePendingAwaits(
 				"is_error":   isErr,
 				"latency_ms": latencyMs,
 				"job_id":     res.JobID,
+				"presentation": presentationMetadata(buildToolPresentation(
+					toolEventMeta(*runCtx, await.AwaitToolCallID, AsyncToolAwaitJob, args, "", "", false),
+					args,
+					content,
+				)),
 			},
 		}
 		*messages = append(*messages, msg)
@@ -822,7 +903,7 @@ func (r *AgentRuntime) resumePendingAwaits(
 		sink.Emit(StreamEvent{
 			Type:       EventToolCompleted,
 			Step:       step,
-			Tool:       &ToolMeta{ID: await.AwaitToolCallID, Name: AsyncToolAwaitJob, Args: args, Display: display},
+			Tool:       toolEventMetaWithResult(*runCtx, await.AwaitToolCallID, AsyncToolAwaitJob, args, display, "", false, content),
 			DurationMs: latencyMs,
 		})
 		logger.Info("await_job resolved", "job_id", res.JobID, "status", res.Status)
@@ -850,6 +931,7 @@ func buildSnapshot(
 		},
 		Meta: SnapshotMeta{
 			AgentID:            ag.ID,
+			TeamID:             runCtx.TeamID,
 			ThreadID:           runCtx.ThreadID,
 			Provider:           ag.Provider,
 			Model:              ag.Model,

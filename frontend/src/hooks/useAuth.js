@@ -1,88 +1,102 @@
 import { useAtom } from 'jotai'
 import { useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { tokenAtom, userAtom, isInitializingAuthAtom } from '../store/atoms/authAtoms'
-
-const API_URL = 'http://localhost:9090/api/auth'
+import { apiRequest, ApiError } from '../api/client'
+import {
+  authErrorAtom,
+  isInitializingAuthAtom,
+  tokenAtom,
+  userAtom,
+} from '../store/atoms/authAtoms'
 
 export function useAuth() {
   const [token, setToken] = useAtom(tokenAtom)
   const [user, setUser] = useAtom(userAtom)
   const [isInitializing, setIsInitializing] = useAtom(isInitializingAuthAtom)
+  const [authError, setAuthError] = useAtom(authErrorAtom)
   const navigate = useNavigate()
 
-  const saveToken = (newToken) => {
+  const saveToken = useCallback((newToken) => {
     if (newToken) {
-      console.log("saving new token")
       localStorage.setItem('agentflow_token', newToken)
     } else {
-      console.log("removing token")
       localStorage.removeItem('agentflow_token')
     }
     setToken(newToken)
-  }
+  }, [setToken])
 
-  const login = async (email, password) => {
-    const res = await fetch(`${API_URL}/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password })
-    })
-
-    if (!res.ok) {
-      const text = await res.text()
-      throw new Error(text || 'Login failed')
-    }
-
-    const data = await res.json()
-    saveToken(data.token)
-    await loadMe(data.token)
-    navigate('/dashboard')
-  }
-
-  const signup = async (firstName, lastName, email, password) => {
-    const res = await fetch(`${API_URL}/signup`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ first_name: firstName, last_name: lastName, email, password })
-    })
-
-    if (!res.ok) {
-      const text = await res.text()
-      throw new Error(text || 'Signup failed')
-    }
-
-    // Auto-login after successful signup
-    await login(email, password)
-  }
+  const invalidateSession = useCallback(() => {
+    saveToken(null)
+    setUser(null)
+    setAuthError(null)
+    setIsInitializing(false)
+    navigate('/login', { replace: true })
+  }, [navigate, saveToken, setAuthError, setIsInitializing, setUser])
 
   const loadMe = useCallback(async (currentToken = token) => {
     if (!currentToken) {
-      setIsInitializing(false)
-      return
-    }
-    try {
-      const res = await fetch(`${API_URL}/me`, {
-        headers: { 'Authorization': `Bearer ${currentToken}` }
-      })
-      if (!res.ok) throw new Error('Invalid token')
-
-      const data = await res.json()
-      setUser(data.user)
-    } catch (err) {
-      console.log("Error fetching user : ", err)
-      saveToken(null)
       setUser(null)
+      setAuthError(null)
+      setIsInitializing(false)
+      return null
+    }
+
+    setAuthError(null)
+    try {
+      const data = await apiRequest('/auth/me', { token: currentToken })
+      setUser(data.user)
+      return data.user
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        invalidateSession()
+        return null
+      }
+      setAuthError(error.message || 'Unable to verify your session.')
+      throw error
     } finally {
       setIsInitializing(false)
     }
-  }, [token, setToken, setUser, setIsInitializing])
+  }, [invalidateSession, setAuthError, setIsInitializing, setUser, token])
 
-  const logout = () => {
-    saveToken(null)
-    setUser(null)
-    navigate('/login')
+  const login = useCallback(async (email, password) => {
+    setAuthError(null)
+    const data = await apiRequest('/auth/login', {
+      method: 'POST',
+      json: { email, password },
+    })
+
+    saveToken(data.token)
+    await loadMe(data.token)
+    navigate('/dashboard')
+  }, [loadMe, navigate, saveToken, setAuthError])
+
+  const signup = useCallback(async (firstName, lastName, email, password) => {
+    setAuthError(null)
+    await apiRequest('/auth/signup', {
+      method: 'POST',
+      json: {
+        first_name: firstName,
+        last_name: lastName,
+        email,
+        password,
+      },
+    })
+
+    // Auto-login after successful signup
+    await login(email, password)
+  }, [login, setAuthError])
+
+  const logout = useCallback(() => invalidateSession(), [invalidateSession])
+
+  return {
+    token,
+    user,
+    isInitializing,
+    authError,
+    login,
+    signup,
+    loadMe,
+    logout,
+    invalidateSession,
   }
-
-  return { token, user, isInitializing, login, signup, loadMe, logout }
 }

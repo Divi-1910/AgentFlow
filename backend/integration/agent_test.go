@@ -25,6 +25,7 @@ func TestAgentCreateReturns201(t *testing.T) {
 	}
 	var body struct {
 		ID   string `json:"id"`
+		Kind string `json:"kind"`
 		Name string `json:"name"`
 	}
 	decodeBody(t, resp, &body)
@@ -33,6 +34,30 @@ func TestAgentCreateReturns201(t *testing.T) {
 	}
 	if body.Name != "My Agent" {
 		t.Errorf("name: got %q, want %q", body.Name, "My Agent")
+	}
+	if body.Kind != "standalone_agent" {
+		t.Errorf("kind: got %q, want %q", body.Kind, "standalone_agent")
+	}
+}
+
+func TestAgentCreateRejectsUnknownModelAndInvalidTuning(t *testing.T) {
+	e := newTestEnv(t)
+	token := e.mustSignup(t, "agent-validation@example.com", "password123")
+
+	unknownModel := minimalAgent("Unknown Model")
+	unknownModel["model"] = "not-in-catalog"
+	resp := e.do(t, "POST", "/api/agents", unknownModel, token)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown model: expected 400, got %d", resp.StatusCode)
+	}
+
+	invalidTuning := minimalAgent("Invalid Tuning")
+	invalidTuning["max_steps"] = 0
+	resp = e.do(t, "POST", "/api/agents", invalidTuning, token)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid tuning: expected 400, got %d", resp.StatusCode)
 	}
 }
 
@@ -115,7 +140,7 @@ func TestAgentUpdateReturns200(t *testing.T) {
 	decodeBody(t, resp, &created)
 
 	newName := "NewName"
-	resp2 := e.do(t, "PUT", "/api/agents/"+created.ID, map[string]any{"name": &newName}, token)
+	resp2 := e.do(t, "PATCH", "/api/agents/"+created.ID, map[string]any{"name": &newName}, token)
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp2.StatusCode)
 	}

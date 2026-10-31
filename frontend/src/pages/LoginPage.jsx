@@ -6,7 +6,7 @@ import { useAuth } from '../hooks/useAuth'
 
 function LoginPage() {
   const { login } = useAuth()
-  const [error, setError]   = useState('')
+  const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
   const handleSubmit = async (e) => {
@@ -33,6 +33,7 @@ function LoginPage() {
       switchCta="Create one"
       switchTo="/signup"
       onSubmit={handleSubmit}
+      submitting={loading}
     >
       {/* Error banner */}
       {error && (
@@ -70,30 +71,6 @@ function LoginPage() {
         icon="lock"
       />
 
-      {/* Remember + forgot — styled as a form-item so AnimeJS staggers it */}
-      <div className="form-item flex items-center justify-between gap-3 pt-1 text-[12px] opacity-0">
-        <label className="flex cursor-pointer items-center gap-2.5 text-white/35 transition-colors hover:text-white/60 font-light select-none">
-          <div className="relative flex items-center justify-center">
-            <input
-              type="checkbox"
-              className="peer h-4 w-4 cursor-pointer appearance-none rounded border border-white/15 bg-white/[0.03] transition-all
-                         checked:border-white/50 checked:bg-white/10 focus:outline-none focus:ring-1 focus:ring-white/15"
-            />
-            <span className="material-symbols-outlined pointer-events-none absolute text-[11px] text-white opacity-0 transition-opacity peer-checked:opacity-100"
-              style={{ fontVariationSettings: "'FILL' 1, 'wght' 700, 'GRAD' 0, 'opsz' 24" }}>
-              check
-            </span>
-          </div>
-          Keep me signed in
-        </label>
-
-        <button
-          type="button"
-          className="font-light text-white/30 transition-colors hover:text-white/60 underline decoration-white/10 underline-offset-4 hover:decoration-white/30"
-        >
-          Reset password
-        </button>
-      </div>
     </AuthShell>
   )
 }

@@ -72,7 +72,8 @@ func NewValidationRegistry() *ToolRegistry {
 }
 
 // NewCatalogRegistry contains every embedded tool definition regardless of
-// credentials. It is publication-only and its tools must never be executed.
+// runtime credentials. It is metadata-only (Studio discovery and publication)
+// and its placeholder-backed tools must never be executed.
 func NewCatalogRegistry() *ToolRegistry {
 	return newToolRegistry(nil, &memory.Service{}, &scratchpad.Service{}, "catalog-definition-only")
 }

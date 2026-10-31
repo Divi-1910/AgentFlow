@@ -89,6 +89,7 @@ func (r *JobRepo) DispatchAgent(ctx context.Context, req agent.DispatchAgentRequ
 		"$setOnInsert": bson.M{
 			"_id":                  bson.NewObjectID(),
 			"job_id":               jobID,
+			"team_id":              req.TeamID,
 			"parent_run_id":        req.ParentRunID,
 			"originator_run_id":    req.OriginatorRunID,
 			"parent_thread_id":     req.ParentThreadID,
@@ -156,6 +157,7 @@ func dispatchResultFromJob(doc model.JobDocument) agent.DispatchAgentResult {
 // never needs to import this package or the bson driver.
 func toJobRecord(doc model.JobDocument) agent.JobRecord {
 	return agent.JobRecord{
+		TeamID:              doc.TeamID,
 		JobID:               doc.JobID,
 		ParentRunID:         doc.ParentRunID,
 		OriginatorRunID:     doc.OriginatorRunID,

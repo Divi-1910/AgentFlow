@@ -18,7 +18,7 @@ function ToggleLink({ to, label, isActive }) {
       to={to}
       className={`relative rounded-full px-6 py-2.5 font-headline text-[11px] font-bold uppercase tracking-[0.15em] transition-all duration-300 ${isActive
         ? 'bg-white text-black shadow-[0_2px_20px_rgba(255,255,255,0.2)]'
-        : 'text-white/40 hover:text-white'
+        : 'text-content-muted hover:text-white'
         }`}
     >
       {label}
@@ -31,7 +31,7 @@ function StatBadge({ value, label }) {
   return (
     <div className="flex flex-col">
       <span className="font-headline text-4xl font-bold text-white">{value}</span>
-      <span className="mt-1 text-[12px] font-light uppercase tracking-[0.12em] text-white/30">{label}</span>
+      <span className="mt-1 text-[12px] font-light uppercase tracking-[0.12em] text-content-muted">{label}</span>
     </div>
   )
 }
@@ -45,6 +45,7 @@ export default function AuthShell({
   switchCta,
   switchTo,
   onSubmit,
+  submitting = false,
   children,
 }) {
   const formRef = useRef(null)
@@ -146,7 +147,7 @@ export default function AuthShell({
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               transition={{ delay: 0.3, duration: 0.8 }}
-              className="mt-6 max-w-sm text-[15px] font-light leading-relaxed text-white/35"
+              className="mt-6 max-w-sm text-[15px] font-light leading-relaxed text-content-supporting"
             >
               AgentFlow gives you the primitives to create ReAct agents for any use case — without the overhead.
             </motion.p>
@@ -161,7 +162,7 @@ export default function AuthShell({
               <div className="h-px w-8 bg-white/20" />
               <p
                 ref={brandLineRef}
-                className="font-headline text-[12px] font-bold uppercase tracking-[0.18em] text-white/35"
+                className="font-headline text-[12px] font-bold uppercase tracking-[0.18em] text-content-supporting"
               >
                 {BRAND_LINES[0]}
               </p>
@@ -224,7 +225,7 @@ export default function AuthShell({
                   {title}
                 </h1>
                 <div className="mt-5 h-px w-10 bg-white/15" />
-                <p className="mt-4 text-[13px] font-light leading-relaxed text-white/35 max-w-xs">
+                <p className="mt-4 text-[13px] font-light leading-relaxed text-content-supporting max-w-xs">
                   {subtitle}
                 </p>
               </motion.div>
@@ -242,9 +243,10 @@ export default function AuthShell({
               <div className="form-item pt-2 opacity-0">
                 <motion.button
                   type="submit"
+                  disabled={submitting}
                   whileHover={{ scale: 1.02 }}
                   whileTap={{ scale: 0.98 }}
-                  className="group/btn relative flex w-full items-center justify-between overflow-hidden rounded-full bg-white px-7 py-4 shadow-[0_0_32px_rgba(255,255,255,0.15)] transition-all hover:shadow-[0_0_48px_rgba(255,255,255,0.3)]"
+                  className="group/btn relative flex w-full items-center justify-between overflow-hidden rounded-full bg-white px-7 py-4 shadow-[0_0_32px_rgba(255,255,255,0.15)] transition-all hover:shadow-[0_0_48px_rgba(255,255,255,0.3)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white disabled:cursor-wait disabled:opacity-60"
                 >
                   <span className="font-headline text-[12px] font-bold uppercase tracking-[0.12em] text-black">
                     {submitLabel}
@@ -257,7 +259,7 @@ export default function AuthShell({
             </form>
 
             {/* Switch link */}
-            <p className="form-item mt-8 text-[12px] font-light text-white/35 opacity-0">
+            <p className="form-item mt-8 text-[12px] font-light text-content-supporting opacity-0">
               {switchLabel}{' '}
               <TransitionLink
                 to={switchTo}

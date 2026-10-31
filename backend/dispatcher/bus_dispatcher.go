@@ -18,6 +18,10 @@ type BusDispatcher struct {
 	RequestTimeout time.Duration
 }
 
+func (d *BusDispatcher) CancelRun(originatorRunID string) {
+	d.cancelTask(originatorRunID)
+}
+
 func (d *BusDispatcher) Dispatch(ctx context.Context, req DispatchRequest, events chan<- agent.StreamEvent) (*agent.RunResult, error) {
 	if d.Bus == nil || d.Pools == nil {
 		close(events)

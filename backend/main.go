@@ -37,7 +37,7 @@ import (
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, PATCH, DELETE")
 		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, Idempotency-Key")
 
 		if r.Method == "OPTIONS" {
@@ -154,6 +154,7 @@ func main() {
 	}
 
 	toolRegistry := tools.NewToolRegistry(db.GetRedis(), memorySvc, scratchpadSvc)
+	toolCatalog := tools.NewCatalogRegistry()
 	mcpManager := tools.NewMCPManager(&http.Client{Timeout: 60 * time.Second})
 
 	llmModelRepo := mongorepo.NewLLMModelRepo(llmRegistryCol)
@@ -169,6 +170,8 @@ func main() {
 	runRepo := mongorepo.NewRunRepo(runsCol, checkpointsCol)
 	jobRepo := mongorepo.NewJobRepo(jobsCol, jobLocksCol)
 	taskRepo := mongorepo.NewTaskRepo(tasksCol)
+	resourceDependencyRepo := mongorepo.NewResourceDependencyRepo(agentsCol, threadsCol, deploymentRevisionsCol, deploymentStatesCol)
+	workspaceStatsRepo := mongorepo.NewWorkspaceStatsRepo(runsCol, deploymentStatesCol)
 	jobRepo.SetTaskBudgetStore(taskRepo)
 	if err := mcpServerRepo.EnsureIndexes(context.Background()); err != nil {
 		slog.Error("failed to create MCP server indexes", "error", err)
@@ -178,6 +181,24 @@ func main() {
 	if err := runRepo.EnsureIndexes(context.Background()); err != nil {
 		slog.Error("failed to create run indexes", "error", err)
 		os.Exit(1)
+	}
+	if err := messageRepo.EnsureIndexes(context.Background()); err != nil {
+		slog.Error("failed to create message indexes", "error", err)
+		os.Exit(1)
+	}
+	recovery, err := runRepo.RecoverOrphanedRuns(context.Background(), "")
+	if err != nil {
+		slog.Error("failed to recover orphaned runs", "error", err)
+		os.Exit(1)
+	}
+	if recovery.Interrupted > 0 || recovery.Failed > 0 || recovery.Cancelled > 0 {
+		slog.Info("recovered orphaned runs", "interrupted", recovery.Interrupted, "failed", recovery.Failed, "cancelled", recovery.Cancelled)
+	}
+	if count, err := handlers.ReconcileAcceptedPrompts(context.Background(), "", runRepo, messageRepo); err != nil {
+		slog.Error("failed to reconcile accepted prompts", "error", err)
+		os.Exit(1)
+	} else if count > 0 {
+		slog.Info("reconciled accepted prompts", "count", count)
 	}
 	if err := jobRepo.EnsureIndexes(context.Background()); err != nil {
 		slog.Error("failed to create job indexes", "error", err)
@@ -216,7 +237,7 @@ func main() {
 	contextBuilder := agent.NewContextBuilder(platformCfg, memorySvc, memoryMetaRepo, scratchpadSvc)
 	publisherSvc, err := publisher.NewService(publisher.Config{
 		Agents: agentRepo, Revisions: deploymentRevisionRepo, Platform: platformCfg,
-		Catalog: tools.NewCatalogRegistry(), MCPServers: mcpServerRepo,
+		Catalog: toolCatalog, MCPServers: mcpServerRepo,
 	})
 	if err != nil {
 		slog.Error("failed to initialize deployment publisher", "error", err)
@@ -230,6 +251,7 @@ func main() {
 
 	theBus := bus.NewInProc()
 	jobHub := dispatcher.NewJobHub()
+	taskEvents := agent.NewTaskEventHub()
 	preparer := dispatcher.NewRunPreparer(dispatcher.RunPreparerConfig{
 		Agents:       agentRepo,
 		Threads:      threadRepo,
@@ -244,16 +266,17 @@ func main() {
 		Capabilities: capabilities,
 	})
 	pools := dispatcher.NewPoolManager(dispatcher.PoolManagerConfig{
-		RootCtx:  appCtx,
-		Bus:      theBus,
-		Preparer: preparer,
-		Runtime:  agentRuntime,
-		Status:   runRepo,
-		Messages: messageRepo,
-		Jobs:     jobRepo,
-		Tasks:    taskRepo,
-		Hub:      jobHub,
-		Workers:  4,
+		RootCtx:    appCtx,
+		Bus:        theBus,
+		Preparer:   preparer,
+		Runtime:    agentRuntime,
+		Status:     runRepo,
+		Messages:   messageRepo,
+		Jobs:       jobRepo,
+		Tasks:      taskRepo,
+		Hub:        jobHub,
+		TaskEvents: taskEvents,
+		Workers:    4,
 	})
 	invoker := dispatcher.NewBusDelegateInvoker(dispatcher.BusDelegateInvokerConfig{
 		Bus:      theBus,
@@ -266,14 +289,15 @@ func main() {
 	})
 	agentRuntime.SetDelegateInvoker(invoker)
 	coordinator := dispatcher.NewJobCoordinator(dispatcher.JobCoordinatorConfig{
-		Bus:     theBus,
-		Pools:   pools,
-		Threads: threadRepo,
-		Runs:    runRepo,
-		Jobs:    jobRepo,
-		Tasks:   taskRepo,
-		Hub:     jobHub,
-		Logger:  slog.Default(),
+		Bus:        theBus,
+		Pools:      pools,
+		Threads:    threadRepo,
+		Runs:       runRepo,
+		Jobs:       jobRepo,
+		Tasks:      taskRepo,
+		Hub:        jobHub,
+		TaskEvents: taskEvents,
+		Logger:     slog.Default(),
 	})
 	coordinator.Start(appCtx)
 	defer theBus.Close()
@@ -297,8 +321,15 @@ func main() {
 		slog.Info("dispatcher: using DirectDispatcher")
 	}
 
-	agentHandler := handlers.NewAgentHandler(agentRepo, toolRegistry, mcpServerRepo)
+	agentHandler := handlers.NewAgentHandler(agentRepo, toolRegistry, toolCatalog, mcpServerRepo, llmModelRepo, llmRegistry, resourceDependencyRepo)
+	agentTeamHandler := handlers.NewAgentTeamHandler(agentRepo, toolRegistry, toolCatalog, mcpServerRepo, llmModelRepo, llmRegistry, resourceDependencyRepo)
+	toolHandler := handlers.NewToolHandler(toolCatalog, toolRegistry)
 	mcpServerHandler := handlers.NewMCPServerHandler(mcpServerRepo)
+	platformHandler := handlers.NewPlatformHandler(managedDeployments.Enabled)
+	workspaceHandler := handlers.NewWorkspaceHandler(
+		agentRepo, llmModelRepo, llmRegistry, toolCatalog, toolRegistry,
+		mcpServerRepo, workspaceStatsRepo, managedDeployments.Enabled,
+	)
 	publicationHandler := handlers.NewPublicationHandler(publisherSvc)
 	artifactDeliverySvc, err := delivery.NewService(delivery.Config{
 		Tokens: deploymentDeliveryTokenRepo, States: deploymentStateRepo, Revisions: deploymentRevisionRepo,
@@ -344,7 +375,7 @@ func main() {
 			os.Exit(1)
 		}
 		deploymentHandler, err := handlers.NewDeploymentHandler(
-			deploymentSvc, managedDeployments.Namespace, managedDeployments.RuntimeImage,
+			deploymentSvc, managedDeployments.Namespace, managedDeployments.RuntimeImage, agentRepo,
 		)
 		if err != nil {
 			slog.Error("failed to initialize deployment API", "error", err)
@@ -355,49 +386,79 @@ func main() {
 			slog.Error("failed to initialize runtime proxy", "error", err)
 			os.Exit(1)
 		}
-		mux.HandleFunc("PUT /api/agents/{id}/deployment", middleware.RequireAuth(deploymentHandler.Deploy))
-		mux.HandleFunc("DELETE /api/agents/{id}/deployment", middleware.RequireAuth(deploymentHandler.Undeploy))
-		mux.HandleFunc("GET /api/agents/{id}/deployment", middleware.RequireAuth(deploymentHandler.Status))
-		mux.HandleFunc("/api/agents/{id}/runtime/{path...}", middleware.RequireAuth(runtimeProxy.ServeHTTP))
+		mux.HandleFunc("GET /api/deployments", middleware.RequireAuth(deploymentHandler.List))
+		mux.HandleFunc("PUT /api/agents/{id}/deployment", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindStandaloneAgent, deploymentHandler.Deploy)))
+		mux.HandleFunc("DELETE /api/agents/{id}/deployment", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindStandaloneAgent, deploymentHandler.Undeploy)))
+		mux.HandleFunc("GET /api/agents/{id}/deployment", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindStandaloneAgent, deploymentHandler.Status)))
+		mux.HandleFunc("/api/agents/{id}/runtime/{path...}", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindStandaloneAgent, runtimeProxy.ServeHTTP)))
+		mux.HandleFunc("PUT /api/agent-teams/{id}/deployment", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindAgentTeam, deploymentHandler.Deploy)))
+		mux.HandleFunc("DELETE /api/agent-teams/{id}/deployment", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindAgentTeam, deploymentHandler.Undeploy)))
+		mux.HandleFunc("GET /api/agent-teams/{id}/deployment", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindAgentTeam, deploymentHandler.Status)))
+		mux.HandleFunc("/api/agent-teams/{id}/runtime/{path...}", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindAgentTeam, runtimeProxy.ServeHTTP)))
 	}
 	threadHandler := handlers.NewThreadHandler(threadRepo, agentRepo)
+	executions := handlers.NewExecutionRegistryWithTaskEvents(appCtx, taskEvents)
 	messageHandler := handlers.NewMessageHandler(
 		agentRepo,
 		threadRepo,
 		messageRepo,
 		disp,
 		runRepo,
+		executions,
 	)
 	runHandler := handlers.NewRunHandler(
 		agentRepo,
+		threadRepo,
 		messageRepo,
 		runRepo,
 		disp,
 		toolRegistry,
 		capabilities,
+		executions,
 	)
 
 	mux.HandleFunc("POST /api/auth/signup", authHandler.SignUp)
 	mux.HandleFunc("POST /api/auth/login", authHandler.Login)
 	mux.HandleFunc("GET /api/auth/me", middleware.RequireAuth(authHandler.Me))
+	mux.HandleFunc("GET /api/platform/capabilities", middleware.RequireAuth(platformHandler.Capabilities))
+	mux.HandleFunc("GET /api/workspace/overview", middleware.RequireAuth(workspaceHandler.Overview))
 	mux.HandleFunc("GET /api/llms", middleware.RequireAuth(llmHandler.GetLLMs))
+	mux.HandleFunc("GET /api/tools", middleware.RequireAuth(toolHandler.List))
 	mux.HandleFunc("GET /api/mcp-servers", middleware.RequireAuth(mcpServerHandler.List))
 	mux.HandleFunc("POST /api/llm/chat", middleware.RequireAuth(llmHandler.Chat))
 	mux.HandleFunc("POST /api/agents", middleware.RequireAuth(agentHandler.Create))
 	mux.HandleFunc("GET /api/agents", middleware.RequireAuth(agentHandler.List))
 	mux.HandleFunc("GET /api/agents/{id}", middleware.RequireAuth(agentHandler.Get))
-	mux.HandleFunc("PUT /api/agents/{id}", middleware.RequireAuth(agentHandler.Update))
+	mux.HandleFunc("PATCH /api/agents/{id}", middleware.RequireAuth(agentHandler.Update))
 	mux.HandleFunc("DELETE /api/agents/{id}", middleware.RequireAuth(agentHandler.Delete))
-	mux.HandleFunc("POST /api/agents/{id}/publish", middleware.RequireAuth(publicationHandler.Publish))
-	mux.HandleFunc("GET /api/agents/{id}/publications", middleware.RequireAuth(publicationHandler.List))
-	mux.HandleFunc("GET /api/agents/{id}/publications/{revision}/bundle", middleware.RequireAuth(publicationHandler.GetBundle))
-	mux.HandleFunc("POST /api/agents/{id}/publications/{revision}/restore", middleware.RequireAuth(publicationHandler.Restore))
+	mux.HandleFunc("POST /api/agent-teams", middleware.RequireAuth(agentTeamHandler.Create))
+	mux.HandleFunc("GET /api/agent-teams", middleware.RequireAuth(agentTeamHandler.List))
+	mux.HandleFunc("GET /api/agent-teams/{id}", middleware.RequireAuth(agentTeamHandler.Get))
+	mux.HandleFunc("PATCH /api/agent-teams/{id}", middleware.RequireAuth(agentTeamHandler.Update))
+	mux.HandleFunc("DELETE /api/agent-teams/{id}", middleware.RequireAuth(agentTeamHandler.Delete))
+	mux.HandleFunc("POST /api/agents/{id}/publish", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindStandaloneAgent, publicationHandler.Publish)))
+	mux.HandleFunc("GET /api/agents/{id}/publications", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindStandaloneAgent, publicationHandler.List)))
+	mux.HandleFunc("GET /api/agents/{id}/publications/{revision}/bundle", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindStandaloneAgent, publicationHandler.GetBundle)))
+	mux.HandleFunc("POST /api/agents/{id}/publications/{revision}/restore", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindStandaloneAgent, publicationHandler.Restore)))
+	mux.HandleFunc("POST /api/agent-teams/{id}/publish", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindAgentTeam, publicationHandler.Publish)))
+	mux.HandleFunc("GET /api/agent-teams/{id}/publications", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindAgentTeam, publicationHandler.List)))
+	mux.HandleFunc("GET /api/agent-teams/{id}/publications/{revision}/bundle", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindAgentTeam, publicationHandler.GetBundle)))
+	mux.HandleFunc("POST /api/agent-teams/{id}/publications/{revision}/restore", middleware.RequireAuth(handlers.RequireResourceKind(agentRepo, agent.ResourceKindAgentTeam, publicationHandler.Restore)))
 	mux.HandleFunc("POST /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.Create))
 	mux.HandleFunc("GET /api/agents/{id}/threads", middleware.RequireAuth(threadHandler.ListByAgent))
+	mux.HandleFunc("POST /api/agent-teams/{id}/threads", middleware.RequireAuth(threadHandler.CreateForTeam))
+	mux.HandleFunc("GET /api/agent-teams/{id}/threads", middleware.RequireAuth(threadHandler.ListByTeam))
+	mux.HandleFunc("GET /api/threads", middleware.RequireAuth(threadHandler.List))
+	mux.HandleFunc("GET /api/threads/{id}", middleware.RequireAuth(threadHandler.Get))
+	mux.HandleFunc("PATCH /api/threads/{id}", middleware.RequireAuth(threadHandler.Update))
 	mux.HandleFunc("POST /api/threads/{id}/messages", middleware.RequireAuth(messageHandler.Send))
 	mux.HandleFunc("GET /api/threads/{id}/messages", middleware.RequireAuth(messageHandler.List))
+	mux.HandleFunc("GET /api/threads/{id}/runs", middleware.RequireAuth(runHandler.ListByThread))
+	mux.HandleFunc("GET /api/runs", middleware.RequireAuth(runHandler.List))
 	mux.HandleFunc("GET /api/runs/{id}", middleware.RequireAuth(runHandler.GetRun))
+	mux.HandleFunc("GET /api/runs/{id}/events", middleware.RequireAuth(runHandler.StreamEvents))
 	mux.HandleFunc("POST /api/runs/{id}/resume", middleware.RequireAuth(runHandler.ResumeRun))
+	mux.HandleFunc("POST /api/runs/{id}/cancel", middleware.RequireAuth(runHandler.CancelRun))
 
 	port := os.Getenv("PORT")
 	if port == "" {

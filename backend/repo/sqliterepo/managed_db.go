@@ -8,13 +8,13 @@ import (
 )
 
 const (
-	sharedSchemaVersion    = 1
-	executionSchemaVersion = 1
+	sharedSchemaVersion    = 3
+	executionSchemaVersion = 3
 )
 
 var (
-	sharedMigrations    = []string{sharedMigrationV1}
-	executionMigrations = []string{executionMigrationV1}
+	sharedMigrations    = []string{sharedMigrationV1, sharedMigrationV2, sharedMigrationV3}
+	executionMigrations = []string{executionMigrationV1, executionMigrationV2, executionMigrationV3}
 )
 
 // OpenShared opens the deployment-wide managed store. It contains durable
@@ -252,4 +252,29 @@ CREATE TABLE job_locks (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+`
+
+const sharedMigrationV2 = `
+ALTER TABLE messages ADD COLUMN dedupe_key TEXT;
+CREATE UNIQUE INDEX messages_dedupe_unique ON messages(dedupe_key) WHERE dedupe_key IS NOT NULL;
+`
+
+const executionMigrationV2 = `
+ALTER TABLE runs ADD COLUMN submission_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN accepted_input TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN prompt_persisted INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN dispatch_started INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN active_slot TEXT;
+CREATE UNIQUE INDEX runs_submission_unique ON runs(user_id, thread_id, submission_key) WHERE submission_key <> '';
+CREATE UNIQUE INDEX runs_active_slot_unique ON runs(active_slot) WHERE active_slot IS NOT NULL;
+`
+
+const sharedMigrationV3 = `
+DROP INDEX IF EXISTS threads_user_agent_idx;
+CREATE INDEX threads_user_agent_activity_idx ON threads(user_id, agent_id, updated_at DESC, id DESC);
+CREATE INDEX threads_user_activity_idx ON threads(user_id, updated_at DESC, id DESC) WHERE kind <> 'sub';
+`
+
+const executionMigrationV3 = `
+CREATE INDEX runs_owner_timeline_idx ON runs(user_id, parent_run_id, invocation_kind, created_at DESC, run_id DESC);
 `

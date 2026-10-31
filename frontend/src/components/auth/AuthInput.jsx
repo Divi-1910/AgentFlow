@@ -103,7 +103,7 @@ export default function AuthInput({
                 setHasValue(e.target.value.length > 0)
               }}
               onChange={(e) => setHasValue(e.target.value.length > 0)}
-              className="absolute bottom-[8px] left-0 w-full bg-transparent font-body text-[14px] text-white leading-none placeholder-white/20 focus:outline-none"
+              className="absolute bottom-[8px] left-0 w-full bg-transparent font-body text-[14px] text-white leading-none placeholder:text-content-muted focus:outline-none"
             />
           </div>
 
@@ -117,8 +117,9 @@ export default function AuthInput({
                 exit={{ opacity: 0, scale: 0.8 }}
                 transition={{ duration: 0.2 }}
                 onClick={() => setShowPwd(v => !v)}
-                tabIndex={-1}
-                className="flex-shrink-0 text-white/20 transition-colors hover:text-white/50 focus:outline-none"
+                aria-label={showPwd ? 'Hide password' : 'Show password'}
+                aria-pressed={showPwd}
+                className="flex-shrink-0 rounded text-content-muted transition-colors hover:text-content-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white"
               >
                 <span className="material-symbols-outlined text-[18px]">
                   {showPwd ? 'visibility_off' : 'visibility'}

@@ -10,6 +10,7 @@ type RunStatus string
 
 const (
 	RunStatusRunning     RunStatus = "running"
+	RunStatusCancelling  RunStatus = "cancelling"
 	RunStatusCompleted   RunStatus = "completed"
 	RunStatusFailed      RunStatus = "failed"
 	RunStatusCancelled   RunStatus = "cancelled"   // RunStatusCancelled means the run was explicitly cancelled by the user. Distinct from RunStatusInterrupted, which is used when a run's context is cancelled (e.g. dropped SSE connection) but it can be resumed from the last checkpoint.
@@ -23,6 +24,7 @@ type RunDocument struct {
 	RunID          string        `bson:"run_id"        json:"run_id"`
 	ThreadID       string        `bson:"thread_id"     json:"thread_id"`
 	AgentID        string        `bson:"agent_id"      json:"agent_id"`
+	TeamID         string        `bson:"team_id,omitempty" json:"team_id,omitempty"`
 	UserID         string        `bson:"user_id"       json:"user_id"`
 	Status         RunStatus     `bson:"status"          json:"status"`
 	Attempt        int           `bson:"attempt"         json:"attempt"`
@@ -35,6 +37,11 @@ type RunDocument struct {
 	ParentRunID     string    `bson:"parent_run_id,omitempty"     json:"parent_run_id,omitempty"`
 	InvocationKind  string    `bson:"invocation_kind,omitempty"  json:"invocation_kind,omitempty"`
 	JobID           string    `bson:"job_id,omitempty"           json:"job_id,omitempty"`
+	SubmissionKey   string    `bson:"submission_key,omitempty"   json:"-"`
+	AcceptedInput   string    `bson:"accepted_input,omitempty"   json:"-"`
+	PromptPersisted bool      `bson:"prompt_persisted,omitempty" json:"-"`
+	DispatchStarted bool      `bson:"dispatch_started,omitempty" json:"-"`
+	ActiveSlot      string    `bson:"active_slot,omitempty"      json:"-"`
 	CreatedAt       time.Time `bson:"created_at" json:"created_at"`
 	UpdatedAt       time.Time `bson:"updated_at" json:"updated_at"`
 }

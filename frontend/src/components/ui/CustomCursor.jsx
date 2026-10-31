@@ -11,7 +11,6 @@ export default function CustomCursor() {
 
   const isHovered = useRef(false)
   const ringRef = useRef(null)
-  const dotRef = useRef(null)
 
   useEffect(() => {
     const move = (e) => {

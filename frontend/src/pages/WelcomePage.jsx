@@ -81,12 +81,12 @@ function UseCaseCard({ icon, label, desc, delay = 0 }) {
     >
       <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/14 to-transparent
                       opacity-0 transition-opacity duration-500 group-hover:opacity-100" />
-      <span className="material-symbols-outlined mb-5 block text-[18px] text-white/22
-                       transition-colors duration-300 group-hover:text-white/48">
+      <span className="material-symbols-outlined mb-5 block text-[18px] text-content-muted
+                       transition-colors duration-300 group-hover:text-content-secondary">
         {icon}
       </span>
       <h3 className="mb-2 font-headline text-[10px] font-bold uppercase tracking-[0.2em] text-white/65">{label}</h3>
-      <p className="text-[11.5px] font-light leading-relaxed text-white/25">{desc}</p>
+      <p className="text-[11.5px] font-light leading-relaxed text-content-supporting">{desc}</p>
     </motion.div>
   )
 }
@@ -207,8 +207,8 @@ export default function WelcomePage() {
               whileHover={{ scale: 1.04 }} whileTap={{ scale: 0.96 }}
               onClick={() => go('/login')}
               className="rounded-full border border-white/[0.07] px-5 py-2.5 font-headline text-[10px]
-                         font-bold uppercase tracking-[0.16em] text-white/36
-                         transition-all hover:border-white/14 hover:text-white/65"
+                         font-bold uppercase tracking-[0.16em] text-content-supporting
+                         transition-all hover:border-white/14 hover:text-white"
             >
               Login
             </motion.button>
@@ -254,10 +254,10 @@ export default function WelcomePage() {
                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-white/50 opacity-75" />
                 <span className="relative inline-flex h-[5px] w-[5px] rounded-full bg-white/55" />
               </span>
-              <span className="font-headline text-[8.5px] font-bold uppercase tracking-[0.3em] text-white/32">
+              <span className="font-headline text-[8.5px] font-bold uppercase tracking-[0.3em] text-content-supporting">
                 Multi-agent platform
               </span>
-              <span className="ml-1 font-headline text-[8px] font-bold uppercase tracking-[0.2em] text-white/15">
+              <span className="ml-1 font-headline text-[8px] font-bold uppercase tracking-[0.2em] text-content-muted">
                 v1.0
               </span>
             </div>
@@ -301,7 +301,7 @@ export default function WelcomePage() {
             <div className="overflow-hidden" style={{ lineHeight: 0.88 }}>
               <h1
                 ref={canBeRef}
-                className="font-headline font-light uppercase tracking-[-0.02em] text-white/[0.28]
+                className="font-headline font-light uppercase tracking-[-0.02em] text-content-muted
                            text-[11vw] sm:text-[8.5vw] lg:text-[6vw]"
               >
                 CAN BE
@@ -318,11 +318,11 @@ export default function WelcomePage() {
               {/* Thin ruled divider */}
               <div className="mb-6 flex items-center gap-4">
                 <div className="h-px w-8 bg-white/[0.08]" />
-                <span className="font-headline text-[8.5px] font-bold uppercase tracking-[0.28em] text-white/20">
+                <span className="font-headline text-[8.5px] font-bold uppercase tracking-[0.28em] text-content-supporting">
                   Build anything
                 </span>
               </div>
-              <p className="mb-8 max-w-[30ch] text-[12.5px] font-light leading-[1.85] text-white/28">
+              <p className="mb-8 max-w-[30ch] text-[12.5px] font-light leading-[1.85] text-content-supporting">
                 Spin up ReAct agents for any workflow, any use case — no orchestration overhead.
               </p>
               <div className="hidden items-center gap-4 lg:flex">
@@ -343,8 +343,8 @@ export default function WelcomePage() {
                   whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}
                   onClick={() => go('/login')}
                   className="rounded-full border border-white/[0.08] px-8 py-4 font-headline text-[11px]
-                             font-bold uppercase tracking-[0.1em] text-white/34 transition-all
-                             hover:border-white/16 hover:text-white/65"
+                             font-bold uppercase tracking-[0.1em] text-content-supporting transition-all
+                             hover:border-white/16 hover:text-white"
                 >
                   Sign In
                 </motion.button>
@@ -375,7 +375,7 @@ export default function WelcomePage() {
             onClick={() => go('/login')}
             className="flex w-full items-center justify-center rounded-full border border-white/[0.07]
                        bg-white/[0.02] px-7 py-4 font-headline text-[11px] font-bold
-                       uppercase tracking-[0.1em] text-white/36 backdrop-blur-sm"
+                       uppercase tracking-[0.1em] text-content-supporting backdrop-blur-sm"
           >
             Sign In
           </motion.button>
@@ -395,7 +395,7 @@ export default function WelcomePage() {
 
           <div className="mb-10 flex items-center gap-4">
             <div className="h-px w-6 bg-white/[0.08]" />
-            <span className="font-headline text-[8.5px] font-bold uppercase tracking-[0.3em] text-white/40">
+            <span className="font-headline text-[8.5px] font-bold uppercase tracking-[0.3em] text-content-supporting">
               How it thinks
             </span>
           </div>
@@ -431,9 +431,9 @@ export default function WelcomePage() {
               >
                 <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/[0.09] to-transparent
                                opacity-0 transition-opacity duration-500 group-hover:opacity-100" />
-                <span className="mb-7 block font-headline text-[8.5px] font-bold tracking-[0.3em] text-white/14">{n}</span>
+                <span className="mb-7 block font-headline text-[8.5px] font-bold tracking-[0.3em] text-content-decorative">{n}</span>
                 <h3 className="mb-3 font-headline text-base font-bold uppercase tracking-widest text-white">{label}</h3>
-                <p className="text-[11px] font-light leading-relaxed text-white/45">{desc}</p>
+                <p className="text-[11px] font-light leading-relaxed text-content-supporting">{desc}</p>
               </div>
             ))}
           </div>
@@ -447,14 +447,14 @@ export default function WelcomePage() {
         <div className="mx-auto max-w-5xl">
           <div className="mb-10 flex items-center gap-4">
             <div className="h-px w-6 bg-white/[0.08]" />
-            <span className="font-headline text-[8.5px] font-bold uppercase tracking-[0.3em] text-white/20">
+            <span className="font-headline text-[8.5px] font-bold uppercase tracking-[0.3em] text-content-supporting">
               Use cases
             </span>
           </div>
           <h2 className="mb-14 font-headline uppercase tracking-tight text-white
                          text-[8vw] sm:text-[5.5vw] lg:text-[3.8vw]">
             <span className="font-bold">Built for</span><br />
-            <span className="font-light text-white/16">any workflow.</span>
+            <span className="font-light text-content-muted">any workflow.</span>
           </h2>
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {USE_CASES.map(({ icon, label, desc }, i) => (
@@ -470,15 +470,15 @@ export default function WelcomePage() {
       <section ref={ctaRef} className="relative z-10 overflow-hidden bg-black px-6 py-32 sm:px-10 lg:px-14 lg:py-52">
         <div className="mx-auto max-w-4xl">
           <div className="cta-item mb-14 h-px w-full bg-white/[0.035] opacity-0" />
-          <p className="cta-item mb-4 font-headline text-[8.5px] font-bold uppercase tracking-[0.3em] text-white/15 opacity-0">
+          <p className="cta-item mb-4 font-headline text-[8.5px] font-bold uppercase tracking-[0.3em] text-content-supporting opacity-0">
             Get started today
           </p>
           <h2 className="cta-item mb-10 font-headline uppercase leading-none tracking-tight opacity-0
                          text-[13vw] sm:text-[10vw] lg:text-[7.5vw]">
             <span className="font-black text-white">BUILD</span><br />
-            <span className="font-light text-white/10">ANYTHING.</span>
+            <span className="font-light text-content-muted">ANYTHING.</span>
           </h2>
-          <p className="cta-item mb-12 max-w-[26ch] text-[12.5px] font-light leading-[1.85] text-white/26 opacity-0">
+          <p className="cta-item mb-12 max-w-[26ch] text-[12.5px] font-light leading-[1.85] text-content-supporting opacity-0">
             Your first ReAct agent is one click away.<br />No infrastructure. No boilerplate.
           </p>
           <div className="cta-item flex flex-wrap items-center gap-5 opacity-0">
@@ -497,9 +497,9 @@ export default function WelcomePage() {
             </motion.button>
             <button
               onClick={() => go('/login')}
-              className="font-headline text-[11px] font-bold uppercase tracking-[0.1em] text-white/22
+              className="font-headline text-[11px] font-bold uppercase tracking-[0.1em] text-content-supporting
                          underline decoration-white/[0.08] underline-offset-4
-                         transition-colors hover:text-white/48 hover:decoration-white/25"
+                         transition-colors hover:text-white hover:decoration-white/25"
             >
               Already have an account
             </button>
@@ -519,7 +519,7 @@ export default function WelcomePage() {
       <footer className="relative z-10 flex items-center justify-between border-t border-white/[0.035]
                          bg-black px-6 py-5 sm:px-10 lg:px-14">
         <Wordmark size="sm" />
-        <p className="font-headline text-[8.5px] font-bold uppercase tracking-[0.22em] text-white/12">
+        <p className="font-headline text-[8.5px] font-bold uppercase tracking-[0.22em] text-content-muted">
           © {new Date().getFullYear()} AgentFlow
         </p>
       </footer>

@@ -5,12 +5,12 @@ import (
 	"net/http"
 	"testing"
 
-	"backend/model"
+	"backend/handlers"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
-func TestGetLLMsEmptyReturns200(t *testing.T) {
+func TestGetLLMsReturnsSeededAvailableModel(t *testing.T) {
 	e := newTestEnv(t)
 	token := e.mustSignup(t, "llm-empty@example.com", "password123")
 
@@ -18,10 +18,10 @@ func TestGetLLMsEmptyReturns200(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	var models []any
+	var models []handlers.LLMModelResponse
 	decodeBody(t, resp, &models)
-	if models == nil {
-		t.Error("expected non-nil slice, got nil")
+	if len(models) != 1 || models[0].APIModelID != "gpt-4o" || !models[0].Available {
+		t.Fatalf("unexpected models: %+v", models)
 	}
 }
 
@@ -32,10 +32,10 @@ func TestGetLLMsWithModelsReturnsAll(t *testing.T) {
 	// Seed two model documents directly into the collection.
 	docs := []interface{}{
 		bson.M{
-			"model_id":       "gpt-4o",
-			"name":           "GPT-4o",
+			"model_id":       "gpt-4.1",
+			"name":           "GPT-4.1",
 			"provider":       "openai",
-			"api_model_id":   "gpt-4o",
+			"api_model_id":   "gpt-4.1",
 			"context_window": 128000,
 		},
 		bson.M{
@@ -54,10 +54,17 @@ func TestGetLLMsWithModelsReturnsAll(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	var models []model.LLMModel
+	var models []handlers.LLMModelResponse
 	decodeBody(t, resp, &models)
-	if len(models) != 2 {
-		t.Errorf("expected 2 models, got %d", len(models))
+	if len(models) != 3 {
+		t.Errorf("expected 3 models, got %d", len(models))
+	}
+	availability := map[string]bool{}
+	for _, entry := range models {
+		availability[entry.Provider] = entry.Available
+	}
+	if !availability["openai"] || availability["anthropic"] {
+		t.Errorf("unexpected provider availability: %+v", availability)
 	}
 }
 

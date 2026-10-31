@@ -59,12 +59,37 @@ func TestThreadListByAgentReturns200(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	var threads []struct {
-		ID string `json:"id"`
+	var page struct {
+		Items []struct {
+			ID string `json:"id"`
+		} `json:"items"`
 	}
-	decodeBody(t, resp, &threads)
-	if len(threads) != 2 {
-		t.Errorf("expected 2 threads, got %d", len(threads))
+	decodeBody(t, resp, &page)
+	if len(page.Items) != 2 {
+		t.Errorf("expected 2 threads, got %d", len(page.Items))
+	}
+}
+
+func TestThreadGlobalListProjectsOwnedResource(t *testing.T) {
+	e := newTestEnv(t)
+	token := e.mustSignup(t, "thread-global@example.com", "password123")
+	agentID := createAgent(t, e, token, "GlobalListAgent")
+	threadID := createThread(t, e, token, agentID, "Global Thread")
+
+	resp := e.do(t, "GET", "/api/threads?resource_kind=standalone_agent", nil, token)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var page struct {
+		Items []struct {
+			ID           string `json:"id"`
+			ResourceID   string `json:"resource_id"`
+			ResourceKind string `json:"resource_kind"`
+		} `json:"items"`
+	}
+	decodeBody(t, resp, &page)
+	if len(page.Items) != 1 || page.Items[0].ID != threadID || page.Items[0].ResourceID != agentID || page.Items[0].ResourceKind != "standalone_agent" {
+		t.Fatalf("unexpected thread page: %+v", page.Items)
 	}
 }
 

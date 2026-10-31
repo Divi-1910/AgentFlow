@@ -26,8 +26,16 @@ const (
 	contextTriggerRatio = 0.85
 )
 
+type ResourceKind string
+
+const (
+	ResourceKindStandaloneAgent ResourceKind = "standalone_agent"
+	ResourceKindAgentTeam       ResourceKind = "agent_team"
+)
+
 type Agent struct {
 	ID                 string
+	Kind               ResourceKind
 	Name               string
 	Description        string
 	Provider           string
@@ -35,6 +43,7 @@ type Agent struct {
 	SystemPrompt       string
 	Tools              []string
 	Delegates          []DelegateConfig
+	TeamGraph          *TeamGraph
 	MCPServers         []MCPServerSelection
 	MCPConnections     []MCPServerConnection
 	ModelContextLimit  int
@@ -46,6 +55,23 @@ type Agent struct {
 	MaxTokens          int
 	MaxRuns            int
 	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+// EffectiveResourceKind keeps pre-kind documents readable while all new
+// product writes persist an explicit kind. Historically, only team roots had
+// delegates, so that is the unambiguous compatibility signal.
+func EffectiveResourceKind(a *Agent) ResourceKind {
+	if a == nil {
+		return ""
+	}
+	if a.Kind != "" {
+		return a.Kind
+	}
+	if len(a.Delegates) > 0 {
+		return ResourceKindAgentTeam
+	}
+	return ResourceKindStandaloneAgent
 }
 
 // DelegateConfig declares another agent this agent may call as a tool. The
@@ -54,6 +80,40 @@ type Agent struct {
 // guide when and how to call it.
 type DelegateConfig struct {
 	AgentID      string
+	ToolName     string
+	Description  string
+	Instructions string
+}
+
+// TeamGraph is the Team-owned delegation topology. Nodes reference reusable
+// standalone Agents; edges become effective delegates only while that Team is
+// executing or being published. Canvas positions and edge attachment ports are
+// Studio presentation data and deliberately do not affect runtime configuration
+// or deployment hashes.
+type TeamGraph struct {
+	EntryAgentID string
+	Nodes        []TeamNode
+	Edges        []TeamEdge
+}
+
+type TeamNode struct {
+	AgentID  string
+	Position TeamPosition
+}
+
+type TeamPosition struct {
+	X float64
+	Y float64
+}
+
+type TeamEdge struct {
+	SourceAgentID string
+	TargetAgentID string
+	// SourcePort and TargetPort are Studio presentation metadata. They choose
+	// where the edge meets each canvas node, but never change delegation
+	// direction or the effective runtime Agent compiled from this edge.
+	SourcePort   string
+	TargetPort   string
 	ToolName     string
 	Description  string
 	Instructions string
@@ -85,6 +145,7 @@ type UpdateAgentInput struct {
 	SystemPrompt       *string
 	Tools              *[]string
 	Delegates          *[]DelegateConfig
+	TeamGraph          *TeamGraph
 	MCPServers         *[]MCPServerSelection
 	Provider           *string
 	Model              *string
@@ -92,12 +153,14 @@ type UpdateAgentInput struct {
 	MaxSteps           *int
 	MaxTokens          *int
 	MaxRuns            *int
+	ContextWindow      *int
 	ContextKeepRatio   *float64
 	SummarizationModel *string
 }
 
 type RunContext struct {
 	RunID         string
+	TeamID        string
 	ThreadID      string
 	Attempt       int
 	Summary       string
@@ -139,6 +202,10 @@ type RunContext struct {
 	// run start. The context builder renders these as a model-visible note so
 	// the agent knows those tools are absent this run. Set by the runtime.
 	MCPUnavailable []string
+	// MCPServerIDs maps the runtime-safe alias embedded in an MCP tool name to
+	// its stable catalog identifier. It exists only to produce structured,
+	// URL-free product events; connection URLs never enter the event envelope.
+	MCPServerIDs map[string]string
 }
 
 type RunResult struct {

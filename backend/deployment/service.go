@@ -32,6 +32,10 @@ type DeployStateStore interface {
 	Get(ctx context.Context, userID, deploymentID string) (*DeployState, error)
 }
 
+type deployStatePageStore interface {
+	ListPage(ctx context.Context, userID string, request DeployStatePageRequest) (DeployStatePage, error)
+}
+
 type RevisionReader interface {
 	Get(ctx context.Context, userID, deploymentID string, revision int) (*Revision, error)
 	List(ctx context.Context, userID, deploymentID string, limit int) ([]Revision, error)
@@ -163,6 +167,17 @@ func (s *Service) Get(ctx context.Context, userID, deploymentID string) (*Deploy
 		return nil, fmt.Errorf("%w: owner and deployment are required", ErrDeployStateConflict)
 	}
 	return s.states.Get(ctx, userID, deploymentID)
+}
+
+func (s *Service) ListStates(ctx context.Context, userID string, request DeployStatePageRequest) (DeployStatePage, error) {
+	if strings.TrimSpace(userID) == "" {
+		return DeployStatePage{}, fmt.Errorf("%w: owner is required", ErrDeployStateConflict)
+	}
+	pages, ok := s.states.(deployStatePageStore)
+	if !ok {
+		return DeployStatePage{}, errors.New("deployment: state listing is unavailable")
+	}
+	return pages.ListPage(ctx, userID, request)
 }
 
 func mutationResult(state *DeployState, changed bool) (*MutationResult, error) {

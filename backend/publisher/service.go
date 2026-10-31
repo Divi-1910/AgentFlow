@@ -35,6 +35,10 @@ type RevisionStore interface {
 	List(ctx context.Context, userID, deploymentID string, limit int) ([]deployment.Revision, error)
 }
 
+type revisionPageStore interface {
+	ListPage(ctx context.Context, userID, deploymentID string, request deployment.RevisionPageRequest) (deployment.RevisionPage, error)
+}
+
 type MCPServerCatalog interface {
 	GetEnabledByIDs(ctx context.Context, serverIDs []string) (map[string]mcp.CatalogEntry, error)
 }
@@ -87,6 +91,7 @@ func (s *Service) Publish(ctx context.Context, userID, rootAgentID, idempotencyK
 		return nil, err
 	}
 	var frozen map[string]agentSnapshot
+	bundleRootAgentID := rootAgentID
 	stable := false
 	// Publishing is an optimistic two-pass snapshot, not a locked transaction:
 	// pass one walks and freezes the reachable graph; pass two reloads every
@@ -96,16 +101,39 @@ func (s *Service) Publish(ctx context.Context, userID, rootAgentID, idempotencyK
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		candidate, err := s.walkGraph(ctx, userID, rootAgentID)
+		root, err := s.agents.GetByID(ctx, rootAgentID, userID)
+		if err != nil {
+			return nil, ErrRootAgentNotFound
+		}
+		candidate := map[string]agentSnapshot(nil)
+		candidateRootID := rootAgentID
+		var teamProjection *teamDeploymentProjection
+		if agent.EffectiveResourceKind(root) == agent.ResourceKindAgentTeam {
+			if root.TeamGraph == nil {
+				return nil, fmt.Errorf("%w: team has no graph", ErrInvalidGraph)
+			}
+			candidateRootID = root.TeamGraph.EntryAgentID
+			candidate, err = s.walkTeamGraph(ctx, userID, root)
+			projection := projectTeamGraph(root.TeamGraph)
+			teamProjection = &projection
+		} else {
+			candidate, err = s.walkGraph(ctx, userID, root)
+		}
 		if err != nil {
 			return nil, err
 		}
-		unchanged, err := s.snapshotUnchanged(ctx, userID, candidate)
+		unchanged := false
+		if teamProjection != nil {
+			unchanged, err = s.teamSnapshotUnchanged(ctx, userID, rootAgentID, candidate, *teamProjection)
+		} else {
+			unchanged, err = s.snapshotUnchanged(ctx, userID, candidate)
+		}
 		if err != nil {
 			return nil, err
 		}
 		if unchanged {
 			frozen = candidate
+			bundleRootAgentID = candidateRootID
 			stable = true
 			break
 		}
@@ -131,7 +159,7 @@ func (s *Service) Publish(ctx context.Context, userID, rootAgentID, idempotencyK
 	bundle := &deployment.Bundle{
 		SchemaVersion: deployment.SchemaVersion,
 		DeploymentID:  rootAgentID,
-		RootAgentID:   rootAgentID,
+		RootAgentID:   bundleRootAgentID,
 		PlatformXML:   s.platformXML,
 		Agents:        agents,
 	}
@@ -157,7 +185,7 @@ func (s *Service) Publish(ctx context.Context, userID, rootAgentID, idempotencyK
 	}
 
 	revision, wasExisting, err := s.revisions.Append(ctx, deployment.RevisionInput{
-		UserID: userID, DeploymentID: rootAgentID, RootAgentID: rootAgentID,
+		UserID: userID, DeploymentID: rootAgentID, RootAgentID: bundleRootAgentID,
 		IdempotencyKey: idempotencyKey, ConfigHash: hash,
 		SchemaVersion: deployment.SchemaVersion, BundleJSON: bundleJSON,
 	})
@@ -165,6 +193,117 @@ func (s *Service) Publish(ctx context.Context, userID, rootAgentID, idempotencyK
 		return nil, err
 	}
 	return &Result{Revision: revision, WasExisting: wasExisting}, nil
+}
+
+type teamDeploymentProjection struct {
+	EntryAgentID string
+	NodeIDs      []string
+	Edges        []teamDeploymentEdgeProjection
+}
+
+// teamDeploymentEdgeProjection intentionally contains only behavior that is
+// compiled into a deployment bundle. Canvas attachment ports belong to the
+// Studio presentation and must not make an otherwise stable snapshot appear
+// deployably different.
+type teamDeploymentEdgeProjection struct {
+	SourceAgentID string
+	TargetAgentID string
+	ToolName      string
+	Description   string
+	Instructions  string
+}
+
+func projectTeamGraph(graph *agent.TeamGraph) teamDeploymentProjection {
+	projection := teamDeploymentProjection{EntryAgentID: graph.EntryAgentID}
+	projection.NodeIDs = make([]string, len(graph.Nodes))
+	for i, node := range graph.Nodes {
+		projection.NodeIDs[i] = node.AgentID
+	}
+	sort.Strings(projection.NodeIDs)
+	projection.Edges = make([]teamDeploymentEdgeProjection, len(graph.Edges))
+	for i, edge := range graph.Edges {
+		projection.Edges[i] = teamDeploymentEdgeProjection{
+			SourceAgentID: edge.SourceAgentID,
+			TargetAgentID: edge.TargetAgentID,
+			ToolName:      edge.ToolName,
+			Description:   edge.Description,
+			Instructions:  edge.Instructions,
+		}
+	}
+	sort.Slice(projection.Edges, func(i, j int) bool {
+		left, right := projection.Edges[i], projection.Edges[j]
+		if left.SourceAgentID != right.SourceAgentID {
+			return left.SourceAgentID < right.SourceAgentID
+		}
+		if left.TargetAgentID != right.TargetAgentID {
+			return left.TargetAgentID < right.TargetAgentID
+		}
+		return left.ToolName < right.ToolName
+	})
+	return projection
+}
+
+func (s *Service) walkTeamGraph(ctx context.Context, userID string, team *agent.Agent) (map[string]agentSnapshot, error) {
+	if team == nil || team.TeamGraph == nil || team.TeamGraph.EntryAgentID == "" {
+		return nil, fmt.Errorf("%w: team has no entry agent", ErrInvalidGraph)
+	}
+	frozen := make(map[string]agentSnapshot, len(team.TeamGraph.Nodes))
+	for _, node := range team.TeamGraph.Nodes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		base, err := s.agents.GetByID(ctx, node.AgentID, userID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: team agent %q not found or not owned", ErrInvalidGraph, node.AgentID)
+		}
+		effective, err := agent.EffectiveTeamAgent(team, base, node.AgentID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidGraph, err)
+		}
+		snapshot, err := snapshotAgent(effective)
+		if err != nil {
+			return nil, fmt.Errorf("%w: agent %q: %v", ErrInvalidGraph, node.AgentID, err)
+		}
+		if _, exists := frozen[node.AgentID]; exists {
+			return nil, fmt.Errorf("%w: duplicate team agent %q", ErrInvalidGraph, node.AgentID)
+		}
+		frozen[node.AgentID] = snapshot
+	}
+	if _, exists := frozen[team.TeamGraph.EntryAgentID]; !exists {
+		return nil, fmt.Errorf("%w: entry agent %q is not a team node", ErrInvalidGraph, team.TeamGraph.EntryAgentID)
+	}
+	return frozen, nil
+}
+
+func (s *Service) teamSnapshotUnchanged(
+	ctx context.Context,
+	userID, teamID string,
+	first map[string]agentSnapshot,
+	graphProjection teamDeploymentProjection,
+) (bool, error) {
+	team, err := s.agents.GetByID(ctx, teamID, userID)
+	if err != nil || agent.EffectiveResourceKind(team) != agent.ResourceKindAgentTeam || team.TeamGraph == nil {
+		return false, nil
+	}
+	if !reflect.DeepEqual(projectTeamGraph(team.TeamGraph), graphProjection) {
+		return false, nil
+	}
+	for _, id := range sortedAgentIDs(first) {
+		base, err := s.agents.GetByID(ctx, id, userID)
+		if err != nil {
+			return false, nil
+		}
+		effective, err := agent.EffectiveTeamAgent(team, base, id)
+		if err != nil {
+			return false, nil
+		}
+		converted, err := snapshotAgent(effective)
+		if err != nil || !reflect.DeepEqual(converted.Projection, first[id].Projection) ||
+			!reflect.DeepEqual(converted.Agent.MCPServers, first[id].Agent.MCPServers) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // Restore copies an immutable historical publication into a new, forward-only
@@ -212,6 +351,18 @@ func (s *Service) ListRevisions(ctx context.Context, userID, deploymentID string
 	return s.revisions.List(ctx, userID, deploymentID, limit)
 }
 
+func (s *Service) ListRevisionPage(ctx context.Context, userID, deploymentID string, request deployment.RevisionPageRequest) (deployment.RevisionPage, error) {
+	store, ok := s.revisions.(revisionPageStore)
+	if !ok {
+		if request.BeforeRevision > 0 {
+			return deployment.RevisionPage{}, errors.New("publisher: revision pagination is unavailable")
+		}
+		items, err := s.revisions.List(ctx, userID, deploymentID, request.Limit)
+		return deployment.RevisionPage{Items: items}, err
+	}
+	return store.ListPage(ctx, userID, deploymentID, request)
+}
+
 type agentSnapshot struct {
 	Agent      agent.Agent
 	Projection deployment.BundleAgent
@@ -230,7 +381,7 @@ func snapshotAgent(a *agent.Agent) (agentSnapshot, error) {
 	return agentSnapshot{Agent: copy, Projection: projection}, nil
 }
 
-func (s *Service) walkGraph(ctx context.Context, userID, rootAgentID string) (map[string]agentSnapshot, error) {
+func (s *Service) walkGraph(ctx context.Context, userID string, root *agent.Agent) (map[string]agentSnapshot, error) {
 	const (
 		visiting = 1
 		done     = 2
@@ -252,8 +403,12 @@ func (s *Service) walkGraph(ctx context.Context, userID, rootAgentID string) (ma
 		}
 		state[agentID] = visiting
 		stack = append(stack, agentID)
-		a, err := s.agents.GetByID(ctx, agentID, userID)
-		if err != nil {
+		a := root
+		var err error
+		if parentID != "" || root == nil || root.ID != agentID {
+			a, err = s.agents.GetByID(ctx, agentID, userID)
+		}
+		if err != nil || a == nil {
 			if parentID == "" {
 				return ErrRootAgentNotFound
 			}
@@ -273,7 +428,10 @@ func (s *Service) walkGraph(ctx context.Context, userID, rootAgentID string) (ma
 		state[agentID] = done
 		return nil
 	}
-	if err := visit(rootAgentID, ""); err != nil {
+	if root == nil {
+		return nil, ErrRootAgentNotFound
+	}
+	if err := visit(root.ID, ""); err != nil {
 		return nil, err
 	}
 	return frozen, nil
