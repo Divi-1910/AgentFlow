@@ -1,258 +1,357 @@
+<div align="center">
+
 # AgentFlow
 
-### Build the agent. Connect the team. Watch it work.
+### Design agents. Connect teams. Inspect every step.
 
-AgentFlow is a full-stack platform for designing, running, and deploying tool-using AI agents.
+AgentFlow is a visual platform for building, running, and deploying tool-using AI agents and multi-agent systems.
 
-It brings the parts of an agent system that are usually scattered across scripts and services into one workflow:
+[![CI](https://github.com/Divi-1910/AgentFlow/actions/workflows/ci.yml/badge.svg)](https://github.com/Divi-1910/AgentFlow/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](backend/go.mod)
+[![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](frontend/package.json)
+[![Kubernetes](https://img.shields.io/badge/Runtime-Kubernetes-326CE5?logo=kubernetes&logoColor=white)](deploy/kubernetes/README.md)
 
-- design an agent visually in **Agent Forge**;
-- compose reusable agents into a directed team graph in **Team Forge**;
-- run conversations with streamed model output and execution activity;
-- give agents memory, scratchpad workspaces, built-in tools, and MCP servers;
-- publish an immutable revision and deploy it to Kubernetes.
+</div>
 
-AgentFlow is a personal engineering project and a learning surface for agent-runtime architecture. It is actively evolving, so the repository documentation is the source of truth for the current implementation.
+![AgentFlow landing page](<docs/ss/Screenshot From 2026-11-01 16-25-14.png>)
 
-## Why AgentFlow?
+AgentFlow combines a visual studio, a durable Go execution engine, inspectable chat activity, Model Context Protocol (MCP) connectivity, and managed Kubernetes deployment. You can follow an agent from its model and capabilities to every tool call, delegation, memory mutation, and published runtime revision.
 
-Most agent prototypes stop at a prompt and a model call. AgentFlow treats an agent as an executable system with explicit state, capabilities, delegation, persistence, and deployment boundaries.
+> [!IMPORTANT]
+> AgentFlow is an active pre-1.0 project. The core product works, but public APIs and operational workflows may change before the first stable release.
 
-~~~text
-                         AgentFlow Studio
-       ┌───────────────────────────────────────────┐
-       │ Agent Forge  ·  Team Forge  ·  Chat       │
-       └──────────────────────┬────────────────────┘
-                              │ authenticated API
-                              v
-       ┌───────────────────────────────────────────┐
-       │ Go backend                                 │
-       │ context · execution · delegation · events  │
-       └───────────────┬───────────────┬───────────┘
-                       │               │
-                 MongoDB         LLM / tools / MCP
-                       │               │
-                       v               v
-       ┌───────────────────────────────────────────┐
-       │ Published immutable revision                │
-       │ AgentFlow Runtime in one Kubernetes pod     │
-       └───────────────────────────────────────────┘
-~~~
+## What you can build
 
-## Product surface
+AgentFlow supports individual agents and directed agent teams without forcing every workflow into a supervisor and worker hierarchy.
 
-### Agent Forge
+| Surface | What it does |
+| --- | --- |
+| **Agent Forge** | Configure an agent's identity, instructions, model, tools, MCP servers, memory, and scratchpad |
+| **Team Forge** | Connect reusable agents into a directed delegation graph with explicit caller and callee relationships |
+| **Chat** | Stream model output while preserving a readable transcript and a detailed execution trail |
+| **Memory** | Store durable, scoped facts with revision history and replay-safe mutation identities |
+| **Scratchpad** | Give collaborating agents a shared workspace for plans, findings, and structured artifacts |
+| **Publishing** | Freeze a validated agent or team graph into an immutable revision |
+| **Deployment** | Reconcile one Kubernetes runtime pod and one stable persistent volume per deployment |
 
-Create and configure a standalone agent through a visual canvas and inspector. The agent core exposes the model it uses while tools and MCP servers appear as capabilities around it. Configuration is persisted as an editable resource and can later be published as a revision.
+## Why AgentFlow
 
-### Team Forge
+An agent is more than a prompt and a model call. It is an executable system with state, capabilities, failure boundaries, and operational history.
 
-Compose agents as a directed graph. A team is not restricted to a supervisor/worker hierarchy: an agent can delegate to another agent, and a delegated agent can have its own downstream agents. The graph editor preserves connection direction, visible ports, node positions, and the request path that the runtime will execute.
+AgentFlow keeps those parts explicit:
 
-### Chat and execution activity
+- **Visible configuration**: models, tools, and MCP capabilities appear on the canvas
+- **Directed delegation**: each team edge states which agent can call which agent
+- **Inspectable execution**: chat activity shows model steps, tool inputs and outputs, delegation, memory, scratchpad, and safe failures
+- **Durable state**: MongoDB stores Studio resources and conversations; deployed runtimes keep their own persistent state
+- **Immutable delivery**: publishing creates a new revision instead of modifying history
+- **Stable deployment identity**: newer revisions reuse the deployment's persistent volume
+- **Platform-owned credentials**: provider keys remain on the backend and never enter browser configuration
 
-Start conversations with an agent or team and receive model output incrementally. The chat surface keeps the answer readable while a compact execution receipt and an expandable activity view explain what happened: model calls, tool inputs and outputs, delegation, memory, scratchpad, MCP calls, waiting, and safe failures.
+## Product tour
 
-### Memory and scratchpad
+The Studio uses one visual language across authentication, workspace management, agent design, team orchestration, and chat.
 
-Agents can persist durable memory revisions and use a scoped scratchpad for working documents. These are runtime capabilities with explicit scopes and replay-aware mutation identities rather than hidden process-local variables.
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/ss/Screenshot From 2026-11-01 16-25-14.png" alt="AgentFlow landing page" />
+      <p align="center"><strong>Product entry</strong></p>
+    </td>
+    <td width="50%">
+      <img src="docs/ss/Screenshot From 2026-11-01 16-25-35.png" alt="AgentFlow login screen" />
+      <p align="center"><strong>Authentication</strong></p>
+    </td>
+  </tr>
+</table>
 
-### MCP connectivity
+The remaining screenshots under [`docs/ss`](docs/ss) cover the workspace, Agent Library, Team Forge, chat, and execution activity. Sanitize account details before publishing those screenshots outside a development repository.
 
-AgentFlow communicates with independently running MCP servers over Streamable HTTP. The platform stores the MCP catalog and freezes the selected deployment URLs into published configuration; it does not bundle or supervise MCP workloads.
+## Run AgentFlow with Docker Compose
 
-The repository includes a local development harness for:
-
-- Sequential Thinking;
-- Fetch;
-- Python Sandbox;
-- Math & Utilities;
-- Open-Meteo.
-
-See [`mcp_server/README.md`](mcp_server/README.md) for local setup, ports, MongoDB catalog entries, and the safety limits of the unauthenticated development servers.
-
-### Publishing and Kubernetes deployment
-
-Publishing walks the reachable agent or team graph, validates the configuration, and creates an immutable revision. The managed deployment layer runs one AgentFlow Runtime pod per deployed agent or team, keeps the persistent volume stable across revisions, and exposes deployment status and runtime proxy APIs through the backend.
-
-The Kubernetes manifests are a deployable baseline, not a ready-made public cluster. Images, secrets, TLS, storage, MCP service URLs, and cluster-specific ingress configuration must be supplied by the operator. Start with [`deploy/kubernetes/README.md`](deploy/kubernetes/README.md).
-
-## Repository map
-
-~~~text
-backend/       Go Studio API, execution engine, persistence, publisher, and deployment controller
-frontend/      React + Vite Studio application
-mcp_server/    Local-only independent MCP server harness
-deploy/        Kubernetes manifests and deployment contract
-docs/          Detailed backend and frontend architecture guides
-~~~
-
-The most useful deep dives are:
-
-- [`docs/BACKEND_ARCHITECTURE_GUIDE.md`](docs/BACKEND_ARCHITECTURE_GUIDE.md) — backend layers, control flow, state, failure boundaries, and deployment decisions;
-- [`docs/FRONTEND_ARCHITECTURE_GUIDE.md`](docs/FRONTEND_ARCHITECTURE_GUIDE.md) — frontend boundaries, API client, authentication, routing, and state ownership;
-- [`frontend/README.md`](frontend/README.md) — frontend-specific development commands and API configuration;
-- [`mcp_server/README.md`](mcp_server/README.md) — local MCP process control and catalog configuration;
-- [`deploy/kubernetes/README.md`](deploy/kubernetes/README.md) — managed deployment prerequisites and Kubernetes ownership boundaries.
-
-## Local development
+Docker Compose starts the Studio frontend, Go backend, MongoDB, and Redis. It preserves MongoDB, memory, scratchpad, and Redis data across container restarts.
 
 ### Prerequisites
 
-Install the tools used by the repository:
+Install Docker Engine with the Compose plugin. Add at least one provider credential if you want to execute model calls.
 
-- Go compatible with [`backend/go.mod`](backend/go.mod) (currently Go 1.25);
-- Node.js and npm for the Vite frontend;
-- MongoDB, normally available at `mongodb://localhost:27017`;
-- `rg` (ripgrep), required by the memory and scratchpad services;
-- Redis is optional for local development. If it is unavailable, the backend disables the Redis-backed tool deduplication cache and continues;
-- `mongosh` if you want to inspect or manually populate local catalog data.
+### 1. Create local configuration
 
-The backend also needs a JWT signing secret and at least one configured model provider for live model calls. Provider credentials are read by the backend process, never by the browser:
+Copy the environment template:
 
-~~~dotenv
-MONGO_URL=mongodb://localhost:27017
-JWT_SECRET=replace-with-a-long-local-development-secret
-REDIS_URL=redis://localhost:6379
+```bash
+cp .env.example .env
+```
 
-# Configure only the providers you intend to use.
-OPENAI_API_KEY=...
-ANTHROPIC_API_KEY=...
-NVIDIA_API_KEY=...
-~~~
+Generate a signing secret:
 
-Do not commit a real `.env` file or provider credentials. The backend also supports `MEMORY_ROOT`, `SCRATCHPAD_ROOT`, `RG_PATH`, and `PORT`; unset values use the local defaults described in the source and architecture guide.
+```bash
+openssl rand -hex 32
+```
 
-### Start the backend
+Set the generated value as `JWT_SECRET` in `.env`. Add the provider keys that AgentFlow should own.
 
-From the repository root:
+### 2. Start the stack
 
-~~~bash
+Build and start every service:
+
+```bash
+docker compose up --build
+```
+
+Open [http://localhost:5174](http://localhost:5174). The backend remains available at [http://localhost:9090/health](http://localhost:9090/health) for direct health checks.
+
+### 3. Stop the stack
+
+Stop the containers without deleting stored data:
+
+```bash
+docker compose down
+```
+
+Delete the containers and all Compose-managed data only when you want a fresh local environment:
+
+```bash
+docker compose down --volumes
+```
+
+> [!NOTE]
+> The model and MCP catalogs are operator-owned MongoDB data. Provider keys make a provider executable, but they do not insert model catalog records. Populate the local catalogs before configuring an agent. The MCP development entries and their MongoDB commands are documented in [`mcp_servers/README.md`](mcp_servers/README.md).
+
+### Compose environment variables
+
+The frontend receives none of these secrets. Compose injects provider credentials only into the backend container.
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `JWT_SECRET` | Yes | Signs local AgentFlow sessions |
+| `OPENAI_API_KEY` | No | Enables OpenAI models registered in the Studio catalog |
+| `ANTHROPIC_API_KEY` | No | Enables Anthropic models registered in the Studio catalog |
+| `NVIDIA_API_KEY` | No | Enables NVIDIA-hosted models registered in the Studio catalog |
+| `TAVILY_API_KEY` | No | Enables the built-in web search tool |
+| `AGENTFLOW_WEB_PORT` | No | Changes the host frontend port from `5174` |
+| `AGENTFLOW_API_PORT` | No | Changes the host backend port from `9090` |
+
+Managed Kubernetes deployment stays disabled in the Compose stack. Use the Kubernetes installation path when you want AgentFlow to create deployed runtime pods.
+
+## Run the development servers
+
+Use the host development workflow when you want Vite hot module replacement or direct access to local MCP processes.
+
+### Backend
+
+Install Go 1.25, MongoDB, and `rg` from ripgrep. Then create `backend/.env` with `MONGO_URL`, `JWT_SECRET`, and any provider credentials.
+
+Start the API:
+
+```bash
 cd backend
 go run .
-~~~
+```
 
-The Studio API listens on `http://localhost:9090` by default. Check that it is alive:
+The API listens on `http://localhost:9090` by default.
 
-~~~bash
-curl http://localhost:9090/health
-~~~
+### Frontend
 
-The backend loads `.env` from its current working directory, so place local development configuration in `backend/.env` when using the command above.
+Install Node.js and start Vite:
 
-### Start the frontend
-
-In a second terminal:
-
-~~~bash
+```bash
 cd frontend
 npm install
 npm run dev
-~~~
+```
 
-Open the Vite URL shown in the terminal. In development, requests to `/api` are proxied to `http://localhost:9090`, keeping the browser on one origin.
+Vite proxies `/api` to `http://localhost:9090`. Override the development target when the backend uses another address:
 
-Useful frontend commands:
-
-~~~bash
-npm test          # Vitest suite
-npm run lint      # ESLint
-npm run build     # production bundle
-npm run preview   # serve the production bundle locally
-~~~
-
-To use another backend address:
-
-~~~bash
+```bash
 VITE_DEV_API_TARGET=http://localhost:8080 npm run dev
-~~~
+```
 
-### Optional: start the local MCP servers
+## Connect local MCP servers
 
-The MCP harness is intentionally separate from AgentFlow. It clones and prepares the upstream projects, then starts each server as its own local process:
+AgentFlow connects to MCP servers but does not own or supervise them. The local harness runs five independent development servers:
 
-~~~bash
-./mcp_server/setup.sh
-./mcp_server/start-all.sh
-./mcp_server/status.sh
-~~~
+- Sequential Thinking
+- Fetch
+- Python Sandbox
+- Math & Utilities
+- Open-Meteo
 
-Stop only the processes started by the harness:
+Prepare and start them from the repository root:
 
-~~~bash
-./mcp_server/stop-all.sh
-~~~
+```bash
+./mcp_servers/setup.sh
+./mcp_servers/start-all.sh
+./mcp_servers/status.sh
+```
 
-The local MCP endpoints bind to loopback and have no authentication. Do not expose them through a public interface or tunnel. After starting them, populate the local MongoDB MCP catalog using the documented entries in [`mcp_server/README.md`](mcp_server/README.md).
+Stop only the processes created by the harness:
 
-## Backend architecture in one page
+```bash
+./mcp_servers/stop-all.sh
+```
 
-The Studio request path is deliberately split into responsibilities:
+These endpoints bind to loopback without authentication. Do not expose them through a public interface or tunnel. Read [`mcp_servers/README.md`](mcp_servers/README.md) for ports, upstream revisions, MongoDB catalog entries, and sandbox limits.
 
-~~~text
+## Understand the architecture
+
+AgentFlow separates editable Studio resources from immutable deployed revisions. This boundary lets you continue editing an agent without changing a running deployment.
+
+```mermaid
+flowchart TB
+    UI[React Studio<br/>Agent Forge, Team Forge, Chat]
+    API[Go Studio API<br/>Auth, resources, publication, deployment]
+    DB[(MongoDB<br/>Studio and conversation state)]
+    REDIS[(Redis<br/>Tool-call deduplication)]
+    PROVIDERS[LLM providers<br/>Built-in tools and MCP]
+    REV[Immutable published revision]
+    CONTROLLER[Kubernetes deployment controller]
+    RUNTIME[AgentFlow Runtime pod]
+    PVC[(Stable persistent volume)]
+
+    UI -->|Authenticated /api| API
+    API --> DB
+    API --> REDIS
+    API --> PROVIDERS
+    API --> REV
+    REV --> CONTROLLER
+    CONTROLLER --> RUNTIME
+    RUNTIME --> PVC
+    RUNTIME --> PROVIDERS
+```
+
+### Studio execution path
+
+The runtime owns control flow. A strategy decides the next action, while the runtime executes that action and records the result.
+
+```text
 HTTP request
   -> authentication and product handler
-  -> run creation and execution preparation
+  -> thread, message, and run persistence
   -> dispatcher and agent runtime loop
-  -> LLM provider, built-in tools, MCP, or delegated agent
-  -> checkpoints, streamed events, and persisted messages
-~~~
+  -> model, tool, MCP server, or delegated agent
+  -> checkpoints and persisted execution events
+  -> Server-Sent Events stream and final message
+```
 
-The execution engine is action-driven. A model decision becomes an explicit action such as `tool`, `delegate`, `respond`, or `plan_update`. The runtime owns the loop; the selected strategy owns decision logic. This keeps ReAct, network-style multi-agent delegation, and supervisor-style coordination on the same execution contract.
+The action contract supports `tool`, `delegate`, `respond`, and `plan_update`. ReAct agents and multi-agent delegation use the same runtime contract.
 
-The backend stores editable Studio resources and conversation state in MongoDB. A published revision is a validated, immutable snapshot with its own unique revision identity, delivered to the standalone runtime. The runtime uses local SQLite/filesystem state for its managed memory and scratchpad boundary.
+### Publishing and deployment
 
-## API surface
+Publishing walks the reachable graph and validates every referenced model, tool, agent, and MCP server. It then stores an immutable configuration bundle with a unique revision identity.
 
-The authenticated product API currently covers:
+Managed deployment uses a forward-only model:
 
-- signup, login, session restoration, and local session logout;
-- workspace overview, platform capabilities, LLM catalog, tools, and MCP catalog;
-- agent and agent-team CRUD;
-- agent/team publication, revision listing, bundle export, and forward restore;
-- conversations, messages, runs, streamed run events, cancellation, and resume;
-- managed deployment list, deploy, undeploy, status, and runtime proxy routes when managed Kubernetes mode is enabled.
+1. Publish the current editable resource
+2. Select a revision to deploy
+3. Create a new desired deployment generation
+4. Reconcile one runtime pod for the agent or team
+5. Preserve the deployment's persistent volume across revisions
+6. Expose status and runtime APIs through the authenticated backend proxy
 
-The Go router is the authoritative API contract. The frontend uses the shared client in `frontend/src/api/client.js` so authentication, JSON handling, `401` session invalidation, and network failures remain consistent across product pages.
+Deploying an older configuration does not mutate history. AgentFlow creates a new revision from the older configuration.
 
-## Kubernetes deployment
+## Explore the API surface
 
-The managed deployment path is designed around an immutable revision and a stable persistence boundary:
+The authenticated product API covers the complete Studio execution path:
 
-1. The Studio publishes a validated revision.
-2. The deployment controller reconciles the desired state.
-3. Kubernetes runs one runtime pod for the selected agent or team.
-4. The runtime receives the frozen configuration and AgentFlow-owned credentials.
-5. The persistent volume remains attached to the deployment across newer revisions.
-6. The backend exposes deployment status and proxies authenticated runtime requests.
+- authentication and session restoration
+- workspace overview and platform capabilities
+- model, tool, and MCP catalogs
+- agent and agent-team create, read, update, and delete operations
+- publication, revision history, bundle export, and forward restore
+- threads, messages, runs, cancellation, and resume
+- persisted run events through Server-Sent Events (SSE)
+- managed deployment status, deploy, undeploy, and runtime proxy routes
 
-Before applying the manifests, read the complete deployment contract and provide immutable image digests, Kubernetes secrets, artifact TLS, a compatible StorageClass, and the independently deployed MCP service URLs:
+The router in [`backend/main.go`](backend/main.go) is the current API contract. The frontend centralizes authentication, JSON handling, streaming, and `401` invalidation in [`frontend/src/api/client.js`](frontend/src/api/client.js).
 
-~~~bash
+## Repository map
+
+The repository keeps product, runtime, and infrastructure concerns separate:
+
+```text
+backend/         Studio API, execution engine, persistence, publisher, controller
+frontend/        React Studio and production Nginx image
+mcp_servers/     Local-only independent MCP development harness
+deploy/          Kubernetes manifests and deployment contract
+docs/            Backend and frontend architecture guides and screenshots
+scripts/ci/      Shared quality gates for local CI, Jenkins, and GitHub Actions
+```
+
+Read the deeper guides when you need implementation-level detail:
+
+- [`docs/BACKEND_ARCHITECTURE_GUIDE.md`](docs/BACKEND_ARCHITECTURE_GUIDE.md): backend layers, execution flow, persistence, failure boundaries, and deployment decisions
+- [`docs/FRONTEND_ARCHITECTURE_GUIDE.md`](docs/FRONTEND_ARCHITECTURE_GUIDE.md): frontend boundaries, routing, API access, state ownership, and UI architecture
+- [`frontend/README.md`](frontend/README.md): frontend development and API configuration
+- [`mcp_servers/README.md`](mcp_servers/README.md): MCP process control and local catalog setup
+- [`deploy/kubernetes/README.md`](deploy/kubernetes/README.md): Kubernetes prerequisites, trust boundaries, and operational contract
+
+## Run the quality gates
+
+The repository uses the same scripts in local automation, Jenkins, and GitHub Actions.
+
+Run the frontend checks:
+
+```bash
+bash scripts/ci/frontend.sh
+```
+
+Run backend checks against a disposable MongoDB test database:
+
+```bash
+MONGO_TEST_URI=mongodb://127.0.0.1:27017 \
+  bash scripts/ci/backend.sh
+```
+
+The backend script runs formatting verification, `go mod tidy -diff`, `go vet`, the full Go test suite, focused race detection, and a complete build. The frontend script installs the locked dependency graph, runs ESLint and Vitest, then creates the production bundle.
+
+## CI and release delivery
+
+AgentFlow includes two continuous integration paths:
+
+- [GitHub Actions CI](.github/workflows/ci.yml) checks the frontend, backend, race-sensitive packages, and container builds
+- `Jenkinsfile.frontend` and `Jenkinsfile.backend` expose equivalent independent Jenkins jobs
+
+The [release workflow](.github/workflows/release.yml) runs for version tags or manual dispatch. It uploads the frontend distribution and publishes Studio and Runtime images to GitHub Container Registry (GHCR) with source commit and version tags.
+
+Release delivery does not modify a Kubernetes cluster. Operators retain control of cluster credentials, immutable image digests, storage classes, ingress, Transport Layer Security (TLS), and provider secrets.
+
+## Deploy to Kubernetes
+
+The manifests under [`deploy/kubernetes`](deploy/kubernetes) define the baseline Studio and runtime trust boundaries. They are not a universal cluster installer.
+
+Before deployment, provide:
+
+- immutable Studio and Runtime image digests
+- AgentFlow-owned provider credentials in Kubernetes secrets
+- artifact delivery TLS
+- a compatible `ReadWriteOnce` storage class
+- ingress and Domain Name System (DNS) configuration
+- independently deployed MCP service URLs
+
+Apply the configured manifests:
+
+```bash
 kubectl apply -k deploy/kubernetes
-~~~
+```
 
-This is an operator workflow, not required for ordinary local Studio development.
+Read [`deploy/kubernetes/README.md`](deploy/kubernetes/README.md) before applying them to a cluster.
 
-## Project status
+## Current project status
 
-AgentFlow is an active, evolving project. The core Studio workflow, agent/team execution model, chat activity experience, MCP integration, publication path, and managed Kubernetes deployment layer are implemented and documented. Interfaces and operational tooling may continue to change as the product is refined.
+AgentFlow currently implements the core Studio workflow, agent and team execution, chat activity, memory, scratchpad, MCP connectivity, immutable publication, and managed Kubernetes deployment. The next public-product milestones include deployment management in the Studio, one maintained model-catalog bootstrap path, browser-level end-to-end tests, security hardening, and stable release documentation.
 
-The repository currently does not declare a license. If you intend to accept external contributions or permit reuse, add an explicit license and contribution policy before presenting it as an open-source project.
+## Contributing
 
-## Engineering notes
+External contribution guidelines and community policies are not published yet. Until they are added, open an issue before investing in a large change so the proposed direction can be discussed first.
 
-AgentFlow favors explicit boundaries over a single opaque “agent” abstraction:
+## Security
 
-- the browser never connects directly to MongoDB or receives provider secrets;
-- user-authored configuration is distinct from immutable published revisions;
-- MCP servers are independent workloads, not hidden dependencies inside an agent pod;
-- execution events are persisted and streamed so the UI can explain what the runtime did;
-- retry and replay identities are designed around durable run and tool-call identifiers;
-- deployment changes create forward revisions rather than mutating historical revisions.
+Do not commit `.env` files, provider keys, deployment tokens, or database exports. The local MCP servers are unauthenticated development processes and must remain on a trusted machine.
 
-Those decisions are explained with evidence, alternatives, and failure analysis in the architecture guides.
+A dedicated security policy and private vulnerability-reporting channel remain planned before the first public release.
 
 ## License
 
-No license has been declared yet. All rights remain with the repository owner unless a license is added.
+No license has been declared. All rights remain with the repository owner until an explicit license is added.

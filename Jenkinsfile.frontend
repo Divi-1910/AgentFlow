@@ -1,0 +1,37 @@
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        disableConcurrentBuilds(abortPrevious: true)
+        skipDefaultCheckout(true)
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Frontend quality') {
+            steps {
+                sh '''
+                    docker run --rm \
+                      --user "$(id -u):$(id -g)" \
+                      --env HOME=/tmp/jenkins-home \
+                      --volume "$WORKSPACE:/workspace" \
+                      --workdir /workspace \
+                      node:24.15.0-bookworm \
+                      bash scripts/ci/frontend.sh
+                '''
+            }
+        }
+
+        stage('Archive frontend') {
+            steps {
+                archiveArtifacts artifacts: 'frontend/dist/**', fingerprint: true
+            }
+        }
+    }
+}

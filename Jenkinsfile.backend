@@ -1,0 +1,90 @@
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        disableConcurrentBuilds(abortPrevious: true)
+        skipDefaultCheckout(true)
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Start MongoDB') {
+            steps {
+                sh '''
+                    job_id="$(printf '%s' "$JOB_BASE_NAME" | tr -c '[:alnum:]_.-' '-' | cut -c1-30)"
+                    ci_id="agentflow-${job_id}-${BUILD_NUMBER}"
+
+                    docker network create "$ci_id"
+                    docker run --detach --rm \
+                      --name "${ci_id}-mongo" \
+                      --network "$ci_id" \
+                      --ulimit nofile=64000:64000 \
+                      mongo:7.0.45
+
+                    attempt=1
+                    until docker exec "${ci_id}-mongo" \
+                      mongosh --quiet --eval 'if (!db.runCommand({ ping: 1 }).ok) quit(1)'
+                    do
+                      if [ "$attempt" -ge 30 ]; then
+                        echo "MongoDB did not become ready in time." >&2
+                        exit 1
+                      fi
+                      attempt=$((attempt + 1))
+                      sleep 2
+                    done
+                '''
+            }
+        }
+
+        stage('Backend quality') {
+            steps {
+                sh '''
+                    job_id="$(printf '%s' "$JOB_BASE_NAME" | tr -c '[:alnum:]_.-' '-' | cut -c1-30)"
+                    ci_id="agentflow-${job_id}-${BUILD_NUMBER}"
+
+                    docker run --rm \
+                      --network "$ci_id" \
+                      --env MONGO_TEST_URI="mongodb://${ci_id}-mongo:27017" \
+                      --volume agentflow-go-mod-cache:/go/pkg/mod \
+                      --volume agentflow-go-build-cache:/root/.cache/go-build \
+                      --volume "$WORKSPACE:/workspace" \
+                      --workdir /workspace \
+                      golang:1.25-bookworm \
+                      bash scripts/ci/backend.sh
+                '''
+            }
+        }
+
+        stage('Container builds') {
+            steps {
+                sh '''
+                    CI_IMAGE_PREFIX=agentflow-ci \
+                    CI_IMAGE_TAG="jenkins-${BUILD_NUMBER}" \
+                    bash scripts/ci/build-images.sh
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            sh '''
+                job_id="$(printf '%s' "$JOB_BASE_NAME" | tr -c '[:alnum:]_.-' '-' | cut -c1-30)"
+                ci_id="agentflow-${job_id}-${BUILD_NUMBER}"
+
+                docker rm --force "${ci_id}-mongo" >/dev/null 2>&1 || true
+                docker network rm "$ci_id" >/dev/null 2>&1 || true
+                docker image rm \
+                  "agentflow-ci-backend:jenkins-${BUILD_NUMBER}" \
+                  "agentflow-ci-runtime:jenkins-${BUILD_NUMBER}" \
+                  >/dev/null 2>&1 || true
+            '''
+        }
+    }
+}

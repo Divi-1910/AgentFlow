@@ -17,7 +17,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ripgrep \
+    && apt-get install -y --no-install-recommends ca-certificates curl ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 agentflow \
     && useradd --uid 10001 --gid 10001 --no-create-home \
