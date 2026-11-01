@@ -9,7 +9,7 @@ services:
     healthcheck:
       test:
         - CMD-SHELL
-        - mongosh --quiet --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)'
+        - "mongosh --quiet --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)'"
       interval: 5s
       timeout: 5s
       retries: 20

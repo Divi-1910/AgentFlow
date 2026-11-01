@@ -17,22 +17,19 @@ AgentFlow is a visual platform for building, running, and deploying tool-using A
 
 AgentFlow combines a visual studio, a durable Go execution engine, inspectable chat activity, Model Context Protocol (MCP) connectivity, and managed Kubernetes deployment. You can follow an agent from its model and capabilities to every tool call, delegation, memory mutation, and published runtime revision.
 
-> [!IMPORTANT]
-> AgentFlow is an active pre-1.0 project. The core product works, but public APIs and operational workflows may change before the first stable release.
-
 ## What you can build
 
 AgentFlow supports individual agents and directed agent teams without forcing every workflow into a supervisor and worker hierarchy.
 
-| Surface | What it does |
-| --- | --- |
-| **Agent Forge** | Configure an agent's identity, instructions, model, tools, MCP servers, memory, and scratchpad |
-| **Team Forge** | Connect reusable agents into a directed delegation graph with explicit caller and callee relationships |
-| **Chat** | Stream model output while preserving a readable transcript and a detailed execution trail |
-| **Memory** | Store durable, scoped facts with revision history and replay-safe mutation identities |
-| **Scratchpad** | Give collaborating agents a shared workspace for plans, findings, and structured artifacts |
-| **Publishing** | Freeze a validated agent or team graph into an immutable revision |
-| **Deployment** | Reconcile one Kubernetes runtime pod and one stable persistent volume per deployment |
+| Surface         | What it does                                                                                           |
+| --------------- | ------------------------------------------------------------------------------------------------------ |
+| **Agent Forge** | Configure an agent's identity, instructions, model, tools, MCP servers, memory, and scratchpad         |
+| **Team Forge**  | Connect reusable agents into a directed delegation graph with explicit caller and callee relationships |
+| **Chat**        | Stream model output while preserving a readable transcript and a detailed execution trail              |
+| **Memory**      | Store durable, scoped facts with revision history and replay-safe mutation identities                  |
+| **Scratchpad**  | Give collaborating agents a shared workspace for plans, findings, and structured artifacts             |
+| **Publishing**  | Freeze a validated agent or team graph into an immutable revision                                      |
+| **Deployment**  | Reconcile one Kubernetes runtime pod and one stable persistent volume per deployment                   |
 
 ## Why AgentFlow
 
@@ -63,9 +60,27 @@ The Studio uses one visual language across authentication, workspace management,
       <p align="center"><strong>Authentication</strong></p>
     </td>
   </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/ss/agent-library.png" alt="AgentFlow Agent Library visual canvas" />
+      <p align="center"><strong>Agent Library</strong></p>
+    </td>
+    <td width="50%">
+      <img src="docs/ss/team-forge.png" alt="AgentFlow Team Forge delegation graph" />
+      <p align="center"><strong>Team Forge</strong></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/ss/chat.png" alt="AgentFlow streaming chat workspace" />
+      <p align="center"><strong>Streaming chat</strong></p>
+    </td>
+    <td width="50%">
+      <img src="docs/ss/chat-activity.png" alt="AgentFlow inspectable execution activity" />
+      <p align="center"><strong>Execution activity</strong></p>
+    </td>
+  </tr>
 </table>
-
-The remaining screenshots under [`docs/ss`](docs/ss) cover the workspace, Agent Library, Team Forge, chat, and execution activity. Sanitize account details before publishing those screenshots outside a development repository.
 
 ## Run AgentFlow with Docker Compose
 
@@ -115,22 +130,19 @@ Delete the containers and all Compose-managed data only when you want a fresh lo
 docker compose down --volumes
 ```
 
-> [!NOTE]
-> The model and MCP catalogs are operator-owned MongoDB data. Provider keys make a provider executable, but they do not insert model catalog records. Populate the local catalogs before configuring an agent. The MCP development entries and their MongoDB commands are documented in [`mcp_servers/README.md`](mcp_servers/README.md).
-
 ### Compose environment variables
 
 The frontend receives none of these secrets. Compose injects provider credentials only into the backend container.
 
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `JWT_SECRET` | Yes | Signs local AgentFlow sessions |
-| `OPENAI_API_KEY` | No | Enables OpenAI models registered in the Studio catalog |
-| `ANTHROPIC_API_KEY` | No | Enables Anthropic models registered in the Studio catalog |
-| `NVIDIA_API_KEY` | No | Enables NVIDIA-hosted models registered in the Studio catalog |
-| `TAVILY_API_KEY` | No | Enables the built-in web search tool |
-| `AGENTFLOW_WEB_PORT` | No | Changes the host frontend port from `5174` |
-| `AGENTFLOW_API_PORT` | No | Changes the host backend port from `9090` |
+| Variable             | Required | Purpose                                                       |
+| -------------------- | -------- | ------------------------------------------------------------- |
+| `JWT_SECRET`         | Yes      | Signs local AgentFlow sessions                                |
+| `OPENAI_API_KEY`     | No       | Enables OpenAI models registered in the Studio catalog        |
+| `ANTHROPIC_API_KEY`  | No       | Enables Anthropic models registered in the Studio catalog     |
+| `NVIDIA_API_KEY`     | No       | Enables NVIDIA-hosted models registered in the Studio catalog |
+| `TAVILY_API_KEY`     | No       | Enables the built-in web search tool                          |
+| `AGENTFLOW_WEB_PORT` | No       | Changes the host frontend port from `5174`                    |
+| `AGENTFLOW_API_PORT` | No       | Changes the host backend port from `9090`                     |
 
 Managed Kubernetes deployment stays disabled in the Compose stack. Use the Kubernetes installation path when you want AgentFlow to create deployed runtime pods.
 
@@ -176,22 +188,6 @@ AgentFlow connects to MCP servers but does not own or supervise them. The local 
 - Python Sandbox
 - Math & Utilities
 - Open-Meteo
-
-Prepare and start them from the repository root:
-
-```bash
-./mcp_servers/setup.sh
-./mcp_servers/start-all.sh
-./mcp_servers/status.sh
-```
-
-Stop only the processes created by the harness:
-
-```bash
-./mcp_servers/stop-all.sh
-```
-
-These endpoints bind to loopback without authentication. Do not expose them through a public interface or tunnel. Read [`mcp_servers/README.md`](mcp_servers/README.md) for ports, upstream revisions, MongoDB catalog entries, and sandbox limits.
 
 ## Understand the architecture
 
@@ -306,8 +302,6 @@ MONGO_TEST_URI=mongodb://127.0.0.1:27017 \
 
 The backend script runs formatting verification, `go mod tidy -diff`, `go vet`, the full Go test suite, focused race detection, and a complete build. The frontend script installs the locked dependency graph, runs ESLint and Vitest, then creates the production bundle.
 
-## CI and release delivery
-
 AgentFlow includes two continuous integration paths:
 
 - [GitHub Actions CI](.github/workflows/ci.yml) checks the frontend, backend, race-sensitive packages, and container builds
@@ -341,16 +335,6 @@ Read [`deploy/kubernetes/README.md`](deploy/kubernetes/README.md) before applyin
 ## Current project status
 
 AgentFlow currently implements the core Studio workflow, agent and team execution, chat activity, memory, scratchpad, MCP connectivity, immutable publication, and managed Kubernetes deployment. The next public-product milestones include deployment management in the Studio, one maintained model-catalog bootstrap path, browser-level end-to-end tests, security hardening, and stable release documentation.
-
-## Contributing
-
-External contribution guidelines and community policies are not published yet. Until they are added, open an issue before investing in a large change so the proposed direction can be discussed first.
-
-## Security
-
-Do not commit `.env` files, provider keys, deployment tokens, or database exports. The local MCP servers are unauthenticated development processes and must remain on a trusted machine.
-
-A dedicated security policy and private vulnerability-reporting channel remain planned before the first public release.
 
 ## License
 

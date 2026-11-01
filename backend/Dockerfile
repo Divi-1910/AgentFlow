@@ -21,7 +21,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 agentflow \
     && useradd --uid 10001 --gid 10001 --no-create-home \
-        --home-dir /nonexistent --shell /usr/sbin/nologin agentflow
+        --home-dir /nonexistent --shell /usr/sbin/nologin agentflow \
+    && mkdir -p /var/lib/agentflow \
+    && chown 10001:10001 /var/lib/agentflow
 
 WORKDIR /app
 COPY --from=build --chown=10001:10001 /out/agentflow-backend /usr/local/bin/agentflow-backend
