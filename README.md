@@ -334,7 +334,7 @@ Read [`deploy/kubernetes/README.md`](deploy/kubernetes/README.md) before applyin
 
 ## Current project status
 
-AgentFlow currently implements the core Studio workflow, agent and team execution, chat activity, memory, scratchpad, MCP connectivity, immutable publication, and managed Kubernetes deployment. The next public-product milestones include deployment management in the Studio, one maintained model-catalog bootstrap path, browser-level end-to-end tests, security hardening, and stable release documentation.
+AgentFlow currently implements the core Studio workflow, reusable Agent and Team templates, agent and team execution, chat activity, memory, scratchpad, MCP connectivity, immutable publication, and managed Kubernetes deployment management in the Studio. The next public-product milestones include a maintained model-catalog bootstrap path, browser-level end-to-end tests, security hardening, and stable release documentation.
 
 ## License
 
