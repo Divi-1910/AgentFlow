@@ -57,6 +57,7 @@ export default function OrchestrationChatPage() {
       <motion.div className="chat-stage" layout transition={{ layout: { duration: reduceMotion ? 0 : 0.42, ease: [0.22, 1, 0.36, 1] } }}>
         <ChatTranscript
           actionError={chat.actionError}
+          backgroundJobs={chat.backgroundJobs}
           latestRun={chat.latestRun}
           messages={chat.messages}
           onCancel={chat.cancelRun}

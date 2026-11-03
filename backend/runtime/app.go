@@ -187,6 +187,7 @@ func newRuntimeApp(parent context.Context, cfg appConfig) (_ *runtimeApp, err er
 	executions := handlers.NewExecutionRegistryWithTaskEvents(runtimeCtx, taskEvents)
 	messageHandler := handlers.NewMessageHandler(agentReader, threadRepo, messageRepo, disp, runRepo, executions)
 	runHandler := handlers.NewRunHandler(agentReader, threadRepo, messageRepo, runRepo, disp, toolRegistry, capabilities, executions)
+	jobHandler := handlers.NewJobHandler(threadRepo, jobRepo)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", app.health)
@@ -199,6 +200,7 @@ func newRuntimeApp(parent context.Context, cfg appConfig) (_ *runtimeApp, err er
 	protected.HandleFunc("POST /v1/threads/{id}/messages", messageHandler.Send)
 	protected.HandleFunc("GET /v1/threads/{id}/messages", messageHandler.List)
 	protected.HandleFunc("GET /v1/threads/{id}/runs", runHandler.ListByThread)
+	protected.HandleFunc("GET /v1/threads/{id}/jobs", jobHandler.ListByThread)
 	protected.HandleFunc("GET /v1/runs/{id}", runHandler.GetRun)
 	protected.HandleFunc("GET /v1/runs/{id}/events", runHandler.StreamEvents)
 	protected.HandleFunc("POST /v1/runs/{id}/resume", runHandler.ResumeRun)

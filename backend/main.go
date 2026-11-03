@@ -416,6 +416,7 @@ func main() {
 		capabilities,
 		executions,
 	)
+	jobHandler := handlers.NewJobHandler(threadRepo, jobRepo)
 
 	mux.HandleFunc("POST /api/auth/signup", authHandler.SignUp)
 	mux.HandleFunc("POST /api/auth/login", authHandler.Login)
@@ -454,6 +455,7 @@ func main() {
 	mux.HandleFunc("POST /api/threads/{id}/messages", middleware.RequireAuth(messageHandler.Send))
 	mux.HandleFunc("GET /api/threads/{id}/messages", middleware.RequireAuth(messageHandler.List))
 	mux.HandleFunc("GET /api/threads/{id}/runs", middleware.RequireAuth(runHandler.ListByThread))
+	mux.HandleFunc("GET /api/threads/{id}/jobs", middleware.RequireAuth(jobHandler.ListByThread))
 	mux.HandleFunc("GET /api/runs", middleware.RequireAuth(runHandler.List))
 	mux.HandleFunc("GET /api/runs/{id}", middleware.RequireAuth(runHandler.GetRun))
 	mux.HandleFunc("GET /api/runs/{id}/events", middleware.RequireAuth(runHandler.StreamEvents))

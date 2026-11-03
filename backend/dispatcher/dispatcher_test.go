@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -280,6 +281,85 @@ func TestRunPreparerResolvesTeamEntryAndOutgoingEdges(t *testing.T) {
 	}
 	if len(entry.Delegates) != 0 {
 		t.Fatalf("standalone entry was mutated: %+v", entry.Delegates)
+	}
+}
+
+func TestRunPreparerAllowsTeamMemberCallbackOnTeamOwnedThread(t *testing.T) {
+	t.Parallel()
+
+	teamID := "team-1"
+	entryID := "entry-1"
+	team := &agent.Agent{
+		ID: teamID, Kind: agent.ResourceKindAgentTeam,
+		TeamGraph: &agent.TeamGraph{
+			EntryAgentID: entryID,
+			Nodes:        []agent.TeamNode{{AgentID: entryID}},
+		},
+	}
+	entry := &agent.Agent{ID: entryID, Kind: agent.ResourceKindStandaloneAgent, Provider: "fake", Model: "fake", MaxSteps: 5, MaxRuns: 10}
+	preparer := NewRunPreparer(RunPreparerConfig{
+		Agents:   &fakeAgentStore{agents: map[string]*agent.Agent{teamID: team, entryID: entry}},
+		Threads:  &fakeThreadStore{thread: &agent.ThreadRecord{ID: testThreadID, AgentID: teamID, UserID: testUserID}},
+		Messages: &fakeMessageStore{}, Runtime: &fakeRuntime{}, ToolRegistry: tools.NewEmptyRegistry(),
+	})
+
+	prepared, err := preparer.Prepare(context.Background(), DispatchRequest{
+		RunID: "callback-run", AgentID: entryID, TeamID: teamID, UserID: testUserID,
+		ThreadID: testThreadID, InvocationKind: agent.InvocationCallback,
+	})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	if prepared.Agent.ID != entryID || prepared.RunCtx.TeamID != teamID {
+		t.Fatalf("prepared identity = agent %q team %q, want %q/%q", prepared.Agent.ID, prepared.RunCtx.TeamID, entryID, teamID)
+	}
+}
+
+func TestRunPreparerRejectsNonMemberOnTeamOwnedThread(t *testing.T) {
+	t.Parallel()
+
+	teamID := "team-1"
+	entryID := "entry-1"
+	outsiderID := "outsider-1"
+	team := &agent.Agent{
+		ID: teamID, Kind: agent.ResourceKindAgentTeam,
+		TeamGraph: &agent.TeamGraph{
+			EntryAgentID: entryID,
+			Nodes:        []agent.TeamNode{{AgentID: entryID}},
+		},
+	}
+	entry := &agent.Agent{ID: entryID, Kind: agent.ResourceKindStandaloneAgent, Provider: "fake", Model: "fake"}
+	outsider := &agent.Agent{ID: outsiderID, Kind: agent.ResourceKindStandaloneAgent, Provider: "fake", Model: "fake"}
+	preparer := NewRunPreparer(RunPreparerConfig{
+		Agents: &fakeAgentStore{agents: map[string]*agent.Agent{
+			teamID: team, entryID: entry, outsiderID: outsider,
+		}},
+		Threads:  &fakeThreadStore{thread: &agent.ThreadRecord{ID: testThreadID, AgentID: teamID, UserID: testUserID}},
+		Messages: &fakeMessageStore{}, Runtime: &fakeRuntime{}, ToolRegistry: tools.NewEmptyRegistry(),
+	})
+
+	if _, err := preparer.Prepare(context.Background(), DispatchRequest{
+		RunID: "callback-run", AgentID: outsiderID, TeamID: teamID, UserID: testUserID,
+		ThreadID: testThreadID, InvocationKind: agent.InvocationCallback,
+	}); err == nil || !strings.Contains(err.Error(), "is not a member of team") {
+		t.Fatalf("Prepare error = %v, want team-membership rejection", err)
+	}
+}
+
+func TestRunPreparerPreservesStandaloneThreadOwnership(t *testing.T) {
+	t.Parallel()
+
+	owner := &agent.Agent{ID: testAgentID, Kind: agent.ResourceKindStandaloneAgent, Provider: "fake", Model: "fake"}
+	preparer := NewRunPreparer(RunPreparerConfig{
+		Agents:   &fakeAgentStore{agent: owner},
+		Threads:  &fakeThreadStore{thread: &agent.ThreadRecord{ID: testThreadID, AgentID: testAgentID, UserID: testUserID}},
+		Messages: &fakeMessageStore{}, Runtime: &fakeRuntime{}, ToolRegistry: tools.NewEmptyRegistry(),
+	})
+
+	if _, err := preparer.Prepare(context.Background(), DispatchRequest{
+		RunID: "wrong-agent-run", AgentID: "different-agent", UserID: testUserID, ThreadID: testThreadID,
+	}); err == nil || !strings.Contains(err.Error(), "does not own thread") {
+		t.Fatalf("Prepare error = %v, want standalone ownership rejection", err)
 	}
 }
 

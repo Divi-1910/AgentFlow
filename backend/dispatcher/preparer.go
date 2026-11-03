@@ -113,14 +113,14 @@ func (p *RunPreparer) prepareFresh(ctx context.Context, req DispatchRequest) (Pr
 	if err != nil {
 		return PreparedRun{}, fmt.Errorf("dispatcher: load thread: %w", err)
 	}
-	threadAgentID := thread.AgentID
-	if req.AgentID != "" && req.AgentID != threadAgentID {
-		return PreparedRun{}, fmt.Errorf("dispatcher: request agent %s does not own thread %s", req.AgentID, req.ThreadID)
+	threadOwnerID := thread.AgentID
+	executionAgentID := req.AgentID
+	if executionAgentID == "" {
+		executionAgentID = threadOwnerID
 	}
-
 	teamID := req.TeamID
 	if teamID == "" {
-		resource, loadErr := p.agents.GetByID(ctx, threadAgentID, req.UserID)
+		resource, loadErr := p.agents.GetByID(ctx, threadOwnerID, req.UserID)
 		if loadErr != nil {
 			return PreparedRun{}, fmt.Errorf("dispatcher: load agent: %w", loadErr)
 		}
@@ -128,7 +128,20 @@ func (p *RunPreparer) prepareFresh(ctx context.Context, req DispatchRequest) (Pr
 			teamID = resource.ID
 		}
 	}
-	ag, err := p.resolveExecutionAgent(ctx, threadAgentID, teamID, req.UserID, false)
+	// A standalone thread is owned and executed by the same Agent. Team runs
+	// have two identities instead: the Team owns the root thread while one of
+	// its member Agents executes the request. Delegate sub-threads remain owned
+	// by their assigned member. resolveExecutionAgent performs the second half
+	// of this boundary by proving that executionAgentID belongs to teamID.
+	if teamID == "" {
+		if executionAgentID != threadOwnerID {
+			return PreparedRun{}, fmt.Errorf("dispatcher: request agent %s does not own thread %s", executionAgentID, req.ThreadID)
+		}
+	} else if threadOwnerID != teamID && threadOwnerID != executionAgentID {
+		return PreparedRun{}, fmt.Errorf("dispatcher: request agent %s cannot execute in team thread %s", executionAgentID, req.ThreadID)
+	}
+
+	ag, err := p.resolveExecutionAgent(ctx, executionAgentID, teamID, req.UserID, false)
 	if err != nil {
 		return PreparedRun{}, fmt.Errorf("dispatcher: load agent: %w", err)
 	}

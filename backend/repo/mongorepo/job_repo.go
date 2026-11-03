@@ -194,6 +194,38 @@ func toJobRecord(doc model.JobDocument) agent.JobRecord {
 	}
 }
 
+// ListByParentThreadForUser returns the durable async work launched from a
+// user-facing thread. Both predicates belong here: parent_thread_id selects the
+// product boundary while user_id prevents a caller from discovering another
+// user's job merely by learning a thread id.
+func (r *JobRepo) ListByParentThreadForUser(ctx context.Context, threadID, userID string, limit int) ([]agent.JobRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	cursor, err := r.jobs.Find(
+		ctx,
+		bson.M{"parent_thread_id": threadID, "user_id": userID},
+		options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}, {Key: "job_id", Value: -1}}).SetLimit(int64(limit)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("job_repo: list thread jobs: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	jobs := make([]agent.JobRecord, 0)
+	for cursor.Next(ctx) {
+		var doc model.JobDocument
+		if err := cursor.Decode(&doc); err != nil {
+			return nil, fmt.Errorf("job_repo: list thread jobs: decode: %w", err)
+		}
+		jobs = append(jobs, toJobRecord(doc))
+	}
+	if err := cursor.Err(); err != nil {
+		return nil, fmt.Errorf("job_repo: list thread jobs: %w", err)
+	}
+	return jobs, nil
+}
+
 // fencedFilter adds a fencing condition on field to base: an empty runID
 // means "never claimed yet" and matches either an absent or empty-string
 // field (bson `omitempty` never stores an explicit empty string), while a

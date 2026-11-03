@@ -35,6 +35,13 @@ function sortRuns(runs) {
   return [...runs].sort((left, right) => timeValue(right.updated_at) - timeValue(left.updated_at))
 }
 
+function isBackgroundJobPending(job) {
+  if (job?.mode !== 'background') return false
+  if (['failed', 'cancelled'].includes(job.status)) return false
+  if (job.status !== 'succeeded') return true
+  return !['completed', 'failed', 'cancelled'].includes(job.callback_status)
+}
+
 function resourceKind(resource) {
   return resource?.resource_kind || (Array.isArray(resource?.nodes) ? 'agent_team' : 'standalone_agent')
 }
@@ -76,6 +83,7 @@ export function useChatWorkspace() {
   })
   const [messages, setMessages] = useState([])
   const [latestRun, setLatestRun] = useState(null)
+  const [jobs, setJobs] = useState([])
   const [threadLoading, setThreadLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [actionError, setActionError] = useState(null)
@@ -192,6 +200,7 @@ export function useChatWorkspace() {
       setThreadLoading(true)
       setMessages([])
       setLatestRun(null)
+      setJobs([])
       setSelectedThreadId(thread.id)
       setSelectedResource(workspace.resources.find((item) => item.id === thread.resource_id) || null)
       return
@@ -204,6 +213,7 @@ export function useChatWorkspace() {
       setSelectedResource(resource)
       setMessages([])
       setLatestRun(null)
+      setJobs([])
       setThreadLoading(false)
       dispatchRuntime({ type: 'reset' })
     }
@@ -219,18 +229,21 @@ export function useChatWorkspace() {
   ])
 
   const loadDurableState = useCallback(async (threadId, { signal } = {}) => {
-    const [messagePage, runPage] = await Promise.all([
+    const [messagePage, runPage, jobPage] = await Promise.all([
       api.get(`/threads/${threadId}/messages?limit=${PAGE_LIMIT}`, { signal }),
       api.get(`/threads/${threadId}/runs?limit=${PAGE_LIMIT}`, { signal }),
+      api.get(`/threads/${threadId}/jobs?limit=${PAGE_LIMIT}`, { signal }),
     ])
     const durableMessages = sortMessages(pageItems(messagePage))
     const runs = sortRuns(pageItems(runPage))
+    const durableJobs = pageItems(jobPage)
     if (selectedThreadIdRef.current === threadId) {
       setMessages(durableMessages)
       setLatestRun(runs[0] || null)
+      setJobs(durableJobs)
       dispatchRuntime({ type: 'reconciled' })
     }
-    return { messages: durableMessages, run: runs[0] || null }
+    return { jobs: durableJobs, messages: durableMessages, run: runs[0] || null }
   }, [api, dispatchRuntime])
 
   const observeRun = useCallback(async ({
@@ -296,19 +309,40 @@ export function useChatWorkspace() {
           }
           if (event.type === 'stream.reset') {
             flushQueuedDeltas()
-            await loadDurableState(threadId, { signal: controller.signal })
+            const durable = await loadDurableState(threadId, { signal: controller.signal })
+            if (durable.run && isRunActive(durable.run.status)) {
+              const resetError = new Error('Live event history was reset while this run was still active.')
+              dispatchRuntime({ type: 'connection', connection: 'interrupted', error: resetError.message })
+              return { accepted, error: resetError, runId }
+            }
+            dispatchRuntime({ type: 'connection', connection: 'closed' })
             return { accepted, runId }
           }
         }
 
         flushQueuedDeltas()
-        await loadDurableState(threadId, { signal: controller.signal })
+        const durable = await loadDurableState(threadId, { signal: controller.signal })
+        if (durable.run && isRunActive(durable.run.status)) {
+          const streamError = new Error('The live connection ended while this run was still active.')
+          dispatchRuntime({ type: 'connection', connection: 'interrupted', error: streamError.message })
+          return { accepted, error: streamError, runId }
+        }
+        dispatchRuntime({ type: 'connection', connection: 'closed' })
         return { accepted, runId }
       } catch (error) {
         if (error.name === 'AbortError' || controller.signal.aborted) return { aborted: true, accepted, runId }
         finalError = error
         if (error.status === 410 && runId) {
-          await loadDurableState(threadId, { signal: controller.signal })
+          const durable = await loadDurableState(threadId, { signal: controller.signal })
+          if (durable.run && isRunActive(durable.run.status)) {
+            const replayError = new Error('The retained live-event window expired while this run was still active.')
+            dispatchRuntime({
+              type: 'connection',
+              connection: 'interrupted',
+              error: replayError.message,
+            })
+            return { accepted, error: replayError, runId }
+          }
           dispatchRuntime({ type: 'connection', connection: 'closed' })
           return { accepted, runId }
         }
@@ -318,14 +352,19 @@ export function useChatWorkspace() {
       }
     }
 
+    let durable = null
     try {
-      const durable = await loadDurableState(threadId, { signal: controller.signal })
+      durable = await loadDurableState(threadId, { signal: controller.signal })
       if (!accepted && durable.run && isRunActive(durable.run.status)) {
         accepted = true
         runId = durable.run.id
       }
     } catch (reconcileError) {
       if (reconcileError.name !== 'AbortError') finalError = finalError || reconcileError
+    }
+    if (durable?.run && !isRunActive(durable.run.status)) {
+      dispatchRuntime({ type: 'connection', connection: 'closed' })
+      return { accepted, runId }
     }
     dispatchRuntime({
       type: 'connection',
@@ -335,12 +374,68 @@ export function useChatWorkspace() {
     return { accepted, error: finalError, runId }
   }, [api, dispatchRuntime, flushQueuedDeltas, loadDurableState, queueDelta, store])
 
+  const backgroundJobs = useMemo(() => {
+    const rootRunId = latestRun?.id
+    return jobs.filter((job) => (
+      job.mode === 'background'
+      && (!rootRunId || job.parent_run_id === rootRunId)
+    ))
+  }, [jobs, latestRun?.id])
+
+  const hasPendingBackgroundWork = useMemo(
+    () => backgroundJobs.some(isBackgroundJobPending),
+    [backgroundJobs],
+  )
+
+  // A background dispatch intentionally allows the root response stream to
+  // finish. Reconcile its durable job state independently so callback messages
+  // can appear without requiring a page refresh or an indefinitely open SSE.
+  useEffect(() => {
+    if (!selectedThreadId || !hasPendingBackgroundWork) return undefined
+    const controller = new AbortController()
+    const rootRunId = latestRun?.id
+
+    async function reconcile() {
+      while (!controller.signal.aborted) {
+        try {
+          await wait(1200, controller.signal)
+          const jobPage = await api.get(`/threads/${selectedThreadId}/jobs?limit=${PAGE_LIMIT}`, {
+            signal: controller.signal,
+          })
+          const durableJobs = pageItems(jobPage)
+          if (selectedThreadIdRef.current !== selectedThreadId) return
+          const relevantJobs = rootRunId
+            ? durableJobs.filter((job) => job.parent_run_id === rootRunId)
+            : durableJobs
+          if (!relevantJobs.some(isBackgroundJobPending)) {
+            // Reconcile the complete durable snapshot before publishing the
+            // terminal job state. Publishing it first makes
+            // hasPendingBackgroundWork false, which cleans up this effect and
+            // aborts the very request that should load the callback message.
+            await loadDurableState(selectedThreadId, { signal: controller.signal })
+            return
+          }
+          setJobs(durableJobs)
+        } catch (error) {
+          if (error.name === 'AbortError' || controller.signal.aborted) return
+          // A transient status-read failure must not interrupt the conversation.
+          // The next bounded poll retries, while the normal workspace error
+          // surfaces persistent failures when the thread is reloaded.
+        }
+      }
+    }
+
+    void reconcile()
+    return () => controller.abort()
+  }, [api, hasPendingBackgroundWork, latestRun?.id, loadDurableState, selectedThreadId])
+
   useEffect(() => {
     if (!selectedThreadId || workspace.loading) {
       if (!selectedThreadId) {
         clearQueuedDeltas()
         setMessages([])
         setLatestRun(null)
+        setJobs([])
         dispatchRuntime({ type: 'reset' })
       }
       return undefined
@@ -389,6 +484,7 @@ export function useChatWorkspace() {
     setThreadLoading(true)
     setMessages([])
     setLatestRun(null)
+    setJobs([])
     setSelectedThreadId(thread.id)
     setSelectedResource(resourcesById.get(thread.resource_id) || null)
     setRetrySubmission(null)
@@ -403,6 +499,7 @@ export function useChatWorkspace() {
     setSelectedResource(resource)
     setMessages([])
     setLatestRun(null)
+    setJobs([])
     setRetrySubmission(null)
     dispatchRuntime({ type: 'reset' })
     updateURL({ resourceId: resource.id, resourceKind: resourceKind(resource) })
@@ -519,25 +616,36 @@ export function useChatWorkspace() {
     const controller = new AbortController()
     streamControllerRef.current?.abort()
     streamControllerRef.current = controller
-    await observeRun({
-      controller,
-      initialOptions: { method: 'POST' },
-      initialPath: `/runs/${latestRun.id}/resume`,
-      knownRunId: latestRun.id,
-      threadId: selectedThreadId,
-    })
+    try {
+      const result = await observeRun({
+        controller,
+        initialOptions: { method: 'POST' },
+        initialPath: `/runs/${latestRun.id}/resume`,
+        knownRunId: latestRun.id,
+        threadId: selectedThreadId,
+      })
+      if (result?.error) setActionError(result.error)
+    } catch (error) {
+      if (error.name !== 'AbortError') setActionError(error)
+    }
   }, [dispatchRuntime, latestRun, observeRun, selectedThreadId])
 
   const reconnectRun = useCallback(async () => {
     if (!selectedThreadId || !latestRun?.id) return
+    setActionError(null)
     const controller = new AbortController()
     streamControllerRef.current?.abort()
     streamControllerRef.current = controller
-    await observeRun({
-      controller,
-      knownRunId: latestRun.id,
-      threadId: selectedThreadId,
-    })
+    try {
+      const result = await observeRun({
+        controller,
+        knownRunId: latestRun.id,
+        threadId: selectedThreadId,
+      })
+      if (result?.error) setActionError(result.error)
+    } catch (error) {
+      if (error.name !== 'AbortError') setActionError(error)
+    }
   }, [latestRun?.id, observeRun, selectedThreadId])
 
   const renameThread = useCallback(async (title) => {
@@ -557,6 +665,7 @@ export function useChatWorkspace() {
 
   return {
     actionError,
+    backgroundJobs,
     cancelRun,
     latestRun,
     loading: workspace.loading,

@@ -82,6 +82,22 @@ func scanJobRows(rows *sql.Rows, op string) ([]agent.JobRecord, error) {
 	return out, nil
 }
 
+func (r *JobRepo) ListByParentThreadForUser(ctx context.Context, threadID, userID string, limit int) ([]agent.JobRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := r.db.QueryContext(ctx, `SELECT `+jobColumns+`
+FROM jobs
+WHERE parent_thread_id = ? AND user_id = ?
+ORDER BY created_at DESC, job_id DESC
+LIMIT ?`, threadID, userID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("job_repo: list thread jobs: %w", err)
+	}
+	defer rows.Close()
+	return scanJobRows(rows, "list thread jobs")
+}
+
 // DispatchAgent idempotently creates the job for (parent_run_id, tool_call_id)
 // and returns its dispatch result. A replay of the same key returns the
 // EXISTING job unchanged — even if the request payload (task, mode, …)

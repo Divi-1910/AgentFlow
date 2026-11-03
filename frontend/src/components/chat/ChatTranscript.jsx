@@ -9,6 +9,7 @@ import {
 	buildLiveExecutionActivities,
 	executionSummary,
 	formatChatTime,
+	friendlyChatError,
 	liveExecutionStatus,
 	resourceLabel,
 	statusLabel,
@@ -201,8 +202,55 @@ function Composer({
   )
 }
 
+function backgroundJobPresentation(job) {
+  if (job.status === 'failed') {
+    return { detail: 'The delegated Agent could not complete this task. The conversation is still safe to continue.', label: 'Background task failed', status: 'failed' }
+  }
+  if (job.status === 'cancelled') {
+    return { detail: 'This background task was cancelled safely.', label: 'Background task cancelled', status: 'failed' }
+  }
+  if (job.callback_status === 'failed') {
+    return { detail: 'The work completed, but AgentFlow could not deliver its result into this conversation.', label: 'Result delivery failed', status: 'failed' }
+  }
+  if (job.callback_status === 'cancelled') {
+    return { detail: 'The work completed, but its conversation update was cancelled.', label: 'Result delivery cancelled', status: 'failed' }
+  }
+  if (job.callback_status === 'completed') {
+    return { detail: 'The result was added to this conversation.', label: 'Background task completed', status: 'completed' }
+  }
+  if (job.status === 'succeeded') {
+    return { detail: 'The delegated work is ready and its result is being added here.', label: 'Preparing the result', status: 'running' }
+  }
+  if (job.status === 'running' || job.status === 'starting') {
+    return { detail: 'A delegated Agent is working independently. You can continue using AgentFlow.', label: 'Working in background', status: 'running' }
+  }
+  return { detail: 'The task is queued and will update this conversation when ready.', label: 'Queued in background', status: 'running' }
+}
+
+function BackgroundWork({ jobs = [] }) {
+  if (!jobs.length) return null
+  return (
+    <section className="chat-background-work" aria-label="Background work" aria-live="polite">
+      {jobs.map((job) => {
+        const presentation = backgroundJobPresentation(job)
+        return (
+          <article className={`chat-background-work__item chat-background-work__item--${presentation.status}`} key={job.id}>
+            <span className="chat-background-work__mark" aria-hidden="true"><i /></span>
+            <div>
+              <strong>{presentation.label}</strong>
+              <p>{job.task || presentation.detail}</p>
+              <small>{presentation.detail}</small>
+            </div>
+          </article>
+        )
+      })}
+    </section>
+  )
+}
+
 export default function ChatTranscript({
   actionError,
+  backgroundJobs = [],
   latestRun,
   messages,
   onCancel,
@@ -253,6 +301,11 @@ export default function ChatTranscript({
 		() => executionSummary({ events: runtime.events, messages, rootRunId: executionRunId, run: latestRun }),
 		[executionRunId, latestRun, messages, runtime.events],
 	)
+	const visibleError = useMemo(() => {
+		if (actionError) return friendlyChatError(actionError)
+		if (runtime.error) return friendlyChatError({ errorCode: runtime.errorCode, message: runtime.error })
+		return null
+	}, [actionError, runtime.error, runtime.errorCode])
   const visibleMessages = useMemo(
     () => messages.filter((message) => (
       (message.role === 'user' || message.role === 'assistant')
@@ -412,6 +465,7 @@ export default function ChatTranscript({
 					/>
 				) : null}
             </AnimatePresence>
+			{!threadLoading && !liveTurn ? <BackgroundWork jobs={backgroundJobs} /> : null}
 			{!threadLoading && !liveTurn && workSummary ? (
 				<button type="button" className="chat-work-summary" onClick={onOpenTrace} aria-label="Open complete activity">
 					<span className="material-symbols-outlined" aria-hidden="true">schedule</span>
@@ -420,10 +474,10 @@ export default function ChatTranscript({
 					<span className="material-symbols-outlined" aria-hidden="true">chevron_right</span>
 				</button>
 			) : null}
-            {actionError ? (
+            {visibleError ? (
               <div className="chat-inline-error" role="alert">
                 <span className="material-symbols-outlined" aria-hidden="true">error</span>
-                <div><strong>AgentFlow could not complete that action</strong><p>{actionError.message}</p></div>
+                <div><strong>{visibleError.title}</strong><p>{visibleError.detail}</p></div>
               </div>
             ) : null}
           </motion.div>

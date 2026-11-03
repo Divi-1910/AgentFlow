@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { chatRuntimeAtom } from '../../store/atoms/chatAtoms'
 import ChatTranscript from './ChatTranscript'
 
-function renderTranscript(messageOrMessages) {
+function renderTranscript(messageOrMessages, props = {}) {
   const store = createStore()
   store.set(chatRuntimeAtom, {
     connection: 'idle',
@@ -23,6 +23,7 @@ function renderTranscript(messageOrMessages) {
     <Provider store={store}>
       <ChatTranscript
         actionError={null}
+        backgroundJobs={props.backgroundJobs || []}
         latestRun={null}
         messages={Array.isArray(messageOrMessages) ? messageOrMessages : [messageOrMessages]}
         onCancel={vi.fn()}
@@ -71,6 +72,23 @@ function renderRuntimeTranscript(runtime, messages = []) {
 }
 
 describe('ChatTranscript', () => {
+	it('keeps durable background work visible after the primary stream closes', () => {
+		renderTranscript({
+			content: 'I started the research and will update you here.',
+			created_at: '2026-10-30T12:01:00Z',
+			id: 'message-1',
+			role: 'assistant',
+		}, {
+			backgroundJobs: [{
+				callback_status: 'queued', id: 'job-1', mode: 'background',
+				status: 'running', task: 'Research Mumbai weather',
+			}],
+		})
+
+		expect(screen.getByText('Working in background')).toBeTruthy()
+		expect(screen.getByText('Research Mumbai weather')).toBeTruthy()
+	})
+
   it('renders assistant Markdown instead of exposing formatting syntax', () => {
     const { container } = renderTranscript({
       content: 'Your father is **Ravindra**.\n\n- Remembered from memory',
