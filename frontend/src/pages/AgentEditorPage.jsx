@@ -11,6 +11,7 @@ import {
   validateAgentForm,
 } from '../features/agents/agentForm'
 import { agentEditorTabs, tabForAgentField } from '../features/agents/agentForgeGraph'
+import { createAgentTemplateForm } from '../features/templates/agentTemplates'
 import { useAgentEditorData } from '../hooks/useAgentEditorData'
 import { useApiClient } from '../hooks/useApiClient'
 
@@ -116,6 +117,7 @@ export default function AgentEditorPage() {
     ? location.state.agentPreview
     : null
   const routeCreatePreview = isCreate && location.state?.createPreview === true
+  const routeTemplateId = isCreate ? location.state?.agentTemplateId : null
   const hasRoutePreview = Boolean(routeAgentPreview || routeCreatePreview)
   const routeMcpPreview = hasRoutePreview && Array.isArray(location.state?.mcpServersPreview)
     ? location.state.mcpServersPreview
@@ -168,10 +170,10 @@ export default function AgentEditorPage() {
     if (loading) return
     const identity = agentId || 'new'
     if (initializedFor === identity) return
-    setForm(agentToForm(agent))
+    setForm(routeTemplateId ? createAgentTemplateForm(routeTemplateId, tools) : agentToForm(agent))
     setOriginalAgent(agent)
     setInitializedFor(identity)
-  }, [agent, agentId, initializedFor, loading])
+  }, [agent, agentId, initializedFor, loading, routeTemplateId, tools])
 
   const patch = useMemo(
     () => (isCreate ? {} : buildAgentPatch(form, originalAgent)),

@@ -11,6 +11,8 @@ export const chatTranscriptRuntimeAtom = selectAtom(
   chatRuntimeAtom,
   (runtime) => ({
     connection: runtime.connection,
+	error: runtime.error,
+	errorCode: runtime.errorCode,
 	events: runtime.events,
     partial: runtime.partial,
     primaryDraft: selectPrimaryDraft(runtime),
@@ -18,6 +20,8 @@ export const chatTranscriptRuntimeAtom = selectAtom(
     status: runtime.status,
   }),
   (previous, next) => previous.connection === next.connection
+	&& previous.error === next.error
+	&& previous.errorCode === next.errorCode
 	&& previous.events === next.events
     && previous.partial === next.partial
     && previous.primaryDraft === next.primaryDraft

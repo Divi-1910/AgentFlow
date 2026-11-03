@@ -176,6 +176,12 @@ function ModelPanel({ changeProvider, fieldErrors, form, providerModels, provide
       <InspectorHeading detail="AgentFlow supplies provider credentials. Choose the intelligence profile this agent will use.">
         Intelligence
       </InspectorHeading>
+      {providers.length === 0 ? (
+        <div className="mb-5 rounded-2xl border border-amber-200/15 bg-amber-200/[0.045] p-4" role="status">
+          <p className="text-sm font-medium text-white">No model provider is available</p>
+          <p className="mt-1 text-xs leading-5 text-content-supporting">The model catalog may be empty, or the backend is missing its platform-owned provider credential. Check Workspace for the exact local setup action.</p>
+        </div>
+      ) : null}
       <div className="space-y-5">
         <SelectField
           field="provider"
@@ -398,7 +404,13 @@ function CapabilitiesPanel({ fieldErrors, form, mcpChoices, setField, toolChoice
               />
             )
           })}
-          {visibleMcp.length === 0 ? <p className="agent-capability-empty-state">No matching MCP servers.</p> : null}
+          {visibleMcp.length === 0 ? (
+            <p className="agent-capability-empty-state">
+              {mcpChoices.length === 0
+                ? 'No enabled MCP servers are registered. Add the local catalog records from Workspace setup.'
+                : 'No matching MCP servers.'}
+            </p>
+          ) : null}
         </div>
         <FieldError field="mcp_servers" message={fieldErrors.mcp_servers || fieldErrors.mcp_server_ids} />
       </section>

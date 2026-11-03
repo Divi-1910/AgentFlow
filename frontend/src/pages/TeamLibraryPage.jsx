@@ -252,6 +252,7 @@ export default function TeamLibraryPage() {
           </AnimatePresence>
           <div className="team-library-dock__actions">
             <Link to={`/chat?resource_kind=agent_team&resource_id=${encodeURIComponent(selectedTeam.id)}`} className="agent-secondary-button"><span aria-hidden="true" className="material-symbols-outlined">forum</span>Open chat</Link>
+            <Link to={`/deployments?resource_kind=agent_team&resource_id=${encodeURIComponent(selectedTeam.id)}`} className="agent-secondary-button"><span aria-hidden="true" className="material-symbols-outlined">deployed_code</span>Publish</Link>
             <Link
               to={`/teams/${selectedTeam.id}`}
               state={editorState}

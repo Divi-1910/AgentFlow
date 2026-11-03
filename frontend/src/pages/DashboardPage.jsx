@@ -162,6 +162,92 @@ function Capability({ enabled, label }) {
   );
 }
 
+const journeySteps = [
+  {
+    detail: "Define one responsibility, its model, instructions, tools, memory, and MCP access.",
+    href: "/agents/new",
+    icon: "smart_toy",
+    label: "Agent",
+  },
+  {
+    detail: "Connect reusable Agents into a directed, acyclic delegation graph.",
+    href: "/teams/new",
+    icon: "account_tree",
+    label: "Team",
+  },
+  {
+    detail: "Run the Agent or Team with streaming output and inspectable activity.",
+    href: "/chat",
+    icon: "forum",
+    label: "Chat",
+  },
+  {
+    detail: "Freeze an immutable revision, deploy it, and observe runtime health.",
+    href: "/deployments",
+    icon: "deployed_code",
+    label: "Publish",
+  },
+];
+
+function FirstRunJourney() {
+  return (
+    <motion.section variants={fadeUp} className="mt-10 rounded-3xl border border-white/[0.08] bg-white/[0.025] p-6 sm:p-8">
+      <div className="flex flex-wrap items-end justify-between gap-5">
+        <div>
+          <p className="font-headline text-[9px] font-semibold uppercase tracking-[0.24em] text-content-supporting">Your first working system</p>
+          <h2 className="mt-2 font-headline text-2xl font-semibold text-white">Agent → Team → Chat → Publish</h2>
+        </div>
+        <Link to="/templates" className="agent-secondary-button">Browse templates</Link>
+      </div>
+      <div className="mt-7 grid gap-3 lg:grid-cols-4">
+        {journeySteps.map((step, index) => (
+          <Link key={step.label} to={step.href} className="group rounded-2xl border border-white/[0.08] bg-black/20 p-5 transition-colors hover:border-white/15 hover:bg-white/[0.04]">
+            <div className="flex items-center justify-between">
+              <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-white/[0.035] text-content-secondary">
+                <span aria-hidden="true" className="material-symbols-outlined text-[18px]">{step.icon}</span>
+              </span>
+              <span className="font-headline text-[9px] font-semibold uppercase tracking-[0.2em] text-content-muted">0{index + 1}</span>
+            </div>
+            <h3 className="mt-5 font-headline text-base font-semibold text-white">{step.label}</h3>
+            <p className="mt-2 text-xs leading-5 text-content-supporting">{step.detail}</p>
+            <span className="mt-5 inline-flex items-center gap-1 text-[11px] text-white/70 transition-colors group-hover:text-white">Open <span aria-hidden="true" className="material-symbols-outlined text-[14px]">arrow_outward</span></span>
+          </Link>
+        ))}
+      </div>
+    </motion.section>
+  );
+}
+
+function CatalogReadiness({ mcpServers = [], models = [] }) {
+  const emptyModels = models.length === 0;
+  const providersUnavailable = models.length > 0 && models.every((model) => !model.available);
+  const emptyMcp = mcpServers.length === 0;
+  if (!emptyModels && !providersUnavailable && !emptyMcp) return null;
+
+  return (
+    <motion.section variants={fadeUp} className="mt-6 rounded-3xl border border-amber-200/15 bg-amber-200/[0.045] p-6 sm:p-7" aria-labelledby="catalog-readiness-heading">
+      <div className="flex items-start gap-4">
+        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-amber-200/15 bg-amber-200/[0.06] text-amber-100">
+          <span aria-hidden="true" className="material-symbols-outlined text-[19px]">database</span>
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="font-headline text-[9px] font-semibold uppercase tracking-[0.22em] text-amber-100/60">Local catalog setup</p>
+          <h2 id="catalog-readiness-heading" className="mt-2 font-headline text-xl font-semibold text-white">The runtime catalog needs attention</h2>
+          <div className="mt-4 space-y-3 text-sm leading-6 text-content-supporting">
+            {emptyModels && <p><strong className="text-white/85">No LLM records:</strong> add model metadata to <code className="rounded bg-black/40 px-1.5 py-0.5 text-xs text-white/75">AgentFlow.llm_registry</code> with <code className="text-xs text-white/75">mongosh</code>.</p>}
+            {providersUnavailable && <p><strong className="text-white/85">Models exist, but no provider is available:</strong> set the matching backend credential such as <code className="rounded bg-black/40 px-1.5 py-0.5 text-xs text-white/75">OPENAI_API_KEY</code>, <code className="rounded bg-black/40 px-1.5 py-0.5 text-xs text-white/75">ANTHROPIC_API_KEY</code>, or <code className="rounded bg-black/40 px-1.5 py-0.5 text-xs text-white/75">NVIDIA_API_KEY</code>, then restart the backend.</p>}
+            {emptyMcp && <p><strong className="text-white/85">No enabled MCP records:</strong> start the local harness with <code className="rounded bg-black/40 px-1.5 py-0.5 text-xs text-white/75">./mcp_servers/start-all.sh</code>, then manually upsert the documented catalog entries.</p>}
+          </div>
+          <a href="https://github.com/Divi-1910/AgentFlow/blob/master/docs/LOCAL_CATALOG_SETUP.md" target="_blank" rel="noreferrer" className="mt-5 inline-flex items-center gap-2 text-xs font-medium text-white underline decoration-white/25 underline-offset-4 hover:decoration-white">
+            Open exact local setup commands
+            <span aria-hidden="true" className="material-symbols-outlined text-[15px]">open_in_new</span>
+          </a>
+        </div>
+      </div>
+    </motion.section>
+  );
+}
+
 export default function DashboardPage() {
   const { data, error, loading, reload } = useDashboardData();
   const reduceMotion = useReducedMotion();
@@ -169,7 +255,10 @@ export default function DashboardPage() {
   if (loading) return <DashboardLoading />;
   if (error) return <DashboardError error={error} onRetry={reload} />;
 
-  const { capabilities, overview, runs, threads } = data;
+  const { capabilities, mcpServers, models, overview, runs, threads } = data;
+  const firstRun = overview.resources.agents === 0
+    && overview.resources.teams === 0
+    && threads.length === 0;
   const animationProps = reduceMotion
     ? {}
     : { variants: reveal, initial: "hidden", animate: "show" };
@@ -178,7 +267,7 @@ export default function DashboardPage() {
     <motion.section {...animationProps} className="w-full max-w-[1600px] pb-32">
       <motion.header
         variants={reduceMotion ? undefined : fadeUp}
-        className="mb-12 flex flex-col gap-6 border-b border-white/[0.06] pb-10 sm:flex-row sm:items-end sm:justify-between"
+        className="flex flex-col gap-6 border-b border-white/[0.06] pb-10 sm:flex-row sm:items-end sm:justify-between"
       >
         <div>
           <p className="font-headline text-[10px] font-semibold uppercase tracking-[0.3em] text-content-supporting">
@@ -200,7 +289,10 @@ export default function DashboardPage() {
         </Link>
       </motion.header>
 
-      <div className="grid grid-cols-2 gap-x-7 gap-y-10 lg:grid-cols-4">
+      {firstRun ? <FirstRunJourney /> : null}
+      <CatalogReadiness mcpServers={mcpServers} models={models} />
+
+      <div className="mt-12 grid grid-cols-2 gap-x-7 gap-y-10 lg:grid-cols-4">
         <Metric
           label="Agents"
           value={overview.resources.agents}

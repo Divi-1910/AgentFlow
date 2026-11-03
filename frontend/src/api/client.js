@@ -118,6 +118,29 @@ export async function apiStreamRequest(path, options = {}) {
   return response.body
 }
 
+function attachmentFilename(response, fallback) {
+  const disposition = response.headers.get('content-disposition') || ''
+  const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  if (encoded?.[1]) {
+    try {
+      return decodeURIComponent(encoded[1])
+    } catch {
+      // Fall through to the ordinary filename or the caller-provided fallback.
+    }
+  }
+  const quoted = disposition.match(/filename="([^"]+)"/i)
+  const plain = disposition.match(/filename=([^;\s]+)/i)
+  return quoted?.[1] || plain?.[1] || fallback
+}
+
+export async function apiDownloadRequest(path, { filename = 'agentflow-download', ...options } = {}) {
+  const response = await performRequest(path, options)
+  return {
+    blob: await response.blob(),
+    filename: attachmentFilename(response, filename),
+  }
+}
+
 export function createApiClient({ getToken, onUnauthorized } = {}) {
   const request = (path, options = {}) => apiRequest(path, {
     ...options,
@@ -129,8 +152,14 @@ export function createApiClient({ getToken, onUnauthorized } = {}) {
     token: options.token ?? getToken?.(),
     onUnauthorized,
   })
+  const download = (path, options = {}) => apiDownloadRequest(path, {
+    ...options,
+    token: options.token ?? getToken?.(),
+    onUnauthorized,
+  })
 
   return Object.freeze({
+    download,
     request,
     stream,
     get: (path, options) => request(path, { ...options, method: 'GET' }),

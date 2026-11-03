@@ -4,6 +4,7 @@ const TRACE_LIMIT = 240
 export const initialChatRuntimeState = Object.freeze({
   connection: 'idle',
   error: null,
+  errorCode: '',
   events: [],
   lastEventId: '',
   partial: false,
@@ -97,6 +98,7 @@ function reduceRuntimeEvent(state, event) {
       ? 'resetting'
       : rootTerminal ? 'closed' : 'streaming',
     error: event.error?.message || (event.type === 'run.persist_failed' ? 'The response could not be saved.' : state.error),
+    errorCode: event.error?.code || state.errorCode,
     events,
     lastEventId: event.stream_id || identity || state.lastEventId,
     partial: event.error?.code === 'provider.stream_interrupted' ? hasVisibleDraft({ ...state, streams }) : state.partial,
@@ -128,6 +130,7 @@ export function chatRuntimeReducer(state, action) {
         ...state,
         connection: action.connection,
         error: action.error || null,
+        errorCode: action.errorCode || '',
         partial: action.connection === 'interrupted' ? hasVisibleDraft(state) : state.partial,
       }
     case 'event':

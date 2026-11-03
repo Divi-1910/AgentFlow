@@ -268,6 +268,24 @@ describe('AgentEditorPage', () => {
     expect(screen.getByRole('button', { name: 'Create agent' }).disabled).toBe(true)
   })
 
+  it('opens a built-in template as an editable draft without choosing a model', async () => {
+    const user = userEvent.setup()
+    useApiClient.mockReturnValue({ patch: vi.fn(), post: vi.fn() })
+    useAgentEditorData.mockReturnValue(editorState())
+
+    renderEditor('/agents/new?panel=agent&tab=overview', {
+      agentTemplateId: 'research_analyst',
+      createPreview: true,
+      mcpServersPreview: catalogs.mcpServers,
+      toolsPreview: catalogs.tools,
+    })
+
+    await waitFor(() => expect(screen.getByTestId('agent-forge-canvas').textContent).toContain('Research Analyst'))
+    await user.click(screen.getByRole('tab', { name: 'Model' }))
+    expect(screen.getByLabelText('Provider').value).toBe('')
+    expect(screen.getByLabelText('Primary model').value).toBe('')
+  })
+
   it('returns through the animated library entry while preserving the library snapshot', async () => {
     useApiClient.mockReturnValue({ patch: vi.fn(), post: vi.fn() })
     useAgentEditorData.mockReturnValue(editorState(savedAgent))

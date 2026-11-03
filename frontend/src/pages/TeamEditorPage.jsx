@@ -16,6 +16,7 @@ import {
   validateTeamDraft,
 } from '../features/teams/teamGraph'
 import { EMPTY_TEAM_CANVAS_INSETS } from '../features/teams/teamCanvasViewport'
+import { createTeamTemplateDraft } from '../features/templates/teamTemplates'
 import { useApiClient } from '../hooks/useApiClient'
 import { useTeamEditorData } from '../hooks/useTeamEditorData'
 import {
@@ -70,6 +71,9 @@ export default function TeamEditorPage() {
     ? (location.state.toolsPreview || location.state.libraryPreview.tools)
     : loaded.tools
   const visibleTeam = routeTeamPreview || loaded.team
+  const routeTemplateDraft = isCreate
+    ? createTeamTemplateDraft(location.state?.teamTemplateId, location.state?.teamTemplateAssignments, agents)
+    : null
   const [draft, setDraft] = useAtom(teamDraftAtom)
   const [baseline, setBaseline] = useAtom(teamBaselineAtom)
   const [selection, setSelection] = useAtom(teamSelectionAtom)
@@ -100,13 +104,13 @@ export default function TeamEditorPage() {
   useEffect(() => {
     if (initializedFor === identity) return
     if (loaded.loading && !hasPreview) return
-    const initialDraft = teamToDraft(visibleTeam)
+    const initialDraft = routeTemplateDraft || teamToDraft(visibleTeam)
     setDraft(initialDraft)
     setBaseline(initialDraft)
     setSelection({ id: null, type: 'team' })
     setSurface(isCreate ? 'catalog' : null)
     setInitializedFor(identity)
-  }, [hasPreview, identity, initializedFor, isCreate, loaded.loading, setBaseline, setDraft, setSelection, visibleTeam])
+  }, [hasPreview, identity, initializedFor, isCreate, loaded.loading, routeTemplateDraft, setBaseline, setDraft, setSelection, visibleTeam])
 
   useEffect(() => {
     if (!dirty) return undefined

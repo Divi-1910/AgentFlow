@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, apiRequest, apiStreamRequest, createApiClient } from './client'
+import { ApiError, apiDownloadRequest, apiRequest, apiStreamRequest, createApiClient } from './client'
 
 function jsonResponse(data, init = {}) {
   return new Response(JSON.stringify(data), {
@@ -84,5 +84,25 @@ describe('API client', () => {
     expect(request.headers.get('Accept')).toBe('text/event-stream')
     expect(request.headers.get('Authorization')).toBe('Bearer test-token')
     expect(request.headers.get('Last-Event-ID')).toBe('run-1:8')
+  })
+
+  it('downloads authenticated bundle bytes without decoding them', async () => {
+    const bytes = new Uint8Array([123, 34, 111, 107, 34, 58, 116, 114, 117, 101, 125])
+    const fetchMock = vi.fn().mockResolvedValue(new Response(bytes, {
+      headers: {
+        'Content-Disposition': 'attachment; filename="deployment-agent-1-r3.json"',
+        'Content-Type': 'application/json',
+      },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await apiDownloadRequest('/agents/agent-1/publications/3/bundle', {
+      token: 'test-token',
+    })
+
+    expect(result.filename).toBe('deployment-agent-1-r3.json')
+    expect(new Uint8Array(await result.blob.arrayBuffer())).toEqual(bytes)
+    const [, request] = fetchMock.mock.calls[0]
+    expect(request.headers.get('Authorization')).toBe('Bearer test-token')
   })
 })

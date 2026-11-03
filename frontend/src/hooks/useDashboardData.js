@@ -31,13 +31,15 @@ export function useDashboardData() {
       }))
 
       try {
-        const [overview, capabilities, threadPage, runPage, agents, teams] = await Promise.all([
+        const [overview, capabilities, threadPage, runPage, agents, teams, models, mcpServers] = await Promise.all([
           api.get('/workspace/overview', { signal: controller.signal }),
           api.get('/platform/capabilities', { signal: controller.signal }),
           api.get('/threads?limit=6', { signal: controller.signal }),
           api.get('/runs?limit=6', { signal: controller.signal }),
           api.get('/agents', { signal: controller.signal }),
           api.get('/agent-teams', { signal: controller.signal }),
+          api.get('/llms', { signal: controller.signal }),
+          api.get('/mcp-servers', { signal: controller.signal }),
         ])
 
         const resourcesById = new Map()
@@ -48,6 +50,8 @@ export function useDashboardData() {
         setState({
           data: {
             capabilities,
+            mcpServers: Array.isArray(mcpServers) ? mcpServers : [],
+            models: Array.isArray(models) ? models : [],
             overview,
             runs: pageItems(runPage).map((run) => ({
               ...run,

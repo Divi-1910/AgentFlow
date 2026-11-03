@@ -432,6 +432,10 @@ export default function AgentLibraryPage() {
                 <span aria-hidden="true" className="material-symbols-outlined">forum</span>
                 Open chat
               </Link>
+              <Link to={`/deployments?resource_kind=standalone_agent&resource_id=${encodeURIComponent(selectedAgent.id)}`} className="agent-secondary-button inline-flex">
+                <span aria-hidden="true" className="material-symbols-outlined">deployed_code</span>
+                Publish
+              </Link>
               <Link
                 to={agentEditorPath(selectedAgent.id)}
                 state={editorState}

@@ -3,6 +3,7 @@ import {
 	buildExecutionTimeline,
 	buildLiveExecutionActivities,
 	executionSummary,
+	friendlyChatError,
 	toolEventPresentation,
 } from './chatPresentation'
 
@@ -141,5 +142,13 @@ describe('chat execution presentation', () => {
 		expect(tool.input[0].value).toBe('[redacted]')
 		expect(tool.output[0].value).toContain('unavailable')
 		expect(tool.output[0].value).not.toContain('private raw response')
+	})
+
+	it('turns provider and MCP failure codes into actionable product language', () => {
+		expect(friendlyChatError({ code: 'provider.unavailable' })).toEqual(expect.objectContaining({
+			title: 'Model provider unavailable',
+		}))
+		expect(friendlyChatError({ code: 'provider.stream_interrupted' }).detail).toContain('visible text is partial')
+		expect(friendlyChatError({ code: 'mcp.unavailable' }).detail).toContain('instead of crashing')
 	})
 })

@@ -23,6 +23,8 @@ const dashboardData = {
     runtime_proxy: true,
     studio_execution: true,
   },
+  mcpServers: [{ server_id: 'fetch', name: 'Fetch' }],
+  models: [{ api_model_id: 'gpt-test', available: true, name: 'Test model', provider: 'openai' }],
   overview: {
     catalog: {
       available_mcp_servers: 5,

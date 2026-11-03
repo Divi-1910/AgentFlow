@@ -15,6 +15,8 @@ const TeamLibraryPage = lazy(() => import('../pages/TeamLibraryPage'))
 const TeamEditorPage = lazy(() => import('../pages/TeamEditorPage'))
 const TeamWorkspaceLayout = lazy(() => import('../components/teams/TeamWorkspaceLayout'))
 const OrchestrationChatPage = lazy(() => import('../pages/OrchestrationChatPage'))
+const DeploymentPage = lazy(() => import('../pages/DeploymentPage'))
+const TemplateLibraryPage = lazy(() => import('../pages/TemplateLibraryPage'))
 
 function AgentRouteFallback() {
   return (
@@ -101,6 +103,8 @@ function AppRouter() {
           <Route path=":teamId" element={<TeamEditorPage />} />
         </Route>
         <Route path="chat" element={<LazyChatRoute><OrchestrationChatPage /></LazyChatRoute>} />
+        <Route path="templates" element={<LazyAgentRoute><TemplateLibraryPage /></LazyAgentRoute>} />
+        <Route path="deployments" element={<LazyAgentRoute><DeploymentPage /></LazyAgentRoute>} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>
     </Routes>

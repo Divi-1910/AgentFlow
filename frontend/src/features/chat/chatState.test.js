@@ -78,4 +78,32 @@ describe('chat runtime reducer', () => {
     expect(state.connection).toBe('resetting')
     expect(state.requiresReconcile).toBe(true)
   })
+
+  it('retains the machine-readable provider failure code for friendly recovery UI', () => {
+    const seed = chatRuntimeReducer(initialChatRuntimeState, { type: 'begin', runId: 'root' })
+    const state = apply([{
+      error: { code: 'provider.unavailable', message: 'provider client unavailable' },
+      originator_run_id: 'root',
+      run_id: 'root',
+      stream_id: 'root:3',
+      type: 'run.failed',
+    }], seed)
+
+    expect(state.errorCode).toBe('provider.unavailable')
+    expect(state.status).toBe('failed')
+  })
+
+  it('marks a visible streamed draft as partial when the provider stream is interrupted', () => {
+    const seed = chatRuntimeReducer(initialChatRuntimeState, { type: 'begin', runId: 'root' })
+    const state = apply([
+      { delta: 'Partial answer', run_id: 'root', stream_id: 'root:1', type: 'model.delta' },
+      {
+        error: { code: 'provider.stream_interrupted', message: 'stream closed' },
+        originator_run_id: 'root', run_id: 'root', stream_id: 'root:2', type: 'run.failed',
+      },
+    ], seed)
+
+    expect(state.partial).toBe(true)
+    expect(selectPrimaryDraft(state)?.content).toBe('Partial answer')
+  })
 })

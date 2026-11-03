@@ -47,18 +47,18 @@ a later setup run from silently changing code that was already tested locally.
 From the repository root:
 
 ```bash
-./mcp_server/setup.sh
-./mcp_server/start-all.sh
-./mcp_server/status.sh
+./mcp_servers/setup.sh
+./mcp_servers/start-all.sh
+./mcp_servers/status.sh
 ```
 
 Stop only the processes started by this harness:
 
 ```bash
-./mcp_server/stop-all.sh
+./mcp_servers/stop-all.sh
 ```
 
-Logs are written under `mcp_server/.runtime/logs/`. `start-all.sh` refuses to
+Logs are written under `mcp_servers/.runtime/logs/`. `start-all.sh` refuses to
 reuse a port that is already occupied. Each server is placed in its own process
 group so `stop-all.sh` can also terminate child processes created by a bridge.
 
@@ -154,4 +154,3 @@ Why both URL fields have the same value locally:
   was applied because that would change upstream code and may break its lockfile.
 - The MongoDB URLs are correct only when AgentFlow itself runs on the host. A
   container or Kubernetes pod interprets `127.0.0.1` as itself, not this host.
-

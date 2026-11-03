@@ -18,6 +18,30 @@ export function statusLabel(status) {
   return (status || 'idle').replaceAll('_', ' ')
 }
 
+export function friendlyChatError(error) {
+	const code = error?.code || error?.errorCode || error?.data?.code || ''
+	const message = error?.message || error?.error || ''
+	const presentations = {
+		'provider.unavailable': {
+			detail: 'This Agent\'s model provider is not available to AgentFlow. Configure the platform-owned provider credential, restart the backend, and try again.',
+			title: 'Model provider unavailable',
+		},
+		'provider.stream_interrupted': {
+			detail: 'The model provider stopped the response before it completed. Any visible text is partial; reconnect or retry when the provider is available.',
+			title: 'Provider stream interrupted',
+		},
+		'mcp.unavailable': {
+			detail: 'The selected MCP server could not be reached. The Agent was kept safe and the unavailable capability was reported instead of crashing the conversation.',
+			title: 'MCP server offline',
+		},
+	}
+	if (presentations[code]) return presentations[code]
+	return {
+		detail: message || 'AgentFlow could not complete that action. Your durable conversation history remains available.',
+		title: 'AgentFlow could not complete that action',
+	}
+}
+
 export function tracePresentation(event) {
 	const toolName = toolEventPresentation(event).title
 	const agentName = event.agent_name || 'Agent'
@@ -29,7 +53,7 @@ export function tracePresentation(event) {
     'run.persisted': ['Response saved', 'The conversation history is synchronized.', 'cloud_done'],
     'run.persist_failed': ['Response was not saved', event.error?.message || 'The run finished without durable message storage.', 'cloud_off'],
     'run.completed': [`${agentName} completed`, event.duration_ms ? `${event.duration_ms} ms` : 'Execution finished.', 'check_circle'],
-    'run.failed': [`${agentName} stopped`, event.error?.message || 'Execution could not complete.', 'error'],
+    'run.failed': [`${agentName} stopped`, friendlyChatError(event.error).detail, 'error'],
     'run.cancelled': ['Run cancelled', 'Execution stopped safely.', 'cancel'],
     'step.started': [`Reasoning step ${event.step || ''}`.trim(), event.max_steps ? `Step ${event.step} of ${event.max_steps}` : 'Model work started.', 'progress_activity'],
 		'step.completed': [`Step ${event.step || ''} completed`.trim(), event.duration_ms ? `${event.duration_ms} ms` : 'Model work finished.', 'done'],
@@ -710,6 +734,6 @@ function jobDetail(event) {
 
 function mcpDetail(event) {
   const servers = event.mcp?.unavailable || []
-  if (servers.length === 0) return 'The selected MCP capability could not be reached.'
-  return servers.map((server) => server.alias || server.server_id).join(', ')
+  if (servers.length === 0) return 'The selected MCP capability could not be reached. The Agent continued with a safe unavailability result.'
+  return `${servers.map((server) => server.alias || server.server_id).join(', ')} could not be reached. The Agent continued with a safe unavailability result.`
 }
